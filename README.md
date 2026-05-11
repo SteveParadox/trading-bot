@@ -1,90 +1,95 @@
 # Bybit USDT Perp Trading Bot
 
-A Python scalping bot for Bybit Futures that trades based on MA trend alignment
-and dual Volume-MA confirmation, with intra-candle limit Take-Profit orders.
+Python bot for Bybit linear USDT perpetuals. It scans for MA/volume/ADX trend
+signals, confirms them on a higher timeframe, and places market entries with
+reduce-only stop-loss and take-profit orders.
 
----
+This code cannot guarantee profit. The changes here are meant to reduce
+avoidable losses: smaller risk-based sizing, bad-market filters, protective
+orders, and safer defaults.
 
-## Strategy Summary
+## Main Features
 
-| Component       | Detail                                                             |
-|-----------------|--------------------------------------------------------------------|
-| Timeframe       | 5-minute candles                                                   |
-| Trend filter    | MA7 / MA14 / MA28 — all three must stack in order                 |
-| Volume confirm  | MAVOL(9) vs MAVOL(18) — fast must be above/below slow             |
-| Entry           | Market order on last *closed* candle's signal                      |
-| Take-Profit     | Limit order at entry ± TP_DISTANCE (fills on price touch, no close needed) |
-| Stop-Loss       | None                                                               |
-| Leverage        | 10x                                                                |
-| Position size   | % of available USDT balance (configurable)                         |
-
----
+| Area | Behavior |
+| --- | --- |
+| Signal | MA7/MA14/MA28 trend stack, volume ratio, ADX/DI confirmation |
+| Higher timeframe | Blocks trades that disagree with `HTF_TIMEFRAME` trend |
+| Position sizing | Uses `RISK_PER_TRADE_PCT` of equity based on stop distance |
+| Take-profit | Defaults to risk/reward mode: `MIN_RISK_REWARD` x stop distance |
+| Stop-loss | MA28 stop by default, or ATR stop with `STOP_MODE=atr` |
+| Filters | Spread, ATR range, price-chase guard, cooldown after trades/losses |
+| Safety | Dry-run default, testnet default, max daily loss, max open positions |
+| Execution | API retries, exchange tick/qty rounding, stale reduce-only cleanup |
+| Failure handling | If protection cannot be placed, the bot can emergency-close |
 
 ## Setup
 
-### 1. Install dependencies
+Install dependencies:
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. Configure the bot
+Copy `.env.example` to `.env`, then fill in your values. New installs default
+to `TESTNET=true` and `DRY_RUN=true`.
 
-Edit `config.py`:
-
-- Add your **API key** and **API secret** from Bybit
-- Set `TESTNET = True` while testing, `False` for live
-- Adjust `SYMBOLS`, `BALANCE_PCT`, and `TP_DISTANCE` per symbol
-
-```python
-API_KEY    = "abc123..."
-API_SECRET = "xyz789..."
-TESTNET    = True   # ← Start here
-
-SYMBOLS = ["BTCUSDT", "ETHUSDT", "SOLUSDT"]
-
-BALANCE_PCT = 0.05   # 5% of balance per trade
-
-TP_DISTANCE = {
-    "BTCUSDT": 50.0,   # Take profit $50 above/below entry
-    "ETHUSDT": 3.0,
-    "SOLUSDT": 0.30,
-}
+```env
+API_KEY=your_api_key_here
+API_SECRET=your_api_secret_here
+TESTNET=true
+DRY_RUN=true
+SYMBOLS=SAGAUSDT,BUSDT
 ```
 
-### 3. Run the bot
+Run the bot:
 
 ```bash
 python bot.py
 ```
 
----
+## Safer Live Checklist
 
-## File Structure
+Before setting `DRY_RUN=false`, watch several dry-run sessions and confirm the
+logged entry, stop, take-profit, quantity, and risk numbers make sense.
 
+Suggested live-start settings:
+
+```env
+TESTNET=true
+DRY_RUN=false
+RISK_PER_TRADE_PCT=0.0025
+MAX_TRADE_USDT=10
+MAX_OPEN_POSITIONS=1
+MAX_DAILY_LOSS_PCT=0.01
 ```
-bybit_bot/
-├── bot.py            # Main loop, order execution
-├── indicators.py     # MA, MAVOL calculation + signal logic
-├── config.py         # All settings — edit this
-├── requirements.txt
-└── README.md
+
+Move to `TESTNET=false` only after testnet behavior is boring and predictable.
+
+## Important Settings
+
+| Setting | Default | Notes |
+| --- | ---: | --- |
+| `DRY_RUN` | `true` | Logs orders without placing them |
+| `TESTNET` | `true` | Uses Bybit testnet endpoint |
+| `RISK_PER_TRADE_PCT` | `0.005` | 0.5% equity risk before caps |
+| `MAX_TRADE_USDT` | `50` | Max notional size per position |
+| `MAX_DAILY_LOSS_PCT` | `0.02` | Halt after 2% daily equity drawdown |
+| `MAX_SPREAD_BPS` | `12` | Skip wide-spread markets |
+| `MIN_RISK_REWARD` | `1.5` | Minimum reward/risk ratio |
+| `STOP_MODE` | `ma` | Use `ma` or `atr` |
+| `TP_MODE` | `rr` | Use `rr` or `fixed` |
+
+## Files
+
+```text
+bot.py          Main scan loop, account checks, orders, risk controls
+config.py       Environment-driven settings and defaults
+indicators.py   MA, MAVOL, ADX, ATR, signal logic
+requirements.txt
 ```
-
----
-
-## How the "Second Price" TP works
-
-When the bot enters a trade, it immediately attaches a **limit Take-Profit order**
-at `entry ± TP_DISTANCE`.  Bybit's engine monitors this order in real-time.
-The moment price **touches** that level (even mid-candle), the TP limit order
-fills and the position closes at profit.  The candle does not need to close
-at or beyond the TP level.
-
----
 
 ## Risk Warning
 
-> This bot has **no Stop-Loss**.  A strong adverse move will remain open until
-> the TP is hit on a reversal.  Use small `BALANCE_PCT` values and always test
-> on Testnet first.  Never trade with money you cannot afford to lose.
+Trading perpetual futures can lose money quickly, especially with leverage.
+Start in dry-run and testnet, keep risk small, and review exchange orders
+manually until you trust the automation.

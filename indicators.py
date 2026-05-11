@@ -1,99 +1,155 @@
-# ============================================================
-#  indicators.py — Technical indicator calculations
-# ============================================================
+"""Technical indicators and signal logic for the trading bot."""
 
+from __future__ import annotations
+
+import numpy as np
 import pandas as pd
-from config import MA_PERIODS, MAVOL_FAST, MAVOL_SLOW
 
-# Minimum rows needed: MA28 requires 28 rows, plus 2 for iloc[-2] safety
-MIN_CANDLES = 30
+from config import (
+    ADX_MIN,
+    ADX_PERIOD,
+    ATR_PERIOD,
+    MA_PERIODS,
+    MAVOL_FAST,
+    MAVOL_SLOW,
+    VOLUME_RATIO_MIN,
+)
+
+MIN_CANDLES = max(max(MA_PERIODS), MAVOL_SLOW, ADX_PERIOD * 2, ATR_PERIOD * 2) + 5
+
+
+def _wilders_smooth(series: pd.Series, period: int) -> pd.Series:
+    """Return Wilder-smoothed values for a positive series."""
+    result = pd.Series(np.nan, index=series.index, dtype="float64")
+    if len(series) <= period:
+        return result
+
+    result.iloc[period] = series.iloc[1 : period + 1].sum()
+    for index in range(period + 1, len(series)):
+        previous = result.iloc[index - 1]
+        result.iloc[index] = previous - (previous / period) + series.iloc[index]
+    return result
 
 
 def calculate_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Adds all required indicators to the OHLCV dataframe.
+    """Add moving averages, volume averages, ADX/DI, ATR, and volume ratio."""
+    if df.empty:
+        return df.copy()
 
-    Indicators added:
-      - ma7, ma14, ma28   : Simple Moving Averages of close price
-      - mavol_fast (9)    : Moving Average of volume (fast)
-      - mavol_slow (18)   : Moving Average of volume (slow)
-    """
     df = df.copy()
 
-    # --- Simple Moving Averages (trend direction) ---
     for period in MA_PERIODS:
         df[f"ma{period}"] = df["close"].rolling(window=period).mean()
 
-    # --- Volume Moving Averages (trend volume confirmation) ---
-    # Two MAVOLs are compared: if fast > slow → volume momentum is bullish
-    # This prevents entries in low-conviction moves.
     df["mavol_fast"] = df["volume"].rolling(window=MAVOL_FAST).mean()
     df["mavol_slow"] = df["volume"].rolling(window=MAVOL_SLOW).mean()
+    df["volume_ratio"] = df["mavol_fast"] / df["mavol_slow"].replace(0, np.nan)
+
+    high = df["high"]
+    low = df["low"]
+    close = df["close"]
+    prev_close = close.shift(1)
+
+    true_range = pd.concat(
+        [
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+
+    up_move = high - high.shift(1)
+    down_move = low.shift(1) - low
+
+    pos_dm = pd.Series(
+        np.where((up_move > down_move) & (up_move > 0), up_move, 0.0),
+        index=df.index,
+    )
+    neg_dm = pd.Series(
+        np.where((down_move > up_move) & (down_move > 0), down_move, 0.0),
+        index=df.index,
+    )
+
+    smooth_tr = _wilders_smooth(true_range, ADX_PERIOD)
+    smooth_pos_dm = _wilders_smooth(pos_dm, ADX_PERIOD)
+    smooth_neg_dm = _wilders_smooth(neg_dm, ADX_PERIOD)
+
+    safe_tr = smooth_tr.replace(0, np.nan)
+    di_plus = 100 * smooth_pos_dm / safe_tr
+    di_minus = 100 * smooth_neg_dm / safe_tr
+    di_sum = (di_plus + di_minus).replace(0, np.nan)
+    dx = 100 * (di_plus - di_minus).abs() / di_sum
+
+    df["di_plus"] = di_plus
+    df["di_minus"] = di_minus
+    df["adx"] = _wilders_smooth(dx, ADX_PERIOD) / ADX_PERIOD
+    df["atr"] = _wilders_smooth(true_range, ATR_PERIOD) / ATR_PERIOD
+    df["atr_pct"] = df["atr"] / df["close"].replace(0, np.nan)
 
     return df
 
 
-def get_signal(df: pd.DataFrame) -> str | None:
-    """
-    Evaluates the last complete candle and returns a trade signal.
-
-    LONG  conditions:
-        MA7 > MA14 > MA28        (price uptrend)
-        MAVOL_fast > MAVOL_slow  (bullish volume momentum)
-
-    SHORT conditions:
-        MA7 < MA14 < MA28        (price downtrend)
-        MAVOL_fast < MAVOL_slow  (bearish volume momentum)
-
-    Returns 'LONG', 'SHORT', or None.
-    """
-    # Guard: need at least MIN_CANDLES rows for valid indicators + safe iloc[-2]
+def _last_closed_row(df: pd.DataFrame) -> pd.Series | None:
     if len(df) < MIN_CANDLES:
         return None
+    return df.iloc[-2]
 
-    # Use the last *closed* candle (index -2); -1 is the still-forming candle
-    row = df.iloc[-2]
 
-    # Guard: skip if any indicator is NaN (not enough history yet)
-    cols = ["ma7", "ma14", "ma28", "mavol_fast", "mavol_slow"]
-    if any(pd.isna(row[c]) for c in cols):
+def get_signal(df: pd.DataFrame) -> str | None:
+    """Return LONG, SHORT, or None from the last closed candle."""
+    row = _last_closed_row(df)
+    if row is None:
         return None
 
-    ma7, ma14, ma28  = row["ma7"],       row["ma14"],      row["ma28"]
-    mavol_f, mavol_s = row["mavol_fast"], row["mavol_slow"]
+    required = [
+        "ma7",
+        "ma14",
+        "ma28",
+        "mavol_fast",
+        "mavol_slow",
+        "volume_ratio",
+        "adx",
+        "di_plus",
+        "di_minus",
+    ]
+    if any(pd.isna(row[column]) for column in required):
+        return None
 
-    bull_trend  = (ma7 > ma14) and (ma14 > ma28)
-    bear_trend  = (ma7 < ma14) and (ma14 < ma28)
-    bull_volume = mavol_f > mavol_s
-    bear_volume = mavol_f < mavol_s
+    if row["adx"] < ADX_MIN:
+        return None
 
-    if bull_trend and bull_volume:
+    bull_trend = row["ma7"] > row["ma14"] > row["ma28"]
+    bear_trend = row["ma7"] < row["ma14"] < row["ma28"]
+    bull_volume = row["volume_ratio"] >= VOLUME_RATIO_MIN
+    bear_volume = row["volume_ratio"] <= (1 / VOLUME_RATIO_MIN)
+    bull_direction = row["di_plus"] > row["di_minus"]
+    bear_direction = row["di_minus"] > row["di_plus"]
+    bull_price = row["close"] > row["ma7"]
+    bear_price = row["close"] < row["ma7"]
+
+    if bull_trend and bull_volume and bull_direction and bull_price:
         return "LONG"
-    if bear_trend and bear_volume:
+    if bear_trend and bear_volume and bear_direction and bear_price:
         return "SHORT"
-
     return None
 
 
 def get_htf_trend(df_htf: pd.DataFrame) -> str | None:
-    """
-    Evaluate trend direction on a higher timeframe DataFrame.
-    Returns 'LONG', 'SHORT', or None if no clear trend.
-    Uses the same MA7/MA14/MA28 stack logic as the entry signal.
-    """
-    # Same guard as get_signal for consistency
-    if len(df_htf) < MIN_CANDLES:
+    """Return higher-timeframe LONG, SHORT, or None trend confirmation."""
+    row = _last_closed_row(df_htf)
+    if row is None:
         return None
 
-    row = df_htf.iloc[-2]
-
-    cols = ["ma7", "ma14", "ma28"]
-    if any(pd.isna(row[c]) for c in cols):
+    required = ["ma7", "ma14", "ma28", "adx", "di_plus", "di_minus"]
+    if any(pd.isna(row[column]) for column in required):
         return None
 
-    if (row["ma7"] > row["ma14"]) and (row["ma14"] > row["ma28"]):
+    if row["adx"] < ADX_MIN:
+        return None
+
+    if row["ma7"] > row["ma14"] > row["ma28"] and row["di_plus"] > row["di_minus"]:
         return "LONG"
-    if (row["ma7"] < row["ma14"]) and (row["ma14"] < row["ma28"]):
+    if row["ma7"] < row["ma14"] < row["ma28"] and row["di_minus"] > row["di_plus"]:
         return "SHORT"
-
     return None
