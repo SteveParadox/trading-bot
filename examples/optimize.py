@@ -2,6 +2,12 @@
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# Add parent directory to path so backtester module can be imported
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 from backtester import BacktestConfig
 from backtester.optimization import OptimizationRunner
 

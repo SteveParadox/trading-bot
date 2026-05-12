@@ -47,6 +47,7 @@ def main() -> None:
     output.mkdir(exist_ok=True)
     make_symbol("SAGAUSDT", 1.10, 1).to_csv(output / "SAGAUSDT_5m.csv", index=False)
     make_symbol("BUSDT", 0.75, 2).to_csv(output / "BUSDT_5m.csv", index=False)
+    make_symbol("NEARUSDT", 1.10, 3).to_csv(output / "NEARUSDT_5m.csv", index=False)
     print("Wrote sample data to data/*.csv")
 
 

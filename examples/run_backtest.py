@@ -10,6 +10,12 @@ The config derives 1h/4h frames from 5m candles.
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# Add parent directory to path so backtester module can be imported
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 from backtester import BacktestConfig, BacktestEngine, DataPortal
 from backtester.cli import setup_logging
 
