@@ -74,7 +74,7 @@ COOLDOWN_CANDLES = _get_int("COOLDOWN_CANDLES", 3)
 # strategy profitable by themselves.
 MAX_SPREAD_BPS = _get_float("MAX_SPREAD_BPS", 12.0)
 MAX_ENTRY_DEVIATION_PCT = _get_float("MAX_ENTRY_DEVIATION_PCT", 0.003)
-MIN_RISK_REWARD = _get_float("MIN_RISK_REWARD", 1.5)
+MIN_RISK_REWARD = _get_float("MIN_RISK_REWARD", 1.45)
 MIN_STOP_DISTANCE_PCT = _get_float("MIN_STOP_DISTANCE_PCT", 0.0015)
 MAX_STOP_DISTANCE_PCT = _get_float("MAX_STOP_DISTANCE_PCT", 0.03)
 MIN_ATR_PCT = _get_float("MIN_ATR_PCT", 0.001)
@@ -101,10 +101,10 @@ TRAIL_ATR_MULTIPLIER = _get_float("TRAIL_ATR_MULTIPLIER", 1.5)
 # Signal filters and confirmations.
 RSI_PERIOD = _get_int("RSI_PERIOD", 14)
 RSI_DIVERGENCE_LOOKBACK = _get_int("RSI_DIVERGENCE_LOOKBACK", 5)
-HTF_ADX_MIN = _get_float("HTF_ADX_MIN", 25.0)
+HTF_ADX_MIN = _get_float("HTF_ADX_MIN", 20.0)
 # 1.2 keeps the spike filter from starving lower-liquidity symbols by default;
 # operators who want stricter conviction can raise it toward 1.5.
-VOLUME_SPIKE_MULTIPLIER = _get_float("VOLUME_SPIKE_MULTIPLIER", 1.2)
+VOLUME_SPIKE_MULTIPLIER = _get_float("VOLUME_SPIKE_MULTIPLIER", 1.1)
 CROSS_LOOKBACK = _get_int("CROSS_LOOKBACK", 5)
 
 # Signal ranking. CROSS_LOOKBACK=5 means a fresh MA cross must have happened in

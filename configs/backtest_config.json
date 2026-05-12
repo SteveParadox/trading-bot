@@ -1,0 +1,108 @@
+{
+  "data": {
+    "data_path": "data",
+    "symbols": ["SAGAUSDT", "BUSDT"],
+    "base_timeframe": "5m",
+    "timeframes": ["5m", "1h", "4h"],
+    "file_pattern": "{symbol}_{timeframe}.csv",
+    "timestamp_column": "timestamp",
+    "timezone": "UTC",
+    "start": null,
+    "end": null,
+    "alignment": "intersection",
+    "fill_missing": false,
+    "max_gap_candles": 1,
+    "resample_from": "5m",
+    "validate_candles": true
+  },
+  "execution": {
+    "taker_fee_rate": 0.00055,
+    "maker_fee_rate": 0.0002,
+    "spread_bps": 2.0,
+    "market_slippage_bps": 3.0,
+    "stop_slippage_bps": 5.0,
+    "limit_slippage_bps": 0.0,
+    "market_latency_candles": 1,
+    "resting_order_latency_candles": 1,
+    "partial_fill_probability": 0.05,
+    "partial_fill_min_pct": 0.25,
+    "partial_fill_max_pct": 0.75,
+    "limit_fill_probability": 0.85,
+    "stop_fill_probability": 1.0,
+    "missed_fill_probability": 0.0,
+    "conservative_intrabar_priority": true,
+    "order_timeout_candles": null,
+    "close_on_protection_failure": true,
+    "position_mode": "one_way",
+    "random_seed": 7
+  },
+  "strategy": {
+    "name": "live_indicator_adapter",
+    "entry_timeframe": "5m",
+    "htf_timeframe": "1h",
+    "min_risk_reward": 1.45,
+    "stop_mode": "ma",
+    "atr_sl_multiplier": 1.5,
+    "partial_tp_enabled": true,
+    "tp1_qty_pct": 0.5,
+    "tp2_multiplier": 2.0,
+    "max_entry_deviation_pct": 0.003,
+    "min_atr_pct": 0.001,
+    "max_atr_pct": 0.08,
+    "max_spread_bps": 12.0,
+    "max_signals_per_bar": 2,
+    "use_signal_ranking": true
+  },
+  "risk": {
+    "initial_equity": 1000.0,
+    "risk_per_trade_pct": 0.005,
+    "max_trade_notional": 250.0,
+    "leverage": 2.0,
+    "max_leverage": 10.0,
+    "min_balance_usdt": 10.0,
+    "max_open_positions": 2,
+    "max_symbol_positions": 1,
+    "max_drawdown_pct": 0.2,
+    "daily_loss_limit_pct": 0.03,
+    "max_portfolio_heat_pct": 0.06,
+    "max_symbol_exposure_pct": 0.35,
+    "max_gross_exposure_pct": 1.5,
+    "volatility_target_atr_pct": null,
+    "maintenance_margin_rate": 0.005
+  },
+  "analytics": {
+    "output_dir": "reports/latest",
+    "export_json": true,
+    "export_csv": true,
+    "risk_free_rate": 0.0
+  },
+  "optimization": {
+    "objective": "calmar",
+    "train_pct": 0.7,
+    "walk_forward_train_bars": 2000,
+    "walk_forward_test_bars": 500,
+    "random_iterations": 25,
+    "monte_carlo_iterations": 500,
+    "random_seed": 7
+  },
+  "instruments": {
+    "SAGAUSDT": {
+      "tick_size": 0.0001,
+      "qty_step": 0.1,
+      "min_qty": 0.1,
+      "min_notional": 5.0,
+      "max_leverage": 25.0
+    },
+    "BUSDT": {
+      "tick_size": 0.0001,
+      "qty_step": 0.1,
+      "min_qty": 0.1,
+      "min_notional": 5.0,
+      "max_leverage": 25.0
+    }
+  },
+  "logging": {
+    "level": "INFO",
+    "file_path": "reports/backtest.log"
+  }
+}

@@ -1,0 +1,18 @@
+2026-05-12 14:58:30,702 INFO     backtester.data Loading SAGAUSDT 5m from data\SAGAUSDT_5m.csv
+2026-05-12 14:58:30,871 INFO     backtester.data Loading BUSDT 5m from data\BUSDT_5m.csv
+2026-05-12 14:58:30,946 INFO     backtester.data Enriching SAGAUSDT 5m
+2026-05-12 14:58:31,769 INFO     backtester.data Enriching BUSDT 5m
+2026-05-12 14:58:32,563 INFO     backtester.data Enriching SAGAUSDT 1h
+2026-05-12 14:58:32,637 INFO     backtester.data Enriching BUSDT 1h
+2026-05-12 14:59:45,163 INFO     backtester.data Loading SAGAUSDT 5m from data\SAGAUSDT_5m.csv
+2026-05-12 14:59:45,520 INFO     backtester.data Loading BUSDT 5m from data\BUSDT_5m.csv
+2026-05-12 14:59:45,589 INFO     backtester.data Enriching SAGAUSDT 5m
+2026-05-12 14:59:46,408 INFO     backtester.data Enriching BUSDT 5m
+2026-05-12 14:59:47,294 INFO     backtester.data Enriching SAGAUSDT 1h
+2026-05-12 14:59:47,374 INFO     backtester.data Enriching BUSDT 1h
+2026-05-12 15:04:37,862 INFO     backtester.data Loading SAGAUSDT 5m from data\SAGAUSDT_5m.csv
+2026-05-12 15:04:37,891 INFO     backtester.data Loading BUSDT 5m from data\BUSDT_5m.csv
+2026-05-12 15:04:37,947 INFO     backtester.data Enriching SAGAUSDT 5m
+2026-05-12 15:04:38,828 INFO     backtester.data Enriching BUSDT 5m
+2026-05-12 15:04:39,727 INFO     backtester.data Enriching SAGAUSDT 1h
+2026-05-12 15:04:39,813 INFO     backtester.data Enriching BUSDT 1h

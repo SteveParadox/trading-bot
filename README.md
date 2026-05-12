@@ -85,8 +85,33 @@ Move to `TESTNET=false` only after testnet behavior is boring and predictable.
 bot.py          Main scan loop, account checks, orders, risk controls
 config.py       Environment-driven settings and defaults
 indicators.py   MA, MAVOL, ADX, ATR, signal logic
+backtester/     Historical data, execution, risk, analytics, optimization
+configs/        Backtest configuration examples
+examples/       Backtest and optimization entry points
+tests/          Unit tests for the backtester
 requirements.txt
 ```
+
+## Backtesting
+
+The repository now includes a modular Bybit USDT perpetual futures backtester
+that reuses `indicators.py` while simulating delayed market entries, fees,
+spread/slippage, partial and missed fills, reduce-only exits, leverage, sizing,
+portfolio risk, and performance analytics.
+
+Generate deterministic smoke-test data:
+
+```bash
+python examples/generate_sample_data.py
+```
+
+Run a backtest:
+
+```bash
+python -m backtester.cli --config configs/backtest_config.json
+```
+
+Read the full guide in `docs/BACKTESTING.md`.
 
 ## Risk Warning
 
