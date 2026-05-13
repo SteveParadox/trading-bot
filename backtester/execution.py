@@ -436,9 +436,17 @@ class SimulatedExchange:
             if not triggered:
                 return None, None, None
             if order.side is OrderSide.SELL:
-                reference = min(open_price, order.trigger_price) if open_price <= order.trigger_price else order.trigger_price
+                reference = (
+                    min(open_price, order.trigger_price)
+                    if open_price <= order.trigger_price
+                    else order.trigger_price
+                )
             else:
-                reference = max(open_price, order.trigger_price) if open_price >= order.trigger_price else order.trigger_price
+                reference = (
+                    max(open_price, order.trigger_price)
+                    if open_price >= order.trigger_price
+                    else order.trigger_price
+                )
             if order.order_type is OrderType.STOP_LIMIT and order.price is not None:
                 limit_touched = low <= order.price if order.side is OrderSide.BUY else high >= order.price
                 if not limit_touched:
@@ -466,15 +474,25 @@ class SimulatedExchange:
     ) -> float:
         spread_bps = self.execution.spread_bps if cross_spread else 0.0
         adjustment_bps = slippage_bps + (spread_bps / 2.0)
-        multiplier = 1.0 + adjustment_bps / 10_000.0 if side is OrderSide.BUY else 1.0 - adjustment_bps / 10_000.0
+        multiplier = (
+            1.0 + adjustment_bps / 10_000.0
+            if side is OrderSide.BUY
+            else 1.0 - adjustment_bps / 10_000.0
+        )
         return max(price * multiplier, 1e-12)
 
     def _miss_fill(self, order: Order) -> bool:
-        if self.execution.missed_fill_probability > 0 and self.rng.random() < self.execution.missed_fill_probability:
+        if (
+            self.execution.missed_fill_probability > 0
+            and self.rng.random() < self.execution.missed_fill_probability
+        ):
             return True
         if order.order_type is OrderType.LIMIT and self.rng.random() > self.execution.limit_fill_probability:
             return True
-        if order.order_type in {OrderType.STOP_MARKET, OrderType.STOP_LIMIT} and self.rng.random() > self.execution.stop_fill_probability:
+        if (
+            order.order_type in {OrderType.STOP_MARKET, OrderType.STOP_LIMIT}
+            and self.rng.random() > self.execution.stop_fill_probability
+        ):
             return True
         return False
 
@@ -706,7 +724,7 @@ class SimulatedExchange:
         net = gross - entry_fee_alloc - exit_fee
 
         self.cash += gross - exit_fee
-        self.realized_pnl += gross - exit_fee
+        self.realized_pnl += net
         bars_held = max(0, bar_index - int(position.metadata.get("entry_bar_index") or bar_index))
         self.trades.append(
             TradeRecord(
@@ -737,7 +755,7 @@ class SimulatedExchange:
         if position.qty <= max(1e-12, self.instrument(position.symbol).min_qty * 1e-6):
             self.positions.pop(self._position_key(position.symbol, position.side), None)
             self.cancel_symbol_reduce_only(position.symbol)
-        return gross - exit_fee
+        return net
 
     def _position_key(self, symbol: str, side: Side) -> str:
         symbol = symbol.upper()

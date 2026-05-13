@@ -4,7 +4,8 @@
       "data_path": "data",
       "symbols": [
         "SAGAUSDT",
-        "BUSDT"
+        "BUSDT",
+        "NEARUSDT"
       ],
       "base_timeframe": "5m",
       "timeframes": [
@@ -15,8 +16,8 @@
       "file_pattern": "{symbol}_{timeframe}.csv",
       "timestamp_column": "timestamp",
       "timezone": "UTC",
-      "start": null,
-      "end": null,
+      "start": "2025-01-11T10:00:00+00:00",
+      "end": "2025-01-13T03:35:00+00:00",
       "alignment": "intersection",
       "fill_missing": false,
       "max_gap_candles": 1,
@@ -48,8 +49,8 @@
       "name": "live_indicator_adapter",
       "entry_timeframe": "5m",
       "htf_timeframe": "1h",
-      "min_risk_reward": 1.45,
-      "stop_mode": "ma",
+      "min_risk_reward": 1.2,
+      "stop_mode": "atr",
       "atr_sl_multiplier": 1.5,
       "partial_tp_enabled": true,
       "tp1_qty_pct": 0.5,
@@ -109,6 +110,14 @@
         "min_qty": 0.1,
         "min_notional": 5.0,
         "max_leverage": 25.0
+      },
+      "NEARUSDT": {
+        "symbol": "NEARUSDT",
+        "tick_size": 0.0001,
+        "qty_step": 0.1,
+        "min_qty": 0.1,
+        "min_notional": 5.0,
+        "max_leverage": 25.0
       }
     },
     "logging": {
@@ -118,95 +127,101 @@
   },
   "metrics": {
     "profitability": {
-      "net_profit": 199.61860011980798,
-      "net_return_pct": 0.19961860011980798,
-      "gross_profit": 252.31145818599236,
-      "gross_loss": -57.11150882377325,
-      "win_rate": 0.7012987012987013,
-      "profit_factor": 4.4178741445010665,
-      "expectancy": 2.535064277431417,
-      "average_r_multiple": 1.1457309420161388,
-      "trade_count": 77
+      "net_profit": 25.678131340621576,
+      "net_return_pct": 0.025678131340621576,
+      "gross_profit": 25.644405369214812,
+      "gross_loss": 0.0,
+      "win_rate": 1.0,
+      "profit_factor": null,
+      "expectancy": 1.9726465668626778,
+      "average_r_multiple": 1.680655706617242,
+      "trade_count": 13
     },
     "risk": {
-      "max_drawdown": 0.01758441271839584,
-      "sharpe_ratio": 69.65880794527183,
-      "sortino_ratio": 88.68171220143815,
-      "calmar_ratio": 11.352019730006564,
-      "volatility": 0.07854193531834495,
-      "equity_curve_stability": 0.9676296742088453
+      "max_drawdown": 0.0004870033685094707,
+      "sharpe_ratio": 80.96526993854201,
+      "sortino_ratio": 72.76354173257658,
+      "calmar_ratio": 52.72680437347369,
+      "volatility": 0.06599634169634311,
+      "equity_curve_stability": 0.2702150455811403
     },
     "trades": {
-      "average_trade_duration_bars": 56.74025974025974,
-      "best_trade": 8.454801617610924,
-      "worst_trade": -6.30482276474185,
-      "consecutive_wins": 6,
-      "consecutive_losses": 3,
+      "average_trade_duration_bars": 7.846153846153846,
+      "best_trade": 3.2771963144440353,
+      "worst_trade": 0.6253270083026445,
+      "consecutive_wins": 13,
+      "consecutive_losses": 0,
       "long_performance": {
-        "trades": 31,
-        "net_pnl": 80.93970366507328,
-        "win_rate": 0.6774193548387096,
-        "profit_factor": 4.346662334152577,
-        "average_r": 1.084611233424246
+        "trades": 0,
+        "net_pnl": 0.0,
+        "win_rate": 0.0,
+        "profit_factor": 0.0
       },
       "short_performance": {
-        "trades": 46,
-        "net_pnl": 114.26024569714585,
-        "win_rate": 0.717391304347826,
-        "profit_factor": 4.47018101249007,
-        "average_r": 1.1869203108498052
+        "trades": 13,
+        "net_pnl": 25.644405369214812,
+        "win_rate": 1.0,
+        "profit_factor": null,
+        "average_r": 1.680655706617242
       },
       "symbol_performance": {
         "BUSDT": {
-          "trades": 45,
-          "net_pnl": 118.728217314589,
-          "win_rate": 0.7111111111111111,
-          "profit_factor": 5.012979106899208,
-          "average_r": 1.181080411995901
+          "trades": 5,
+          "net_pnl": 8.687485189660189,
+          "win_rate": 1.0,
+          "profit_factor": null,
+          "average_r": 1.607626914831267
+        },
+        "NEARUSDT": {
+          "trades": 2,
+          "net_pnl": 3.837860280282861,
+          "win_rate": 1.0,
+          "profit_factor": null,
+          "average_r": 1.7144903807547134
         },
         "SAGAUSDT": {
-          "trades": 32,
-          "net_pnl": 76.47173204763013,
-          "win_rate": 0.6875,
-          "profit_factor": 3.7782186729084777,
-          "average_r": 1.0960207498570975
+          "trades": 6,
+          "net_pnl": 13.119059899271763,
+          "win_rate": 1.0,
+          "profit_factor": null,
+          "average_r": 1.7302348083930648
         }
       },
       "timeframe_performance": {
         "5m": {
-          "trades": 77,
-          "net_pnl": 195.19994936221912,
-          "win_rate": 0.7012987012987013,
-          "profit_factor": 4.4178741445010665,
-          "average_r": 1.1457309420161388
+          "trades": 13,
+          "net_pnl": 25.644405369214812,
+          "win_rate": 1.0,
+          "profit_factor": null,
+          "average_r": 1.680655706617242
         }
       }
     },
     "execution": {
-      "fee_impact": 5.884096902630979,
-      "fee_impact_pct_of_gross_pnl": 0.019016354731176993,
-      "slippage_impact": 3.9371692145618615,
-      "slippage_impact_pct_of_gross_pnl": 0.012724230694994279,
-      "missed_fills": 8,
-      "partial_fills": 4,
+      "fee_impact": 1.1187709132432004,
+      "fee_impact_pct_of_gross_pnl": 0.04362631525807359,
+      "slippage_impact": 0.599815965108312,
+      "slippage_impact_pct_of_gross_pnl": 0.02338973965168908,
+      "missed_fills": 0,
+      "partial_fills": 1,
       "orders_expired": 0,
-      "average_fill_notional": 121.56340064802203
+      "average_fill_notional": 156.35312614767471
     },
     "portfolio": {
       "initial_equity": 1000.0,
-      "final_equity": 1199.618600119808,
+      "final_equity": 1025.6781313406216,
       "open_positions": 2,
-      "max_margin_used": 250.08992508686595,
-      "max_gross_exposure": 506.23591443000794
+      "max_margin_used": 249.9715987864638,
+      "max_gross_exposure": 498.44578082189184
     }
   },
   "execution_stats": {
-    "orders_submitted": 146,
+    "orders_submitted": 24,
     "orders_rejected": 0,
     "orders_expired": 0,
-    "missed_fills": 8,
-    "partial_fills": 4,
-    "fees_paid": 5.884096902630979,
-    "slippage_paid": 3.9371692145618615
+    "missed_fills": 0,
+    "partial_fills": 1,
+    "fees_paid": 1.1187709132432004,
+    "slippage_paid": 0.599815965108312
   }
 }

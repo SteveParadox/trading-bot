@@ -11,6 +11,7 @@ import pandas as pd
 
 from backtester.config import DataConfig
 from backtester.models import (
+    normalize_timeframe,
     timeframe_to_pandas_rule,
     timeframe_to_timedelta,
 )
@@ -66,13 +67,13 @@ class DataPortal:
             for timeframe in source_timeframes:
                 if timeframe is None:
                     continue
-                normalized = str(timeframe)
+                normalized = normalize_timeframe(timeframe)
                 frame = self._try_load_frame(symbol, normalized)
                 if frame is not None:
                     self.set_frame(symbol, normalized, frame)
 
         if self.config.resample_from:
-            source = self.config.resample_from
+            source = normalize_timeframe(self.config.resample_from)
             for symbol in self.config.symbols:
                 source_frame = self.get_frame(symbol, source)
                 for timeframe in self.config.timeframes:
@@ -85,6 +86,7 @@ class DataPortal:
         self._ensure_required_frames()
 
     def _try_load_frame(self, symbol: str, timeframe: str) -> pd.DataFrame | None:
+        timeframe = normalize_timeframe(timeframe)
         path = self._resolve_path(symbol, timeframe)
         if path is None or not path.exists():
             return None
@@ -104,6 +106,7 @@ class DataPortal:
         return normalize_ohlcv(raw, self.config)
 
     def _resolve_path(self, symbol: str, timeframe: str) -> Path | None:
+        timeframe = normalize_timeframe(timeframe)
         data_path = Path(self.config.data_path)
         if data_path.is_file():
             return data_path
@@ -148,24 +151,35 @@ class DataPortal:
 
     def set_frame(self, symbol: str, timeframe: str, frame: pd.DataFrame) -> None:
         symbol = symbol.upper()
-        timeframe = str(timeframe)
+        timeframe = normalize_timeframe(timeframe)
         validated = validate_ohlcv(frame, timeframe) if self.config.validate_candles else frame.copy()
         clipped = clip_time_range(validated, self.config.start, self.config.end)
         if self.config.fill_missing:
             clipped = fill_missing_candles(clipped, timeframe)
+        report = detect_gaps(clipped, symbol, timeframe)
+        if (
+            self.config.validate_candles
+            and not self.config.fill_missing
+            and report.largest_gap_candles > self.config.max_gap_candles
+        ):
+            raise ValueError(
+                f"{symbol} {timeframe} has a gap of {report.largest_gap_candles} candle(s), "
+                f"exceeding max_gap_candles={self.config.max_gap_candles}"
+            )
         self.frames[(symbol, timeframe)] = clipped
-        self.gap_reports[(symbol, timeframe)] = detect_gaps(clipped, symbol, timeframe)
+        self.gap_reports[(symbol, timeframe)] = report
 
     def get_frame(self, symbol: str, timeframe: str) -> pd.DataFrame:
+        timeframe = normalize_timeframe(timeframe)
         try:
-            return self.frames[(symbol.upper(), str(timeframe))]
+            return self.frames[(symbol.upper(), timeframe)]
         except KeyError as exc:
             raise KeyError(f"No frame loaded for {symbol.upper()} {timeframe}") from exc
 
     def replace_frame(self, symbol: str, timeframe: str, frame: pd.DataFrame) -> None:
         """Replace a frame after indicator enrichment while keeping reports."""
 
-        self.frames[(symbol.upper(), str(timeframe))] = frame.sort_index()
+        self.frames[(symbol.upper(), normalize_timeframe(timeframe))] = frame.sort_index()
 
     def symbols(self) -> list[str]:
         return list(self.config.symbols)
@@ -174,7 +188,7 @@ class DataPortal:
         return list(self.config.timeframes)
 
     def synchronized_index(self, timeframe: str | None = None) -> pd.DatetimeIndex:
-        timeframe = timeframe or self.config.base_timeframe
+        timeframe = normalize_timeframe(timeframe or self.config.base_timeframe)
         indexes = [self.get_frame(symbol, timeframe).index for symbol in self.config.symbols]
         if not indexes:
             return pd.DatetimeIndex([])
@@ -211,6 +225,7 @@ class DataPortal:
         decision_time.
         """
 
+        timeframe = normalize_timeframe(timeframe)
         frame = self.get_frame(symbol, timeframe)
         decision_time = pd.Timestamp(decision_time)
         if closed:
@@ -223,10 +238,14 @@ class DataPortal:
             history = history.tail(lookback)
         return history.copy()
 
-    def apply_to_frames(self, transform: Callable[[pd.DataFrame], pd.DataFrame], timeframes: list[str] | None = None) -> None:
+    def apply_to_frames(
+        self,
+        transform: Callable[[pd.DataFrame], pd.DataFrame],
+        timeframes: list[str] | None = None,
+    ) -> None:
         """Apply an indicator/enrichment function to selected frames."""
 
-        selected = set(timeframes or self.config.timeframes)
+        selected = {normalize_timeframe(timeframe) for timeframe in (timeframes or self.config.timeframes)}
         for key, frame in list(self.frames.items()):
             symbol, timeframe = key
             if timeframe in selected:

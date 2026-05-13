@@ -42,7 +42,11 @@ class PerformanceAnalyzer:
             "execution": execution,
             "portfolio": {
                 "initial_equity": self.config.risk.initial_equity,
-                "final_equity": float(equity["equity"].iloc[-1]) if not equity.empty else self.config.risk.initial_equity,
+                "final_equity": (
+                    float(equity["equity"].iloc[-1])
+                    if not equity.empty
+                    else self.config.risk.initial_equity
+                ),
                 "open_positions": int(equity["open_positions"].iloc[-1]) if not equity.empty else 0,
                 "max_margin_used": float(equity["margin_used"].max()) if not equity.empty else 0.0,
                 "max_gross_exposure": float(equity["gross_exposure"].max()) if not equity.empty else 0.0,
@@ -194,7 +198,9 @@ class PerformanceAnalyzer:
     ) -> dict[str, Any]:
         fees = float(execution_stats.get("fees_paid") or 0.0)
         slippage = float(execution_stats.get("slippage_paid") or 0.0)
-        gross_abs = abs(float(profitability.get("gross_profit") or 0.0)) + abs(float(profitability.get("gross_loss") or 0.0))
+        gross_abs = abs(float(profitability.get("gross_profit") or 0.0)) + abs(
+            float(profitability.get("gross_loss") or 0.0)
+        )
         return {
             "fee_impact": fees,
             "fee_impact_pct_of_gross_pnl": safe_ratio(fees, gross_abs),

@@ -9,7 +9,7 @@ from backtester.execution import SimulatedExchange
 from backtester.models import OrderSide, OrderType, Side
 
 
-def test_config() -> BacktestConfig:
+def make_test_config() -> BacktestConfig:
     return BacktestConfig.from_dict(
         {
             "data": {"symbols": ["BTCUSDT"], "base_timeframe": "5m", "timeframes": ["5m"]},
@@ -40,9 +40,21 @@ def test_config() -> BacktestConfig:
     )
 
 
+def candle(open_: float, high: float, low: float, close: float) -> pd.Series:
+    return pd.Series(
+        {
+            "open": open_,
+            "high": high,
+            "low": low,
+            "close": close,
+            "volume": 1.0,
+        }
+    )
+
+
 class ExecutionEngineTests(unittest.TestCase):
     def test_market_order_executes_on_next_candle(self) -> None:
-        exchange = SimulatedExchange(test_config())
+        exchange = SimulatedExchange(make_test_config())
         exchange.submit_market_entry(
             symbol="BTCUSDT",
             side=Side.LONG,
@@ -52,17 +64,28 @@ class ExecutionEngineTests(unittest.TestCase):
             leverage=2.0,
             metadata={},
         )
-        candle0 = pd.Series({"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1.0})
-        self.assertEqual(exchange.process_candle(symbol="BTCUSDT", timestamp=pd.Timestamp("2025-01-01T00:00:00Z"), candle=candle0, bar_index=0), [])
-        candle1 = pd.Series({"open": 105.0, "high": 106.0, "low": 104.0, "close": 105.0, "volume": 1.0})
-        fills = exchange.process_candle(symbol="BTCUSDT", timestamp=pd.Timestamp("2025-01-01T00:05:00Z"), candle=candle1, bar_index=1)
+        self.assertEqual(
+            exchange.process_candle(
+                symbol="BTCUSDT",
+                timestamp=pd.Timestamp("2025-01-01T00:00:00Z"),
+                candle=candle(100.0, 101.0, 99.0, 100.0),
+                bar_index=0,
+            ),
+            [],
+        )
+        fills = exchange.process_candle(
+            symbol="BTCUSDT",
+            timestamp=pd.Timestamp("2025-01-01T00:05:00Z"),
+            candle=candle(105.0, 106.0, 104.0, 105.0),
+            bar_index=1,
+        )
 
         self.assertEqual(len(fills), 1)
         self.assertEqual(fills[0].price, 105.0)
         self.assertTrue(exchange.has_position("BTCUSDT", Side.LONG))
 
     def test_reduce_only_order_cannot_flip_position(self) -> None:
-        exchange = SimulatedExchange(test_config())
+        exchange = SimulatedExchange(make_test_config())
         exchange.submit_order(
             symbol="BTCUSDT",
             side=OrderSide.BUY,
@@ -72,8 +95,13 @@ class ExecutionEngineTests(unittest.TestCase):
             current_index=-1,
             leverage=2.0,
         )
-        candle = pd.Series({"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1.0})
-        exchange.process_candle(symbol="BTCUSDT", timestamp=pd.Timestamp("2025-01-01T00:00:00Z"), candle=candle, bar_index=0)
+        flat_candle = candle(100.0, 101.0, 99.0, 100.0)
+        exchange.process_candle(
+            symbol="BTCUSDT",
+            timestamp=pd.Timestamp("2025-01-01T00:00:00Z"),
+            candle=flat_candle,
+            bar_index=0,
+        )
         exchange.submit_order(
             symbol="BTCUSDT",
             side=OrderSide.SELL,
@@ -83,13 +111,18 @@ class ExecutionEngineTests(unittest.TestCase):
             current_index=0,
             reduce_only=True,
         )
-        exchange.process_candle(symbol="BTCUSDT", timestamp=pd.Timestamp("2025-01-01T00:05:00Z"), candle=candle, bar_index=1)
+        exchange.process_candle(
+            symbol="BTCUSDT",
+            timestamp=pd.Timestamp("2025-01-01T00:05:00Z"),
+            candle=flat_candle,
+            bar_index=1,
+        )
 
         self.assertFalse(exchange.has_position("BTCUSDT"))
         self.assertEqual(exchange.open_position_count(), 0)
 
     def test_stop_fills_before_target_when_both_touched(self) -> None:
-        exchange = SimulatedExchange(test_config())
+        exchange = SimulatedExchange(make_test_config())
         exchange.submit_order(
             symbol="BTCUSDT",
             side=OrderSide.BUY,
@@ -100,8 +133,12 @@ class ExecutionEngineTests(unittest.TestCase):
             leverage=2.0,
             metadata={"risk_amount": 10.0},
         )
-        entry_candle = pd.Series({"open": 100.0, "high": 101.0, "low": 99.0, "close": 100.0, "volume": 1.0})
-        exchange.process_candle(symbol="BTCUSDT", timestamp=pd.Timestamp("2025-01-01T00:00:00Z"), candle=entry_candle, bar_index=0)
+        exchange.process_candle(
+            symbol="BTCUSDT",
+            timestamp=pd.Timestamp("2025-01-01T00:00:00Z"),
+            candle=candle(100.0, 101.0, 99.0, 100.0),
+            bar_index=0,
+        )
         exchange.submit_order(
             symbol="BTCUSDT",
             side=OrderSide.SELL,
@@ -124,11 +161,56 @@ class ExecutionEngineTests(unittest.TestCase):
             reduce_only=True,
             metadata={"exit_reason": "take_profit"},
         )
-        wide_candle = pd.Series({"open": 100.0, "high": 111.0, "low": 94.0, "close": 100.0, "volume": 1.0})
-        exchange.process_candle(symbol="BTCUSDT", timestamp=pd.Timestamp("2025-01-01T00:05:00Z"), candle=wide_candle, bar_index=1)
+        exchange.process_candle(
+            symbol="BTCUSDT",
+            timestamp=pd.Timestamp("2025-01-01T00:05:00Z"),
+            candle=candle(100.0, 111.0, 94.0, 100.0),
+            bar_index=1,
+        )
 
         self.assertEqual(len(exchange.trades), 1)
         self.assertEqual(exchange.trades[0].exit_reason, "stop_loss")
+
+    def test_realized_pnl_includes_allocated_entry_and_exit_fees(self) -> None:
+        raw = make_test_config().to_dict()
+        raw["execution"]["taker_fee_rate"] = 0.01
+        exchange = SimulatedExchange(BacktestConfig.from_dict(raw))
+        exchange.submit_order(
+            symbol="BTCUSDT",
+            side=OrderSide.BUY,
+            order_type=OrderType.MARKET,
+            qty=1.0,
+            timestamp=pd.Timestamp("2025-01-01T00:00:00Z"),
+            current_index=-1,
+            leverage=2.0,
+        )
+        exchange.process_candle(
+            symbol="BTCUSDT",
+            timestamp=pd.Timestamp("2025-01-01T00:00:00Z"),
+            candle=candle(100.0, 101.0, 99.0, 100.0),
+            bar_index=0,
+        )
+        exchange.submit_order(
+            symbol="BTCUSDT",
+            side=OrderSide.SELL,
+            order_type=OrderType.MARKET,
+            qty=1.0,
+            timestamp=pd.Timestamp("2025-01-01T00:05:00Z"),
+            current_index=0,
+            reduce_only=True,
+        )
+        fills = exchange.process_candle(
+            symbol="BTCUSDT",
+            timestamp=pd.Timestamp("2025-01-01T00:05:00Z"),
+            candle=candle(110.0, 111.0, 109.0, 110.0),
+            bar_index=1,
+        )
+
+        self.assertEqual(len(exchange.trades), 1)
+        self.assertAlmostEqual(exchange.trades[0].net_pnl, 7.9)
+        self.assertAlmostEqual(exchange.realized_pnl, 7.9)
+        self.assertAlmostEqual(exchange.cash, 1007.9)
+        self.assertAlmostEqual(fills[0].realized_pnl, 7.9)
 
 
 if __name__ == "__main__":

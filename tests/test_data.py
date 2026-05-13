@@ -56,6 +56,34 @@ class DataEngineTests(unittest.TestCase):
         history = portal.history("BTCUSDT", "1h", pd.Timestamp("2025-01-01 01:00:00Z"))
         self.assertEqual(len(history), 1)
 
+    def test_set_frame_rejects_gaps_above_configured_tolerance(self) -> None:
+        config = DataConfig(
+            symbols=["BTCUSDT"],
+            base_timeframe="5m",
+            timeframes=["5m"],
+            max_gap_candles=0,
+        )
+        portal = DataPortal(config)
+        index = pd.to_datetime(
+            [
+                "2025-01-01T00:00:00Z",
+                "2025-01-01T00:10:00Z",
+            ]
+        )
+        frame = pd.DataFrame(
+            {
+                "open": [100.0, 101.0],
+                "high": [101.0, 102.0],
+                "low": [99.0, 100.0],
+                "close": [100.0, 101.0],
+                "volume": [1.0, 1.0],
+            },
+            index=index,
+        )
+
+        with self.assertRaises(ValueError):
+            portal.set_frame("BTCUSDT", "5m", frame)
+
 
 if __name__ == "__main__":
     unittest.main()

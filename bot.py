@@ -122,6 +122,7 @@ class InstrumentInfo:
     qty_step: float
     min_qty: float
     tick_size: float
+    min_notional: float = 5.0
 
 
 @dataclass(frozen=True)
@@ -276,6 +277,24 @@ def format_rate_pct(rate: float) -> str:
     return f"{rate * 100:+.4f}%"
 
 
+def timeframe_seconds(interval: str) -> int:
+    """Convert Bybit intervals such as '5', '5m', '1h', or 'D' to seconds."""
+    value = str(interval).strip().lower()
+    if value.isdigit():
+        seconds = int(value) * 60
+    elif value in {"d", "1d"}:
+        seconds = 24 * 60 * 60
+    elif value.endswith("m") and value[:-1].isdigit():
+        seconds = int(value[:-1]) * 60
+    elif value.endswith("h") and value[:-1].isdigit():
+        seconds = int(value[:-1]) * 60 * 60
+    else:
+        raise ValueError(f"unsupported timeframe interval: {interval}")
+    if seconds <= 0:
+        raise ValueError(f"timeframe interval must be positive: {interval}")
+    return seconds
+
+
 def log_feature_summary() -> None:
     log.info("Feature summary:")
     log.info(
@@ -368,12 +387,14 @@ def get_instrument_info(symbol: str) -> InstrumentInfo:
     qty_step = safe_float(lot.get("qtyStep"))
     min_qty = safe_float(lot.get("minOrderQty"))
     tick_size = safe_float(price.get("tickSize"))
+    min_notional = safe_float(lot.get("minNotionalValue"), 5.0)
     if qty_step <= 0 or min_qty <= 0 or tick_size <= 0:
         raise RuntimeError(f"[{symbol}] malformed instrument filters: {info}")
     return InstrumentInfo(
         qty_step=qty_step,
         min_qty=min_qty,
         tick_size=tick_size,
+        min_notional=max(0.0, min_notional),
     )
 
 
@@ -398,6 +419,8 @@ def get_market_snapshot(symbol: str) -> MarketSnapshot:
         funding_rate = None
     if last <= 0 or bid <= 0 or ask <= 0:
         raise RuntimeError(f"[{symbol}] invalid ticker values: {ticker}")
+    if ask < bid:
+        raise RuntimeError(f"[{symbol}] inverted ticker spread: bid={bid} ask={ask}")
 
     mid = (bid + ask) / 2
     spread_bps = ((ask - bid) / mid) * 10_000 if mid > 0 else float("inf")
@@ -606,7 +629,11 @@ def set_leverage(symbol: str) -> None:
         )
         log.info("[%s] Leverage set to %sx", symbol, LEVERAGE)
     except Exception as exc:
-        log.debug("[%s] Leverage already set or could not be changed: %s", symbol, exc)
+        err = str(exc)
+        if "110043" in err or "leverage not modified" in err:
+            log.info("[%s] Leverage already set to %sx", symbol, LEVERAGE)
+        else:
+            log.warning("[%s] Set leverage failed: %s", symbol, exc)
 
 
 def place_order(label: str, **kwargs: Any) -> dict[str, Any]:
@@ -816,7 +843,11 @@ def recent_loss_cooldown(symbol: str) -> bool:
     if DRY_RUN:
         return False
 
-    cooldown_seconds = COOLDOWN_CANDLES * int(TIMEFRAME) * 60
+    try:
+        cooldown_seconds = COOLDOWN_CANDLES * timeframe_seconds(TIMEFRAME)
+    except ValueError as exc:
+        log.warning("[%s] Loss cooldown disabled: %s", symbol, exc)
+        return False
     cutoff_ms = int((time.time() - cooldown_seconds) * 1000)
     try:
         response = api_request(
@@ -898,6 +929,10 @@ def validate_market_quality(
     last_closed_price: float,
     snapshot: MarketSnapshot,
 ) -> bool:
+    if last_closed_price <= 0 or not math.isfinite(last_closed_price):
+        log.info("[%s] Invalid signal close %.8f; skipping", symbol, last_closed_price)
+        return False
+
     if snapshot.spread_bps > MAX_SPREAD_BPS:
         log.info(
             "[%s] Spread %.2fbps exceeds max %.2fbps; skipping",
@@ -938,10 +973,6 @@ def build_exit_plan(
     info: InstrumentInfo,
 ) -> ExitPlan | None:
     atr = safe_float(signal_row.get("atr"), float("nan"))
-    ma28 = safe_float(signal_row.get("ma28"), float("nan"))
-    if not math.isfinite(ma28) or ma28 <= 0:
-        log.info("[%s] Stop plan skipped: MA28 unavailable", symbol)
-        return None
 
     if STOP_MODE == "atr":
         if not math.isfinite(atr) or atr <= 0:
@@ -953,6 +984,10 @@ def build_exit_plan(
             else entry_price + (atr * ATR_SL_MULTIPLIER)
         )
     else:
+        ma28 = safe_float(signal_row.get("ma28"), float("nan"))
+        if not math.isfinite(ma28) or ma28 <= 0:
+            log.info("[%s] Stop plan skipped: MA28 unavailable", symbol)
+            return None
         raw_stop = ma28
 
     if signal == "LONG":
@@ -987,16 +1022,15 @@ def build_exit_plan(
         log.info("[%s] Reward distance %.8f is invalid; skipping", symbol, reward_distance)
         return None
 
-    raw_take_profit = (
-        entry_price + reward_distance
-        if signal == "LONG"
-        else entry_price - reward_distance
-    )
-    take_profit = decimal_step(
-        raw_take_profit,
-        info.tick_size,
-        ROUND_DOWN if signal == "LONG" else ROUND_UP,
-    )
+    if TP_MODE == "fixed":
+        raw_take_profit = (
+            entry_price + reward_distance
+            if signal == "LONG"
+            else entry_price - reward_distance
+        )
+        take_profit = round_target_price(signal, raw_take_profit, info)
+    else:
+        take_profit = round_min_rr_target_price(signal, entry_price, risk_distance, info)
 
     if signal == "LONG":
         if take_profit <= entry_price:
@@ -1064,8 +1098,8 @@ def calculate_position_size(
         return None
 
     notional = qty * entry_price
-    if notional < 5.0:
-        log.warning("[%s] Notional %.2f below Bybit 5 USDT minimum", symbol, notional)
+    if notional < info.min_notional:
+        log.warning("[%s] Notional %.2f below exchange %.2f USDT minimum", symbol, notional, info.min_notional)
         return None
 
     margin_required = (notional / LEVERAGE) * 1.10
@@ -1149,6 +1183,27 @@ def round_stop_price(signal: str, raw_price: float, info: InstrumentInfo) -> flo
 
 def round_target_price(signal: str, raw_price: float, info: InstrumentInfo) -> float:
     return decimal_step(raw_price, info.tick_size, ROUND_DOWN if signal == "LONG" else ROUND_UP)
+
+
+def round_min_rr_target_price(
+    signal: str,
+    entry_price: float,
+    risk_distance: float,
+    info: InstrumentInfo,
+) -> float:
+    """Round an RR target without accidentally dropping below MIN_RISK_REWARD."""
+    raw_price = (
+        entry_price + (risk_distance * MIN_RISK_REWARD)
+        if signal == "LONG"
+        else entry_price - (risk_distance * MIN_RISK_REWARD)
+    )
+    for _ in range(20):
+        target = round_target_price(signal, raw_price, info)
+        reward = target - entry_price if signal == "LONG" else entry_price - target
+        if risk_distance > 0 and reward / risk_distance >= MIN_RISK_REWARD:
+            return target
+        raw_price = raw_price + info.tick_size if signal == "LONG" else raw_price - info.tick_size
+    return round_target_price(signal, raw_price, info)
 
 
 def tp2_price_from_plan(
@@ -1560,7 +1615,12 @@ def update_trailing_stop_if_active(symbol: str, position: dict[str, Any]) -> Non
 
     if signal == "LONG":
         if new_trail >= current_price:
-            log.info("[%s] Trailing stop invalid for LONG: %.8f >= current %.8f; skipping", symbol, new_trail, current_price)
+            log.info(
+                "[%s] Trailing stop invalid for LONG: %.8f >= current %.8f; skipping",
+                symbol,
+                new_trail,
+                current_price,
+            )
             return
         if new_trail <= current_trail + min_move:
             log.info(
@@ -1573,7 +1633,12 @@ def update_trailing_stop_if_active(symbol: str, position: dict[str, Any]) -> Non
             return
     else:
         if new_trail <= current_price:
-            log.info("[%s] Trailing stop invalid for SHORT: %.8f <= current %.8f; skipping", symbol, new_trail, current_price)
+            log.info(
+                "[%s] Trailing stop invalid for SHORT: %.8f <= current %.8f; skipping",
+                symbol,
+                new_trail,
+                current_price,
+            )
             return
         if current_trail > 0 and new_trail >= current_trail - min_move:
             log.info(
@@ -1693,20 +1758,26 @@ def recover_position_state_from_orders(
             "recovered": True,
         }
         log.warning(
-            "[%s] Restart recovery rebuilt partial TP state from visible orders. Trailing remains inactive until TP1 status/size confirms.",
+            "[%s] Restart recovery rebuilt partial TP state from visible orders. "
+            "Trailing remains inactive until TP1 status/size confirms.",
             symbol,
         )
         return True
 
     log.warning(
-        "[%s] Restart recovery rebuilt stop state only (%s target order(s) visible). Existing exits will be monitored, but trailing cannot be inferred safely.",
+        "[%s] Restart recovery rebuilt stop state only (%s target order(s) visible). "
+        "Existing exits will be monitored, but trailing cannot be inferred safely.",
         symbol,
         len(targets),
     )
     return True
 
 
-def cancel_extra_stop_orders(symbol: str, orders: list[dict[str, Any]], keep_order_id: str | None) -> None:
+def cancel_extra_stop_orders(
+    symbol: str,
+    orders: list[dict[str, Any]],
+    keep_order_id: str | None,
+) -> None:
     """Cancel duplicate visible stops once a primary stop id is known."""
     if not keep_order_id:
         return
@@ -1728,7 +1799,11 @@ def monitor_open_position(symbol: str, position: dict[str, Any]) -> None:
         if not recover_position_state_from_orders(symbol, position, orders):
             return
 
-    keep_sl_id = str(trail_state.get(symbol, {}).get("sl_order_id") or partial_tp_state.get(symbol, {}).get("sl_order_id") or "")
+    keep_sl_id = str(
+        trail_state.get(symbol, {}).get("sl_order_id")
+        or partial_tp_state.get(symbol, {}).get("sl_order_id")
+        or ""
+    )
     cancel_extra_stop_orders(symbol, orders, keep_sl_id or None)
 
     moved_to_breakeven = move_stop_to_breakeven_if_ready(symbol, position, orders)

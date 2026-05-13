@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from typing import Protocol
 
 import pandas as pd
@@ -130,7 +130,7 @@ class IndicatorSignalStrategy:
                 "signal_details": decision.details,
                 "htf_reason": trend.reason,
                 "htf_details": trend.details,
-                "score_details": score_details.__dict__,
+                "score_details": asdict(score_details),
             },
         )
 
@@ -141,7 +141,8 @@ class IndicatorSignalStrategy:
         ma28 = float(row.get("ma28") or 0.0)
         if ma28 <= 0:
             return 0.0
-        return close - ma28 if side is Side.LONG else ma28 - close
+        distance = close - ma28 if side is Side.LONG else ma28 - close
+        return max(0.0, distance)
 
 
 def append_live_placeholder(frame: pd.DataFrame, timeframe: str) -> pd.DataFrame:

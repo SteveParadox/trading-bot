@@ -29,6 +29,8 @@ class ExchangeRiskView(Protocol):
 
     def symbol_exposure(self, symbol: str) -> float: ...
 
+    def margin_used(self) -> float: ...
+
     def portfolio_heat(self) -> float: ...
 
 
@@ -92,13 +94,26 @@ class RiskManager:
             return RiskDecision(False, "portfolio_heat_limit")
 
         entry_price = intent.entry_price_hint
+        if entry_price <= 0 or not math.isfinite(entry_price):
+            return RiskDecision(False, "invalid_entry_price", exit_plan=exit_plan)
+
+        symbol_exposure = exchange.symbol_exposure(intent.symbol)
+        symbol_exposure_limit = equity * self.risk.max_symbol_exposure_pct
+        if symbol_exposure >= symbol_exposure_limit:
+            return RiskDecision(False, "symbol_exposure_limit")
+
+        gross_exposure_remaining = max(
+            0.0,
+            equity * self.risk.max_gross_exposure_pct - exchange.gross_exposure(),
+        )
+        symbol_exposure_remaining = max(0.0, symbol_exposure_limit - symbol_exposure)
         notional_cap = min(
             self.risk.max_trade_notional,
-            equity * self.risk.max_symbol_exposure_pct,
-            max(0.0, equity * self.risk.max_gross_exposure_pct - exchange.gross_exposure()),
+            symbol_exposure_remaining,
+            gross_exposure_remaining,
         )
-        if exchange.symbol_exposure(intent.symbol) >= equity * self.risk.max_symbol_exposure_pct:
-            return RiskDecision(False, "symbol_exposure_limit")
+        if notional_cap <= 0:
+            return RiskDecision(False, "exposure_limit")
 
         qty_by_risk = risk_budget / exit_plan.risk_distance
         qty_by_notional = notional_cap / entry_price
@@ -113,8 +128,9 @@ class RiskManager:
         margin_required = notional / max(leverage, 1e-12)
         if exchange.cash < self.risk.min_balance_usdt:
             return RiskDecision(False, "min_balance")
-        if margin_required > equity:
-            return RiskDecision(False, "insufficient_equity_for_margin")
+        free_equity = max(0.0, equity - exchange.margin_used())
+        if margin_required > free_equity:
+            return RiskDecision(False, "insufficient_free_equity_for_margin")
 
         risk_amount = qty * exit_plan.risk_distance
         liquidation = estimate_liquidation_price(

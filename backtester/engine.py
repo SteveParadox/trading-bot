@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -13,10 +13,17 @@ from backtester.analytics import PerformanceAnalyzer
 from backtester.config import BacktestConfig
 from backtester.data import DataPortal
 from backtester.execution import SimulatedExchange
-from backtester.models import Fill, OrderSide, OrderType, PortfolioSnapshot, SignalIntent, Side
+from backtester.models import (
+    Fill,
+    OrderSide,
+    OrderType,
+    PortfolioSnapshot,
+    SignalIntent,
+    Side,
+    timeframe_to_timedelta,
+)
 from backtester.risk import RiskManager
 from backtester.strategy import IndicatorSignalStrategy, Strategy, StrategyContext
-from backtester.models import timeframe_to_timedelta
 
 log = logging.getLogger(__name__)
 
@@ -130,7 +137,7 @@ class BacktestEngine:
                 "signal_row": intent.signal_row,
                 "side": intent.side.value,
                 "risk_amount": decision.risk_amount,
-                "pretrade_exit_plan": decision.exit_plan.__dict__,
+                "pretrade_exit_plan": asdict(decision.exit_plan),
                 "entry_price_hint": intent.entry_price_hint,
                 "create_bracket": True,
             }
@@ -181,7 +188,7 @@ class BacktestEngine:
         position = self.exchange.position_for(fill.symbol, side)
         if position:
             position.metadata["risk_amount"] = risk_amount
-            position.metadata["actual_exit_plan"] = exit_plan.__dict__
+            position.metadata["actual_exit_plan"] = asdict(exit_plan)
         self.exchange.submit_protective_bracket(
             symbol=fill.symbol,
             position_side=side,

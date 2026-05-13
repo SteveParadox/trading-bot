@@ -1,7 +1,7 @@
 {
   "data": {
     "data_path": "data",
-    "symbols": ["SAGAUSDT", "BUSDT"],
+    "symbols": ["SAGAUSDT", "BUSDT", "NEARUSDT"],
     "base_timeframe": "5m",
     "timeframes": ["5m", "1h", "4h"],
     "file_pattern": "{symbol}_{timeframe}.csv",
@@ -94,6 +94,13 @@
       "max_leverage": 25.0
     },
     "BUSDT": {
+      "tick_size": 0.0001,
+      "qty_step": 0.1,
+      "min_qty": 0.1,
+      "min_notional": 5.0,
+      "max_leverage": 25.0
+    },
+    "NEARUSDT": {
       "tick_size": 0.0001,
       "qty_step": 0.1,
       "min_qty": 0.1,
