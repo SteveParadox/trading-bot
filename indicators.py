@@ -1,4 +1,3 @@
-```python
 """Technical indicators, filters, and signal scoring for the trading bot."""
 
 from __future__ import annotations
@@ -1361,4 +1360,3 @@ def calculate_signal_score(
         tp_distance,
         sl_distance,
     ).score
-```
