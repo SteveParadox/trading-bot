@@ -1,0 +1,17 @@
+[Unit]
+Description=MT5 FX forward-test API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/fx-forward-bot
+EnvironmentFile=/opt/fx-forward-bot/.env
+ExecStart=/opt/fx-forward-bot/.venv/bin/uvicorn fxbot.api:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=10
+User=fxbot
+Group=fxbot
+
+[Install]
+WantedBy=multi-user.target

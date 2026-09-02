@@ -76,3 +76,45 @@
 2026-05-13 13:52:31,340 INFO     backtester.data Enriching SAGAUSDT 1h
 2026-05-13 13:52:31,422 INFO     backtester.data Enriching BUSDT 1h
 2026-05-13 13:52:31,489 INFO     backtester.data Enriching NEARUSDT 1h
+2026-05-13 14:06:16,774 INFO     backtester.data Loading SAGAUSDT 5m from data\SAGAUSDT_5m.csv
+2026-05-13 14:06:16,815 INFO     backtester.data Loading BUSDT 5m from data\BUSDT_5m.csv
+2026-05-13 14:06:16,852 INFO     backtester.data Loading NEARUSDT 5m from data\NEARUSDT_5m.csv
+2026-05-13 14:06:16,965 INFO     backtester.data Enriching SAGAUSDT 5m
+2026-05-13 14:06:17,773 INFO     backtester.data Enriching BUSDT 5m
+2026-05-13 14:06:18,560 INFO     backtester.data Enriching NEARUSDT 5m
+2026-05-13 14:06:19,352 INFO     backtester.data Enriching SAGAUSDT 1h
+2026-05-13 14:06:19,422 INFO     backtester.data Enriching BUSDT 1h
+2026-05-13 14:06:19,496 INFO     backtester.data Enriching NEARUSDT 1h
+2026-05-13 14:07:59,086 INFO     backtester.data Loading SAGAUSDT 5m from data\SAGAUSDT_5m.csv
+2026-05-13 14:07:59,116 INFO     backtester.data Loading BUSDT 5m from data\BUSDT_5m.csv
+2026-05-13 14:07:59,140 INFO     backtester.data Loading NEARUSDT 5m from data\NEARUSDT_5m.csv
+2026-05-13 14:07:59,213 INFO     backtester.data Enriching SAGAUSDT 5m
+2026-05-13 14:08:00,013 INFO     backtester.data Enriching BUSDT 5m
+2026-05-13 14:08:00,826 INFO     backtester.data Enriching NEARUSDT 5m
+2026-05-13 14:08:01,632 INFO     backtester.data Enriching SAGAUSDT 1h
+2026-05-13 14:08:01,708 INFO     backtester.data Enriching BUSDT 1h
+2026-05-13 14:08:01,780 INFO     backtester.data Enriching NEARUSDT 1h
+2026-05-13 15:43:07,933 INFO     root [SAGAUSDT 5m] Bybit update downloaded 2 row(s); local rows=220056
+2026-05-13 15:43:11,689 INFO     root [BUSDT 5m] Bybit update downloaded 1 row(s); local rows=102340
+2026-05-13 15:43:17,308 INFO     root [NEARUSDT 5m] Bybit update downloaded 1 row(s); local rows=248720
+2026-05-13 15:43:18,972 INFO     backtester.data Loading SAGAUSDT 5m from data\bybit\SAGAUSDT_5m.csv
+2026-05-13 15:43:19,901 INFO     backtester.data Loading BUSDT 5m from data\bybit\BUSDT_5m.csv
+2026-05-13 15:43:20,339 INFO     backtester.data Loading NEARUSDT 5m from data\bybit\NEARUSDT_5m.csv
+2026-05-13 15:43:21,672 INFO     backtester.data Enriching SAGAUSDT 5m
+2026-05-13 15:44:12,485 INFO     backtester.data Enriching BUSDT 5m
+2026-05-13 15:44:36,031 INFO     backtester.data Enriching NEARUSDT 5m
+2026-05-13 15:45:32,647 INFO     backtester.data Enriching SAGAUSDT 1h
+2026-05-13 15:45:36,840 INFO     backtester.data Enriching BUSDT 1h
+2026-05-13 15:45:38,776 INFO     backtester.data Enriching NEARUSDT 1h
+2026-05-14 10:16:58,788 INFO     root [SAGAUSDT 5m] Bybit update downloaded 223 row(s); local rows=220279
+2026-05-14 10:17:02,741 INFO     root [BUSDT 5m] Bybit update downloaded 223 row(s); local rows=102563
+2026-05-14 10:17:08,518 INFO     root [NEARUSDT 5m] Bybit update downloaded 223 row(s); local rows=248943
+2026-05-14 10:17:10,205 INFO     backtester.data Loading SAGAUSDT 5m from data\bybit\SAGAUSDT_5m.csv
+2026-05-14 10:17:11,161 INFO     backtester.data Loading BUSDT 5m from data\bybit\BUSDT_5m.csv
+2026-05-14 10:17:11,630 INFO     backtester.data Loading NEARUSDT 5m from data\bybit\NEARUSDT_5m.csv
+2026-05-14 10:17:12,909 INFO     backtester.data Enriching SAGAUSDT 5m
+2026-05-14 10:18:06,533 INFO     backtester.data Enriching BUSDT 5m
+2026-05-14 10:18:31,715 INFO     backtester.data Enriching NEARUSDT 5m
+2026-05-14 10:19:30,886 INFO     backtester.data Enriching SAGAUSDT 1h
+2026-05-14 10:19:35,406 INFO     backtester.data Enriching BUSDT 1h
+2026-05-14 10:19:37,391 INFO     backtester.data Enriching NEARUSDT 1h

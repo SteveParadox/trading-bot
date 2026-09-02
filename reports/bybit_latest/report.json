@@ -1,7 +1,7 @@
 {
   "config": {
     "data": {
-      "data_path": "data",
+      "data_path": "data/bybit",
       "symbols": [
         "SAGAUSDT",
         "BUSDT",
@@ -16,14 +16,14 @@
       "file_pattern": "{symbol}_{timeframe}.csv",
       "timestamp_column": "timestamp",
       "timezone": "UTC",
-      "start": "2025-01-11T10:00:00+00:00",
-      "end": "2025-01-13T03:35:00+00:00",
+      "start": null,
+      "end": null,
       "alignment": "intersection",
       "fill_missing": false,
       "max_gap_candles": 1,
       "resample_from": "5m",
       "validate_candles": true,
-      "provider": "local",
+      "provider": "bybit",
       "bybit_category": "linear",
       "bybit_testnet": false,
       "bybit_request_limit": 1000
@@ -53,8 +53,8 @@
       "name": "live_indicator_adapter",
       "entry_timeframe": "5m",
       "htf_timeframe": "1h",
-      "min_risk_reward": 1.2,
-      "stop_mode": "atr",
+      "min_risk_reward": 1.45,
+      "stop_mode": "ma",
       "atr_sl_multiplier": 1.5,
       "partial_tp_enabled": true,
       "tp1_qty_pct": 0.5,
@@ -84,7 +84,7 @@
       "maintenance_margin_rate": 0.005
     },
     "analytics": {
-      "output_dir": "reports/latest",
+      "output_dir": "reports/bybit_latest",
       "export_json": true,
       "export_csv": true,
       "risk_free_rate": 0.0
@@ -131,101 +131,102 @@
   },
   "metrics": {
     "profitability": {
-      "net_profit": 25.678131340621576,
-      "net_return_pct": 0.025678131340621576,
-      "gross_profit": 25.644405369214812,
-      "gross_loss": 0.0,
-      "win_rate": 1.0,
-      "profit_factor": null,
-      "expectancy": 1.9726465668626778,
-      "average_r_multiple": 1.680655706617242,
-      "trade_count": 13
+      "net_profit": -193.5364001209739,
+      "net_return_pct": -0.1935364001209739,
+      "gross_profit": 218.1012465658038,
+      "gross_loss": -411.61148022541977,
+      "win_rate": 0.37168141592920356,
+      "profit_factor": 0.5298716314869553,
+      "expectancy": -0.8562399719452037,
+      "average_r_multiple": -0.05947590163235819,
+      "trade_count": 226
     },
     "risk": {
-      "max_drawdown": 0.0004870033685094707,
-      "sharpe_ratio": 80.96526993854201,
-      "sortino_ratio": 72.76354173257658,
-      "calmar_ratio": 52.72680437347369,
-      "volatility": 0.06599634169634311,
-      "equity_curve_stability": 0.2702150455811403
+      "max_drawdown": 0.20182920077683777,
+      "sharpe_ratio": -3.260835904133984,
+      "sortino_ratio": -3.0003385344007776,
+      "calmar_ratio": -0.9589117896521164,
+      "volatility": 0.06692165426927557,
+      "equity_curve_stability": 0.737619868519068
     },
     "trades": {
-      "average_trade_duration_bars": 7.846153846153846,
-      "best_trade": 3.2771963144440353,
-      "worst_trade": 0.6253270083026445,
-      "consecutive_wins": 13,
-      "consecutive_losses": 0,
+      "average_trade_duration_bars": 260.3008849557522,
+      "best_trade": 7.259058467899192,
+      "worst_trade": -8.475716783007,
+      "consecutive_wins": 6,
+      "consecutive_losses": 10,
       "long_performance": {
-        "trades": 0,
-        "net_pnl": 0.0,
-        "win_rate": 0.0,
-        "profit_factor": 0.0
+        "trades": 119,
+        "net_pnl": -124.41517470862595,
+        "win_rate": 0.36134453781512604,
+        "profit_factor": 0.42898641183974356,
+        "average_r": -0.13768102585581316
       },
       "short_performance": {
-        "trades": 13,
-        "net_pnl": 25.644405369214812,
-        "win_rate": 1.0,
-        "profit_factor": null,
-        "average_r": 1.680655706617242
+        "trades": 107,
+        "net_pnl": -69.0950589509901,
+        "win_rate": 0.38317757009345793,
+        "profit_factor": 0.6433374346909535,
+        "average_r": 0.027499890728306657
       },
       "symbol_performance": {
         "BUSDT": {
-          "trades": 5,
-          "net_pnl": 8.687485189660189,
-          "win_rate": 1.0,
-          "profit_factor": null,
-          "average_r": 1.607626914831267
+          "trades": 70,
+          "net_pnl": -129.42247175779704,
+          "win_rate": 0.2571428571428571,
+          "profit_factor": 0.2633921243518667,
+          "average_r": -0.47238025442747117
         },
         "NEARUSDT": {
-          "trades": 2,
-          "net_pnl": 3.837860280282861,
-          "win_rate": 1.0,
-          "profit_factor": null,
-          "average_r": 1.7144903807547134
+          "trades": 90,
+          "net_pnl": -59.263226984141696,
+          "win_rate": 0.37777777777777777,
+          "profit_factor": 0.5377418769577689,
+          "average_r": -0.005901858515434233
         },
         "SAGAUSDT": {
-          "trades": 6,
-          "net_pnl": 13.119059899271763,
-          "win_rate": 1.0,
-          "profit_factor": null,
-          "average_r": 1.7302348083930648
+          "trades": 66,
+          "net_pnl": -4.824534917677317,
+          "win_rate": 0.48484848484848486,
+          "profit_factor": 0.955206895785339,
+          "average_r": 0.3053974440515015
         }
       },
       "timeframe_performance": {
         "5m": {
-          "trades": 13,
-          "net_pnl": 25.644405369214812,
-          "win_rate": 1.0,
-          "profit_factor": null,
-          "average_r": 1.680655706617242
+          "trades": 226,
+          "net_pnl": -193.51023365961603,
+          "win_rate": 0.37168141592920356,
+          "profit_factor": 0.5298716314869553,
+          "average_r": -0.05947590163235819
         }
       }
     },
     "execution": {
-      "fee_impact": 1.1187709132432004,
-      "fee_impact_pct_of_gross_pnl": 0.04362631525807359,
-      "slippage_impact": 0.599815965108312,
-      "slippage_impact_pct_of_gross_pnl": 0.02338973965168908,
-      "missed_fills": 0,
-      "partial_fills": 1,
+      "fee_impact": 33.365800829175335,
+      "fee_impact_pct_of_gross_pnl": 0.05298574954836114,
+      "slippage_impact": 27.970092291798238,
+      "slippage_impact_pct_of_gross_pnl": 0.04441722566784252,
+      "missed_fills": 13,
+      "partial_fills": 20,
       "orders_expired": 0,
-      "average_fill_notional": 156.35312614767471
+      "average_fill_notional": 175.9674828493349
     },
     "portfolio": {
       "initial_equity": 1000.0,
-      "final_equity": 1025.6781313406216,
-      "open_positions": 2,
-      "max_margin_used": 249.9715987864638,
-      "max_gross_exposure": 498.44578082189184
+      "final_equity": 806.4635998790261,
+      "open_positions": 1,
+      "max_margin_used": 250.081247502,
+      "max_gross_exposure": 506.33915
     }
   },
   "execution_stats": {
-    "orders_submitted": 24,
+    "orders_submitted": 591,
     "orders_rejected": 0,
     "orders_expired": 0,
-    "missed_fills": 0,
-    "partial_fills": 1,
-    "fees_paid": 1.1187709132432004,
-    "slippage_paid": 0.599815965108312
+    "missed_fills": 13,
+    "partial_fills": 20,
+    "fees_paid": 33.365800829175335,
+    "slippage_paid": 27.970092291798238
   }
 }
