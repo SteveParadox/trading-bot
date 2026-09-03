@@ -180,11 +180,16 @@ class StrategySettings:
     max_entry_deviation_pips: float = 1.5
     min_atr_pips: float = 2.0
     max_atr_pips: float = 28.0
+    max_entry_extension_atr: float | None = None
     min_stop_pips: float = 4.0
     max_stop_pips: float = 40.0
     require_volume_confirmation: bool = False
     volume_ratio_min: float = 0.8
     htf_require_momentum_candle: bool = False
+    score_adx_ceiling: float = 40.0
+    score_di_edge_ceiling: float = 25.0
+    score_volume_ratio_floor: float = 0.8
+    score_volume_ratio_ceiling: float = 2.0
     trade_sessions_utc: tuple[str, ...] = ("london", "new_york", "overlap")
     avoid_rollover_minutes: int = 15
     close_before_weekend_minutes: int = 60
@@ -202,8 +207,18 @@ class StrategySettings:
             raise ValueError("strategy.min_stop_pips cannot exceed max_stop_pips")
         if self.min_atr_pips > self.max_atr_pips:
             raise ValueError("strategy.min_atr_pips cannot exceed max_atr_pips")
+        if self.max_entry_extension_atr is not None and self.max_entry_extension_atr <= 0:
+            raise ValueError("strategy.max_entry_extension_atr must be positive when set")
         if not 0 < self.tp1_units_pct < 1:
             raise ValueError("strategy.tp1_units_pct must leave units for TP1 and TP2")
+        if self.score_adx_ceiling <= self.adx_min:
+            raise ValueError("strategy.score_adx_ceiling must be greater than adx_min")
+        if self.score_di_edge_ceiling <= 0:
+            raise ValueError("strategy.score_di_edge_ceiling must be positive")
+        if self.score_volume_ratio_floor < 0:
+            raise ValueError("strategy.score_volume_ratio_floor cannot be negative")
+        if self.score_volume_ratio_ceiling <= self.score_volume_ratio_floor:
+            raise ValueError("strategy.score_volume_ratio_ceiling must exceed score_volume_ratio_floor")
 
 
 @dataclass(frozen=True)
@@ -310,11 +325,20 @@ def settings_from_env() -> FxBotSettings:
             max_entry_deviation_pips=_get_float("FX_MAX_ENTRY_DEVIATION_PIPS", 1.5),
             min_atr_pips=_get_float("FX_MIN_ATR_PIPS", 2.0),
             max_atr_pips=_get_float("FX_MAX_ATR_PIPS", 28.0),
+            max_entry_extension_atr=(
+                _get_float("FX_MAX_ENTRY_EXTENSION_ATR", 0.0)
+                if os.getenv("FX_MAX_ENTRY_EXTENSION_ATR", "").strip()
+                else None
+            ),
             min_stop_pips=_get_float("FX_MIN_STOP_PIPS", 4.0),
             max_stop_pips=_get_float("FX_MAX_STOP_PIPS", 40.0),
             require_volume_confirmation=_get_bool("FX_REQUIRE_VOLUME_CONFIRMATION", False),
             volume_ratio_min=_get_float("FX_VOLUME_RATIO_MIN", 0.80),
             htf_require_momentum_candle=_get_bool("FX_HTF_REQUIRE_MOMENTUM_CANDLE", False),
+            score_adx_ceiling=_get_float("FX_SCORE_ADX_CEILING", 40.0),
+            score_di_edge_ceiling=_get_float("FX_SCORE_DI_EDGE_CEILING", 25.0),
+            score_volume_ratio_floor=_get_float("FX_SCORE_VOLUME_RATIO_FLOOR", 0.80),
+            score_volume_ratio_ceiling=_get_float("FX_SCORE_VOLUME_RATIO_CEILING", 2.0),
             trade_sessions_utc=tuple(
                 item.lower() for item in _get_csv("FX_TRADE_SESSIONS_UTC", ["london", "new_york", "overlap"])
             ),

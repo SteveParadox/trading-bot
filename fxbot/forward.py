@@ -21,7 +21,7 @@ from fxbot.market_hours import trading_allowed_now
 from fxbot.models import BotRunState, FxPortfolioState, FxSignalIntent, Side
 from fxbot.mt5 import Mt5Client, Mt5CredentialsMissing, Mt5Error, extract_order_ids
 from fxbot.risk import FxRiskDecision, FxRiskManager
-from fxbot.strategy import build_signal_intent, evaluate_signal_frame, prepare_indicators
+from fxbot.strategy import build_signal_intent, evaluate_signal_frame, last_closed_row, prepare_indicators
 
 log = logging.getLogger(__name__)
 
@@ -166,7 +166,15 @@ class ForwardTestWorker:
             self._skip(now, instrument.name, decision.reason, decision.details)
             return
 
-        last_close = float(entry_frame.iloc[-1]["close"])
+        signal_row = last_closed_row(
+            entry_frame,
+            self.settings.strategy.entry_timeframe,
+            timestamp=now,
+        )
+        if signal_row is None:
+            self._skip(now, instrument.name, "closed_signal_candle_unavailable")
+            return
+        last_close = float(signal_row["close"])
         deviation_pips = abs(price.mid - last_close) / instrument.pip_size
         if deviation_pips > self.settings.strategy.max_entry_deviation_pips:
             self._skip(now, instrument.name, "entry_deviation_filter", {"deviation_pips": deviation_pips})
@@ -179,6 +187,7 @@ class ForwardTestWorker:
             settings=self.settings.strategy,
             entry_price=price.mid,
             timestamp=now,
+            entry_price_source="broker_mid",
         )
         if intent is None:
             self._skip(now, instrument.name, "intent_unavailable")

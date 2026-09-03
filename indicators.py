@@ -34,7 +34,6 @@ from config import (
     VOLUME_SPIKE_MULTIPLIER,
 )
 
-
 # ---------------------------------------------------------------------------
 # Optional entry-extension guard.
 #
@@ -317,72 +316,69 @@ def calculate_rsi(
 
 def calculate_indicators(
     df: pd.DataFrame,
+    *,
+    ma_periods: tuple[int, ...] | list[int] | None = None,
+    mavol_fast: int | None = None,
+    mavol_slow: int | None = None,
+    adx_period: int | None = None,
+    atr_period: int | None = None,
+    volume_ratio_min: float | None = None,
 ) -> pd.DataFrame:
     """
     Add moving averages, volume averages, ADX/DI, ATR, RSI, and ratios.
 
     Expected input columns:
         open, high, low, close, volume
+
+    All runtime tuning is passed explicitly so the function remains stateless
+    across concurrent strategy evaluations.
     """
     if df.empty:
         return df.copy()
 
     df = df.copy()
+    ma_periods = tuple(ma_periods if ma_periods is not None else MA_PERIODS)
+    mavol_fast = MAVOL_FAST if mavol_fast is None else int(mavol_fast)
+    mavol_slow = MAVOL_SLOW if mavol_slow is None else int(mavol_slow)
+    adx_period = ADX_PERIOD if adx_period is None else int(adx_period)
+    atr_period = ATR_PERIOD if atr_period is None else int(atr_period)
+    volume_ratio_min = VOLUME_RATIO_MIN if volume_ratio_min is None else float(volume_ratio_min)
 
-    # -----------------------------------------------------------------------
-    # Price moving averages
-    # -----------------------------------------------------------------------
-
-    for period in MA_PERIODS:
+    for period in ma_periods:
         df[f"ma{period}"] = (
             df["close"]
             .rolling(window=period)
             .mean()
         )
 
-    # -----------------------------------------------------------------------
-    # Volume metrics
-    # -----------------------------------------------------------------------
-
     df["mavol_fast"] = (
         df["volume"]
-        .rolling(window=MAVOL_FAST)
+        .rolling(window=mavol_fast)
         .mean()
     )
 
     df["mavol_slow"] = (
         df["volume"]
-        .rolling(window=MAVOL_SLOW)
+        .rolling(window=mavol_slow)
         .mean()
     )
 
-    # Recent average participation relative to longer-term participation.
     df["volume_ma_ratio"] = (
         df["mavol_fast"]
         / df["mavol_slow"].replace(0, np.nan)
     )
 
-    # Current-bar participation relative to the slow volume average.
     df["current_volume_ratio"] = (
         df["volume"]
         / df["mavol_slow"].replace(0, np.nan)
     )
 
-    # Backward-compatible alias for existing consumers.
     df["volume_ratio"] = df["volume_ma_ratio"]
-
-    # -----------------------------------------------------------------------
-    # RSI
-    # -----------------------------------------------------------------------
 
     df["rsi"] = calculate_rsi(
         df["close"],
         RSI_PERIOD,
     )
-
-    # -----------------------------------------------------------------------
-    # True Range / Directional Movement
-    # -----------------------------------------------------------------------
 
     high = df["high"]
     low = df["low"]
@@ -423,10 +419,6 @@ def calculate_indicators(
         dtype="float64",
     )
 
-    # -----------------------------------------------------------------------
-    # Correct Wilder ADX / DI calculation
-    # -----------------------------------------------------------------------
-
     (
         di_plus,
         di_minus,
@@ -435,7 +427,7 @@ def calculate_indicators(
         true_range=true_range,
         pos_dm=pos_dm,
         neg_dm=neg_dm,
-        period=ADX_PERIOD,
+        period=adx_period,
         index=df.index,
     )
 
@@ -443,25 +435,15 @@ def calculate_indicators(
     df["di_minus"] = di_minus
     df["adx"] = adx
 
-    # -----------------------------------------------------------------------
-    # ATR
-    # -----------------------------------------------------------------------
-
     smooth_tr_atr = _wilders_smooth(
         true_range,
-        ATR_PERIOD,
+        atr_period,
     )
 
-    df["atr"] = (
-        smooth_tr_atr
-        / ATR_PERIOD
-    )
+    df["atr"] = smooth_tr_atr / atr_period
+    df["atr_pct"] = df["atr"] / df["close"].replace(0, np.nan)
 
-    df["atr_pct"] = (
-        df["atr"]
-        / df["close"].replace(0, np.nan)
-    )
-
+    df["_fx_volume_ratio_floor"] = volume_ratio_min
     return df
 
 
