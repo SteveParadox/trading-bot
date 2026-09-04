@@ -265,7 +265,7 @@ class RiskSettings:
 @dataclass(frozen=True)
 class RuntimeSettings:
     database_url: str = "sqlite:///./data/fx_forward_test.db"
-    loop_interval_seconds: int = 60
+    loop_interval_seconds: int = 10
     api_key: str = "change-me-demo-key"
     log_jsonl_path: str = "data/fx_journal.jsonl"
     frontend_origin: str = "http://127.0.0.1:5173"
@@ -364,7 +364,7 @@ def settings_from_env() -> FxBotSettings:
         ),
         runtime=RuntimeSettings(
             database_url=os.getenv("FX_DATABASE_URL", "sqlite:///./data/fx_forward_test.db"),
-            loop_interval_seconds=_get_int("FX_LOOP_INTERVAL_SECONDS", 60),
+            loop_interval_seconds=_get_int("FX_LOOP_INTERVAL_SECONDS", 10),
             api_key=os.getenv("FX_API_KEY", "change-me-demo-key"),
             log_jsonl_path=os.getenv("FX_JSONL_JOURNAL", "data/fx_journal.jsonl"),
             frontend_origin=os.getenv("FX_FRONTEND_ORIGIN", "http://127.0.0.1:5173"),

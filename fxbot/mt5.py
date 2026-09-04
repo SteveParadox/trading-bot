@@ -58,6 +58,7 @@ class Mt5Client:
         mt5 = self._module()
         account = mt5.account_info()
         if account is None:
+            self._mark_disconnected()
             raise Mt5CredentialsMissing(f"MT5 account_info failed: {mt5.last_error()}")
         payload = _as_dict(account)
         positions = self._positions()
@@ -114,6 +115,7 @@ class Mt5Client:
         self._select_symbol(symbol)
         rates = mt5.copy_rates_from_pos(symbol, timeframe_value, 1, count)
         if rates is None:
+            self._mark_disconnected()
             raise Mt5Error(f"MT5 copy_rates_from_pos failed for {symbol}: {mt5.last_error()}")
         frame = pd.DataFrame(rates)
         if frame.empty:
@@ -199,6 +201,7 @@ class Mt5Client:
         end = until or datetime.now(timezone.utc)
         deals = mt5.history_deals_get(_naive_utc(since), _naive_utc(end))
         if deals is None:
+            self._mark_disconnected()
             raise Mt5Error(f"MT5 history_deals_get failed: {mt5.last_error()}")
         return self._closed_trade_events(deals)
 
@@ -235,6 +238,7 @@ class Mt5Client:
         self._select_symbol(symbol)
         tick = mt5.symbol_info_tick(symbol)
         if tick is None:
+            self._mark_disconnected()
             raise Mt5Error(f"MT5 symbol_info_tick failed for {symbol}: {mt5.last_error()}")
         tick_payload = _as_dict(tick)
         side = Side.LONG if signed_units > 0 else Side.SHORT
@@ -318,6 +322,16 @@ class Mt5Client:
         self._assert_demo_account(account)
         self._connected = True
 
+    def _mark_disconnected(self) -> None:
+        """Drop the cached connection so the next access re-initializes MT5.
+
+        MT5's Python SDK returns ``None`` from every data call once the local
+        terminal connection drops (terminal closed, restarted, or network loss).
+        Without this, ``_connected`` stays ``True`` forever and the bot can never
+        recover a live MT5 connection until the whole process restarts.
+        """
+        self._connected = False
+
     def _assert_demo_account(self, account: Any) -> None:
         if not self.settings.demo_only:
             return
@@ -343,6 +357,7 @@ class Mt5Client:
         self._select_symbol(symbol)
         tick = mt5.symbol_info_tick(symbol)
         if tick is None:
+            self._mark_disconnected()
             raise Mt5Error(f"MT5 symbol_info_tick failed for {symbol}: {mt5.last_error()}")
         return PriceSnapshot.from_mt5(instrument, tick)
 
@@ -383,6 +398,7 @@ class Mt5Client:
         mt5 = self._module()
         positions = mt5.positions_get()
         if positions is None:
+            self._mark_disconnected()
             raise Mt5Error(f"MT5 positions_get failed: {mt5.last_error()}")
         return tuple(positions)
 
@@ -463,6 +479,7 @@ class Mt5Client:
 
     def _checked_result(self, result: Any, operation: str) -> dict[str, Any]:
         if result is None:
+            self._mark_disconnected()
             raise Mt5Error(f"MT5 {operation} returned no result: {self._module().last_error()}")
         payload = _as_dict(result)
         retcode = _safe_int(payload.get("retcode"), -1)

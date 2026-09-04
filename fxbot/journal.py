@@ -9,7 +9,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import desc, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.orm import Session, close_all_sessions, sessionmaker
 
 from fxbot.database import (
@@ -162,6 +162,48 @@ class StructuredJournal:
             session.flush()
             session.expunge(row)
         self.write_jsonl("order_updated", row)
+        return row
+
+    def record_external_order(
+        self,
+        *,
+        broker_order_id: str,
+        broker_trade_id: str,
+        timestamp: datetime,
+        instrument: str,
+        side: str,
+        units: float,
+        payload: dict[str, Any],
+    ) -> OrderJournalRow:
+        client_order_id = f"mt5-external-{broker_trade_id}"
+        with self.sessions.begin() as session:
+            row = session.scalar(
+                select(OrderJournalRow).where(OrderJournalRow.broker_trade_id == broker_trade_id)
+            )
+            if row is None:
+                row = OrderJournalRow(
+                    client_order_id=client_order_id,
+                    timestamp=_aware(timestamp),
+                    instrument=instrument.upper(),
+                    side=side,
+                    units=units,
+                    order_type="MARKET",
+                    status="filled",
+                    broker_order_id=broker_order_id or None,
+                    broker_trade_id=broker_trade_id,
+                    risk_amount=0.0,
+                    payload=_jsonable(payload),
+                    response=_jsonable(payload),
+                )
+                session.add(row)
+            else:
+                row.status = "filled"
+                row.broker_order_id = broker_order_id or row.broker_order_id
+                row.payload = _jsonable(payload)
+                row.response = _jsonable(payload)
+            session.flush()
+            session.expunge(row)
+        self.write_jsonl("external_order", row)
         return row
 
     def mark_trade_orders_closed(self, broker_trade_id: str) -> None:
@@ -429,11 +471,13 @@ class StructuredJournal:
             statement = statement.where(TradeJournalRow.entry_time >= _aware(start))
         if end:
             statement = statement.where(TradeJournalRow.entry_time <= _aware(end))
+        total_pnl = TradeJournalRow.realized_pl + TradeJournalRow.financing
         if outcome == "win":
-            statement = statement.where(TradeJournalRow.realized_pl > 0)
+            statement = statement.where(total_pnl > 0)
         elif outcome == "loss":
-            statement = statement.where(TradeJournalRow.realized_pl < 0)
-        statement = statement.order_by(desc(TradeJournalRow.entry_time), desc(TradeJournalRow.id)).limit(limit)
+            statement = statement.where(total_pnl < 0)
+        latest_trade_time = func.coalesce(TradeJournalRow.exit_time, TradeJournalRow.entry_time)
+        statement = statement.order_by(desc(latest_trade_time), desc(TradeJournalRow.id)).limit(limit)
         with self.sessions() as session:
             rows = list(session.scalars(statement))
             for row in rows:

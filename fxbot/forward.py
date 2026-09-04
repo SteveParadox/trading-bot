@@ -9,6 +9,8 @@ from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
+import pandas as pd
+
 from fxbot.config import FxBotSettings, ensure_runtime_dirs, settings_from_env
 from fxbot.instruments import (
     FxInstrument,
@@ -21,9 +23,21 @@ from fxbot.market_hours import trading_allowed_now
 from fxbot.models import BotRunState, FxPortfolioState, FxSignalIntent, Side
 from fxbot.mt5 import Mt5Client, Mt5CredentialsMissing, Mt5Error, extract_order_ids
 from fxbot.risk import FxRiskDecision, FxRiskManager
-from fxbot.strategy import build_signal_intent, evaluate_signal_frame, last_closed_row, prepare_indicators
+from fxbot.strategy import (
+    TIMEFRAME_DELTAS,
+    build_signal_intent,
+    evaluate_signal_frame,
+    last_closed_row,
+    prepare_indicators,
+)
 
 log = logging.getLogger(__name__)
+
+# How far back (in hours) closed-trade history is always re-fetched for
+# reconciliation, so trades that closed between scans are picked up even when
+# the sync cursor has already advanced past their close deals. Kept larger than
+# the broker-feed clock skew (~2.5h on MetaQuotes demo) plus the loop interval.
+TRADE_HISTORY_RECONCILE_HOURS = 72
 
 Publisher = Callable[[dict[str, Any]], Awaitable[None] | None]
 
@@ -155,12 +169,17 @@ class ForwardTestWorker:
         htf_frame = prepare_indicators(
             self.client.candles(instrument.name, self.settings.strategy.htf_timeframe, self.settings.strategy.candle_limit)
         )
+        decision_time = feed_decision_time(
+            entry_frame,
+            self.settings.strategy.entry_timeframe,
+            fallback=now,
+        )
         decision = evaluate_signal_frame(
             entry_frame,
             htf_frame,
             instrument=instrument,
             settings=self.settings.strategy,
-            timestamp=now,
+            timestamp=decision_time,
         )
         if decision.signal is None:
             self._skip(now, instrument.name, decision.reason, decision.details)
@@ -169,7 +188,7 @@ class ForwardTestWorker:
         signal_row = last_closed_row(
             entry_frame,
             self.settings.strategy.entry_timeframe,
-            timestamp=now,
+            timestamp=decision_time,
         )
         if signal_row is None:
             self._skip(now, instrument.name, "closed_signal_candle_unavailable")
@@ -186,7 +205,7 @@ class ForwardTestWorker:
             instrument=instrument,
             settings=self.settings.strategy,
             entry_price=price.mid,
-            timestamp=now,
+            timestamp=decision_time,
             entry_price_source="broker_mid",
         )
         if intent is None:
@@ -442,12 +461,25 @@ class ForwardTestWorker:
                 financing=_safe_float(trade.get("financing")),
                 payload={**trade, "estimated_daily_financing": financing_estimate},
             )
+            self.journal.record_external_order(
+                broker_order_id=trade_id,
+                broker_trade_id=trade_id,
+                timestamp=_parse_broker_time(trade.get("openTime")) or now,
+                instrument=instrument_name,
+                side=side.value,
+                units=abs(units),
+                payload={**trade, "source": "mt5_reconciliation"},
+            )
 
     def _sync_trade_history(self, now: datetime) -> None:
         state = self.journal.get_state()
-        since = _parse_broker_time(state.last_transaction_id) if state.last_transaction_id else None
-        if since is None:
-            since = now - timedelta(days=1)
+        cursor = _parse_broker_time(state.last_transaction_id) if state.last_transaction_id else None
+        floor = now - timedelta(hours=TRADE_HISTORY_RECONCILE_HOURS)
+        # Use the earlier of the sync cursor and a fixed reconcile floor so that
+        # trades which closed between scans (whose close deals fall before the
+        # cursor) are still re-fetched and flipped to `closed`. The upsert is
+        # keyed on broker_trade_id, so re-processing is idempotent.
+        since = min(cursor, floor) if cursor else floor
         try:
             closed_trades = self.client.closed_trades_since(since, now)
         except Mt5Error as exc:
@@ -553,6 +585,44 @@ class ForwardTestWorker:
         result = self.publisher(payload)
         if result is not None:
             await result
+
+
+def feed_decision_time(
+    entry_frame: Any,
+    timeframe: str,
+    *,
+    fallback: datetime,
+) -> datetime:
+    """Return the strategy decision time anchored to the broker data feed.
+
+    MT5 candle timestamps use the broker server's simulated clock, which on the
+    MetaQuotes demo terminal runs ~2.5h ahead of the host system clock. Passing
+    the raw system ``datetime.now(UTC)`` into evaluate_signal_frame /
+    last_closed_row therefore misclassifies every candle as
+    ``future_candle_in_frame`` and blocks signal generation.
+
+    Because the worker fetches candles with ``pos=1``, the last row is the most
+    recent fully-closed candle, so its open time plus one timeframe is exactly
+    the moment that candle completed -- a correct, feed-consistent "now" that is
+    never in the future of the data and is identical to the system clock on
+    non-skewed feeds.
+    """
+    if entry_frame is None or len(entry_frame) == 0:
+        return fallback
+    try:
+        delta = TIMEFRAME_DELTAS[timeframe]
+    except KeyError:
+        return fallback
+    index = entry_frame.index
+    if not hasattr(index, "__len__") or len(index) == 0:
+        return fallback
+    last_open = index[-1]
+    if isinstance(last_open, pd.Timestamp):
+        last_open = last_open.to_pydatetime()
+    closed_at = last_open + delta
+    if closed_at.tzinfo is None:
+        closed_at = closed_at.replace(tzinfo=timezone.utc)
+    return closed_at.astimezone(timezone.utc)
 
 
 def client_order_id(intent: FxSignalIntent, leg: str) -> str:
