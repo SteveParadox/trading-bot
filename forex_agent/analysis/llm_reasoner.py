@@ -6,6 +6,7 @@ from typing import Any
 
 import requests
 
+from forex_agent.config import load_config
 from forex_agent.data.schemas import (
     CriticAssessment,
     EvidencePackage,
@@ -70,6 +71,39 @@ Why might this conclusion be wrong?
 
 ## Research Recommendation
 What experiment should we run next?
+"""
+
+
+RESEARCH_SYSTEM_PROMPT = """\
+You are a senior quantitative researcher synthesizing an ongoing trading-strategy research program.
+
+You MUST ONLY use the research memory provided below. You MUST NOT:
+- Invent hypotheses, findings, or decisions
+- Fabricate statistics or evidence
+- Overstate confidence given the sample sizes
+- Recommend strategy changes that contradict the evidence
+
+Base every claim on the stored hypotheses, findings, and decisions.
+Where evidence is thin or inconclusive, say so explicitly.
+
+Produce a research synthesis in this exact format:
+
+## Research Overview
+What is the current state of the research program?
+
+## Hypothesis Status
+How many hypotheses are in each lifecycle state, and which are most important?
+
+## Key Findings
+Which findings are supported by the evidence so far?
+
+## Open Questions
+What remains unresolved or insufficiently tested?
+
+## Recommended Next Steps
+Which experiments or data should be prioritized next?
+
+Be specific and reference hypotheses by their stored text where useful.
 """
 
 
@@ -221,7 +255,7 @@ def _call_openai(
 
     try:
         import openai
-        client = openai.OpenAI(api_key=key)
+        client = openai.OpenAI(api_key=key, timeout=30.0)
         response = client.chat.completions.create(
             model=model,
             messages=[
@@ -231,7 +265,10 @@ def _call_openai(
             temperature=temperature,
             max_tokens=max_tokens,
         )
-        return response.choices[0].message.content
+        if not response.choices:
+            return None
+        content = response.choices[0].message.content
+        return content.strip() if isinstance(content, str) and content.strip() else None
     except ImportError:
         logger.debug("openai package not installed; falling back")
         return None
@@ -243,13 +280,13 @@ def _call_openai(
 def _call_ollama(
     system: str,
     user_message: str,
-    model: str = "llama3.1",
+    model: str = "phi3:mini",
     base_url: str = "http://localhost:11434",
     temperature: float = 0.3,
     max_tokens: int = 2000,
 ) -> str | None:
     """Call Ollama local API. Returns response text or None on failure."""
-    url = f"{base_url}/api/chat"
+    url = f"{base_url.rstrip('/')}/api/chat"
     payload = {
         "model": model,
         "messages": [
@@ -264,10 +301,12 @@ def _call_ollama(
     }
 
     try:
-        resp = requests.post(url, json=payload, timeout=120)
+        resp = requests.post(url, json=payload, timeout=30)
         resp.raise_for_status()
         data = resp.json()
-        return data.get("message", {}).get("content")
+        message = data.get("message") if isinstance(data, dict) else None
+        content = message.get("content") if isinstance(message, dict) else None
+        return content.strip() if isinstance(content, str) and content.strip() else None
     except Exception as exc:
         logger.debug("Ollama call failed: %s", exc)
         return None
@@ -359,6 +398,128 @@ def _template_explanation(
 
 
 # ---------------------------------------------------------------------------
+# Research memory synthesis
+# ---------------------------------------------------------------------------
+
+def _build_research_user_message(
+    hypotheses: list[dict[str, Any]] | None = None,
+    findings: list[dict[str, Any]] | None = None,
+    decisions: list[dict[str, Any]] | None = None,
+) -> str:
+    """Build the user message from the research memory."""
+    sections: list[str] = []
+
+    sections.append("=== RESEARCH MEMORY ===")
+
+    hyp_list = hypotheses or []
+    if hyp_list:
+        sections.append(f"\nHypotheses ({len(hyp_list)}):")
+        for i, h in enumerate(hyp_list, 1):
+            sections.append(
+                f"  H{i}: {h.get('hypothesis', '?')} "
+                f"[{h.get('status', 'unknown')}]"
+            )
+            if h.get("date_created"):
+                sections.append(f"    Created: {h['date_created']}")
+            if h.get("evidence"):
+                sections.append(f"    Evidence: {h['evidence']}")
+            if h.get("result"):
+                sections.append(f"    Result: {h['result']}")
+            if h.get("p_value") is not None:
+                sections.append(
+                    f"    p={h['p_value']:.3f}, effect={h.get('effect_size', 0):.2f}, "
+                    f"sample={h.get('sample_size', 0)}"
+                )
+            if h.get("notes"):
+                sections.append(f"    Notes: {h['notes']}")
+    else:
+        sections.append("\nHypotheses: none")
+
+    findings_list = findings or []
+    if findings_list:
+        sections.append(f"\nFindings ({len(findings_list)}):")
+        for i, f in enumerate(findings_list, 1):
+            text = f.get("text") or f.get("finding") or f.get("summary") or "?"
+            sections.append(f"  F{i}: {text}")
+    else:
+        sections.append("\nFindings: none")
+
+    decisions_list = decisions or []
+    if decisions_list:
+        sections.append(f"\nDecisions ({len(decisions_list)}):")
+        for i, d in enumerate(decisions_list, 1):
+            text = d.get("text") or d.get("decision") or d.get("summary") or "?"
+            sections.append(f"  D{i}: {text}")
+    else:
+        sections.append("\nDecisions: none")
+
+    sections.append("\n=== REQUESTED OUTPUT ===")
+    sections.append("Produce the research synthesis following the required format.")
+    sections.append("Use ONLY the data above. Do not invent findings.")
+
+    return "\n".join(sections)
+
+
+def _template_research_summary(
+    hypotheses: list[dict[str, Any]] | None = None,
+    findings: list[dict[str, Any]] | None = None,
+    decisions: list[dict[str, Any]] | None = None,
+) -> str:
+    """Template-based research synthesis when no LLM is available."""
+    hyp_list = hypotheses or []
+    findings_list = findings or []
+    decisions_list = decisions or []
+
+    sections: list[str] = []
+
+    sections.append("## Research Overview")
+    sections.append(
+        f"Research memory contains {len(hyp_list)} hypotheses, "
+        f"{len(findings_list)} findings, and {len(decisions_list)} decisions."
+    )
+
+    sections.append("\n## Hypothesis Status")
+    if hyp_list:
+        by_status: dict[str, int] = {}
+        for h in hyp_list:
+            status = h.get("status", "unknown")
+            by_status[status] = by_status.get(status, 0) + 1
+        for status, count in sorted(by_status.items()):
+            sections.append(f"- {status}: {count}")
+    else:
+        sections.append("- No hypotheses recorded.")
+
+    sections.append("\n## Key Findings")
+    if findings_list:
+        for i, f in enumerate(findings_list, 1):
+            text = f.get("text") or f.get("finding") or f.get("summary") or "?"
+            sections.append(f"- {text}")
+    else:
+        sections.append("- No findings recorded.")
+
+    sections.append("\n## Open Questions")
+    open_statuses = {"proposed", "testing", "inconclusive"}
+    open_h = [h for h in hyp_list if h.get("status", "") in open_statuses]
+    if open_h:
+        sections.append(
+            f"- {len(open_h)} hypotheses still open "
+            "(proposed/testing/inconclusive)."
+        )
+    else:
+        sections.append(
+            "- No open hypotheses; all recorded hypotheses have a terminal status."
+        )
+
+    sections.append("\n## Recommended Next Steps")
+    sections.append(
+        "Run the proposed experiments to accumulate statistical evidence "
+        "before changing the strategy."
+    )
+
+    return "\n".join(sections)
+
+
+# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -379,10 +540,11 @@ def generate_llm_explanation(
     user_message = _build_user_message(trade, diagnostic, evidence, critic)
 
     # 1. Try OpenAI
-    openai_key = os.getenv("OPENAI_API_KEY")
+    config = load_config()
+    openai_key = config.openai_api_key
     if openai_key:
-        openai_model = os.getenv("OPENAI_MODEL", "gpt-4o")
-        result = _call_openai(SYSTEM_PROMPT, user_message, model=openai_model, api_key=openai_key)
+        openai_model = config.openai_model
+        result = _call_openai(SYSTEM_PROMPT, user_message, model=openai_model, api_key=openai_key, temperature=config.llm_temperature, max_tokens=config.llm_max_tokens)
         if result:
             return {
                 "explanation": result,
@@ -392,9 +554,9 @@ def generate_llm_explanation(
             }
 
     # 2. Try Ollama
-    ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-    ollama_model = os.getenv("OLLAMA_MODEL", "llama3.1")
-    result = _call_ollama(SYSTEM_PROMPT, user_message, model=ollama_model, base_url=ollama_url)
+    ollama_url = config.ollama_base_url
+    ollama_model = config.ollama_model
+    result = _call_ollama(SYSTEM_PROMPT, user_message, model=ollama_model, base_url=ollama_url, temperature=config.llm_temperature, max_tokens=config.llm_max_tokens)
     if result:
         return {
             "explanation": result,
@@ -408,6 +570,61 @@ def generate_llm_explanation(
     template = _template_explanation(trade, diagnostic, evidence, critic)
     return {
         "explanation": template,
+        "provider": "template",
+        "model": "none",
+        "fallback": True,
+    }
+
+
+def generate_research_summary(
+    hypotheses: list[dict[str, Any]] | None = None,
+    findings: list[dict[str, Any]] | None = None,
+    decisions: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """Generate research synthesis using LLM (OpenAI primary, Ollama fallback, template last).
+
+    Accepts the accumulated research memory (hypotheses, findings, decisions)
+    and returns a natural-language synthesis of the research program.
+
+    Returns dict with keys:
+      - summary: str (the research synthesis)
+      - provider: str (which provider was used)
+      - model: str (which model was used)
+      - fallback: bool (whether a fallback was used)
+    """
+    user_message = _build_research_user_message(hypotheses, findings, decisions)
+
+    # 1. Try OpenAI
+    config = load_config()
+    openai_key = config.openai_api_key
+    if openai_key:
+        openai_model = config.openai_model
+        result = _call_openai(RESEARCH_SYSTEM_PROMPT, user_message, model=openai_model, api_key=openai_key, temperature=config.llm_temperature, max_tokens=config.llm_max_tokens)
+        if result:
+            return {
+                "summary": result,
+                "provider": "openai",
+                "model": openai_model,
+                "fallback": False,
+            }
+
+    # 2. Try Ollama
+    ollama_url = config.ollama_base_url
+    ollama_model = config.ollama_model
+    result = _call_ollama(RESEARCH_SYSTEM_PROMPT, user_message, model=ollama_model, base_url=ollama_url, temperature=config.llm_temperature, max_tokens=config.llm_max_tokens)
+    if result:
+        return {
+            "summary": result,
+            "provider": "ollama",
+            "model": ollama_model,
+            "fallback": False,
+        }
+
+    # 3. Template fallback
+    logger.info("No LLM available; using template research summary")
+    template = _template_research_summary(hypotheses, findings, decisions)
+    return {
+        "summary": template,
         "provider": "template",
         "model": "none",
         "fallback": True,

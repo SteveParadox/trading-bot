@@ -424,6 +424,17 @@ def _cmd_research() -> None:
             if count > 0:
                 print(f"    {status}: {count}")
 
+    narrative = analyst.get_research_narrative()
+    provider = narrative.get("provider", "unknown")
+    model = narrative.get("model", "unknown")
+    fallback = narrative.get("fallback", False)
+
+    print(f"\nRESEARCH SYNTHESIS (provider: {provider}, model: {model}"
+          f"{', template fallback' if fallback else ''})")
+    print("=" * 70)
+    print(narrative.get("summary", "No research synthesis generated."))
+    print("=" * 70)
+
 
 def _cmd_explain(trade_id: str) -> None:
     analyst = _build_analyst()

@@ -36,8 +36,9 @@ class AnalysisStore:
         parent = Path(self.db_path).parent
         if str(parent) not in ("", "."):
             parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=30000")
         return conn
 
     def _ensure_schema(self) -> None:

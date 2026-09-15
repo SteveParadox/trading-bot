@@ -70,19 +70,24 @@ class TradeAnalyst:
             load_trades_from_jsonl,
         )
 
+        # SQLite is the canonical source: trade_journal has one row per broker
+        # trade, while JSONL intentionally contains repeated scan snapshots.
+        if self.database_url:
+            try:
+                self._trades = load_trades_from_database(self.database_url)
+            except Exception as exc:  # noqa: BLE001 - defensive after internal handling
+                logger.warning("Failed to load trades from DB %s: %s", self.database_url, exc)
+                self._trades = []
+
+        if self._trades:
+            return
+
         jsonl_path = Path(self.jsonl_path)
         if jsonl_path.exists():
             try:
                 self._trades = load_trades_from_jsonl(str(jsonl_path))
             except Exception as exc:  # noqa: BLE001 - defensive after internal handling
                 logger.warning("Failed to load trades from JSONL %s: %s", jsonl_path, exc)
-                self._trades = []
-
-        if not self._trades and self.database_url:
-            try:
-                self._trades = load_trades_from_database(self.database_url)
-            except Exception as exc:  # noqa: BLE001 - defensive after internal handling
-                logger.warning("Failed to load trades from DB %s: %s", self.database_url, exc)
                 self._trades = []
 
     @property
@@ -211,6 +216,28 @@ class TradeAnalyst:
         config = load_config()
         mem = ResearchMemory(config.research_memory_path)
         return mem.summary()
+
+    def get_research_narrative(self) -> dict[str, Any]:
+        """LLM-powered synthesis of accumulated research memory.
+
+        Collects hypotheses, findings, and decisions from research memory and
+        asks the LLM reasoner to turn them into a research narrative.
+        Returns dict with summary, provider, model, fallback, and summary_counts.
+        """
+        from forex_agent.agent.research_memory import ResearchMemory
+        from forex_agent.analysis.llm_reasoner import generate_research_summary
+        config = load_config()
+        mem = ResearchMemory(config.research_memory_path)
+        hypotheses = [h.to_dict() for h in mem.get_hypotheses()]
+        findings = mem.get_findings()
+        decisions = mem.get_decisions()
+        result = generate_research_summary(
+            hypotheses=hypotheses,
+            findings=findings,
+            decisions=decisions,
+        )
+        result["summary_counts"] = mem.summary()
+        return result
 
     def explain_trade(self, trade_id: str) -> dict[str, Any] | None:
         """Full LLM-powered explanation for a trade.
@@ -409,6 +436,16 @@ class TradeAnalyst:
         else:
             evidence_level = DiagnosticLevel.OBSERVATION
 
+        config = load_config()
+        observed_samples = [f.sample_size for f in factors + protective if f.sample_size > 0]
+        max_sample = max(observed_samples, default=0)
+        if max_sample < config.min_sample_size:
+            evidence_level = DiagnosticLevel.OBSERVATION
+            confidence = min(confidence, 0.35)
+            unknowns.append(
+                f"No statistically meaningful evidence: observed samples are below the configured minimum of {config.min_sample_size}."
+            )
+
         return TradeDiagnostic(
             trade_id=trade.trade_id,
             outcome=outcome,
@@ -421,7 +458,11 @@ class TradeAnalyst:
             confidence=round(confidence, 3),
             evidence_level=evidence_level,
             sample_sizes={f.label: f.sample_size for f in factors + protective if f.sample_size > 0},
-            statistical_support={},
+            statistical_support={
+                "meaningful_evidence": max_sample >= config.min_sample_size,
+                "minimum_sample_size": config.min_sample_size,
+                "observed_max_sample_size": max_sample,
+            },
             counterfactuals=[],
             unknowns=unknowns,
         )
@@ -454,12 +495,16 @@ class TradeAnalyst:
 
         expectancy = float(np.mean(r_values)) if len(r_values) > 0 else 0.0
 
-        equity = np.cumsum(np.concatenate(([0.0], pnls)))
+        # Measure drawdown against account equity, not a P&L curve rooted at
+        # zero. A zero-rooted curve makes initial losses produce arbitrary
+        # percentages and can trigger false health alerts.
+        initial_balance = float(closed[0].account_balance or 0.0)
+        equity = initial_balance + np.concatenate(([0.0], np.cumsum(pnls)))
         running_max = np.maximum.accumulate(equity)
-        drawdowns = equity - running_max
-        max_dd = float(np.min(drawdowns))
+        drawdowns = running_max - equity
+        max_dd = float(np.max(drawdowns))
         peak = float(np.max(running_max))
-        max_dd_pct = abs(max_dd / peak) if peak > 0 else 0.0
+        max_dd_pct = max_dd / peak if peak > 0 else 0.0
 
         sharpe = self._compute_sharpe(r_values)
 
@@ -478,7 +523,7 @@ class TradeAnalyst:
         median_duration = float(np.median(durations)) if durations else 0.0
 
         payoff_ratio = abs(avg_win / avg_loss) if avg_loss != 0 else 0.0
-        recovery_factor = (total_pnl / abs(max_dd)) if max_dd < 0 else 0.0
+        recovery_factor = (total_pnl / max_dd) if max_dd > 0 else 0.0
 
         # Trade frequency (per day based on date span)
         trade_freq = self._compute_trade_frequency(closed)
@@ -648,6 +693,17 @@ class TradeAnalyst:
                 f"Consecutive losses ({metrics.consecutive_losses}) exceed threshold"
             )
 
+        evidence_exp = config.health_thresholds.get("minimum_expectancy_r", 0.10)
+        evidence_pf = config.health_thresholds.get("minimum_profit_factor", 1.0)
+        if metrics.expectancy < evidence_exp:
+            recommendations.append(
+                f"Expectancy ({metrics.expectancy:.2f}R) is below the pre-specified evidence threshold ({evidence_exp:.2f}R)"
+            )
+        if metrics.profit_factor < evidence_pf:
+            recommendations.append(
+                f"Profit factor ({metrics.profit_factor:.2f}) is below the pre-specified evidence threshold ({evidence_pf:.2f})"
+            )
+
         # --- Health status classification ---
         status, status_reason = self._classify_health_status(
             metrics, recommendations, config.health_thresholds
@@ -679,7 +735,7 @@ class TradeAnalyst:
         code.
         """
         thresholds = health or load_config().health_thresholds
-        min_sample = int(thresholds.get("critical_min_sample", 20))
+        min_sample = int(thresholds.get("critical_min_sample", 100))
         critical_exp = thresholds.get("critical_expectancy", -0.5)
         critical_pf = thresholds.get("critical_profit_factor", 0.7)
         critical_dd = thresholds.get("critical_max_drawdown_pct", 0.15)
@@ -1133,11 +1189,12 @@ class TradeAnalyst:
             return {"status": "no closed trades"}
 
         pnls = np.array([t.pnl for t in closed])
-        equity = np.cumsum(np.concatenate(([0.0], pnls)))
+        initial_balance = float(closed[0].account_balance or 0.0)
+        equity = initial_balance + np.concatenate(([0.0], np.cumsum(pnls)))
         running_max = np.maximum.accumulate(equity)
-        drawdowns = equity - running_max
+        drawdowns = running_max - equity
 
-        max_dd = float(np.min(drawdowns))
+        max_dd = float(np.max(drawdowns))
         peak = float(np.max(running_max))
 
         risk_pcts = np.array([
@@ -1148,7 +1205,7 @@ class TradeAnalyst:
 
         return {
             "max_drawdown": max_dd,
-            "max_drawdown_pct": abs(max_dd / peak) if peak > 0 else 0.0,
+            "max_drawdown_pct": max_dd / peak if peak > 0 else 0.0,
             "avg_risk_per_trade": float(np.mean(risk_pcts)) if len(risk_pcts) > 0 else 0.0,
             "max_risk_single_trade": float(np.max(risk_pcts)) if len(risk_pcts) > 0 else 0.0,
             "trades_in_drawdown": int(np.sum(drawdowns < 0)),

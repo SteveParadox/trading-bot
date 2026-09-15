@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -22,6 +23,10 @@ def load_trades_from_jsonl(path: str | Path) -> list[TradeRecord]:
     Only ``type == "trade"`` records are parsed from the journal format.
     """
     trades: list[TradeRecord] = []
+    # The FX worker appends a current-state snapshot every scan. Keep the
+    # latest snapshot for each broker trade so the JSONL fallback remains a
+    # trade journal rather than a scan-count-weighted sample.
+    journal_positions: dict[str, int] = {}
     with open(path, "r", encoding="utf-8") as f:
         for line_no, line in enumerate(f, start=1):
             line = line.strip()
@@ -31,6 +36,10 @@ def load_trades_from_jsonl(path: str | Path) -> list[TradeRecord]:
                 data = json.loads(line)
             except json.JSONDecodeError:
                 logger.debug("Skipping malformed JSONL line %d in %s", line_no, path)
+                continue
+
+            if not isinstance(data, dict):
+                logger.debug("Skipping non-object JSONL line %d in %s", line_no, path)
                 continue
 
             log_type = data.get("type")
@@ -46,7 +55,15 @@ def load_trades_from_jsonl(path: str | Path) -> list[TradeRecord]:
 
             trade = _parse_trade_record(trade_data)
             if trade is not None:
-                trades.append(trade)
+                if log_type == "trade" and trade.trade_id:
+                    position = journal_positions.get(trade.trade_id)
+                    if position is None:
+                        journal_positions[trade.trade_id] = len(trades)
+                        trades.append(trade)
+                    else:
+                        trades[position] = trade
+                else:
+                    trades.append(trade)
 
     return trades
 
@@ -54,7 +71,7 @@ def load_trades_from_jsonl(path: str | Path) -> list[TradeRecord]:
 def _parse_trade_record(data: dict) -> Optional[TradeRecord]:
     """Parse a trade payload dict into a TradeRecord (or None if invalid)."""
 
-    entry_price = data.get("entry_price")
+    entry_price = _optional_float(data.get("entry_price"))
     if entry_price is None or entry_price <= 0:
         return None
 
@@ -66,10 +83,7 @@ def _parse_trade_record(data: dict) -> Optional[TradeRecord]:
     exit_price = data.get("exit_price")
     exit_time = _parse_optional_dt(data.get("exit_time"))
     if exit_price is not None:
-        try:
-            exit_price = float(exit_price)
-        except (TypeError, ValueError):
-            exit_price = None
+        exit_price = _optional_float(exit_price)
     if exit_time is None and exit_price is not None:
         # Exit time unknown but exit price present: keep exit price.
         pass
@@ -89,7 +103,8 @@ def _parse_trade_record(data: dict) -> Optional[TradeRecord]:
         stop_loss = None
 
     take_profit = data.get("take_profit") or data.get("tp")
-    if take_profit is not None and take_profit == 0:
+    take_profit = _optional_float(take_profit)
+    if take_profit is not None and take_profit <= 0:
         take_profit = None
 
     symbol = data.get("symbol") or data.get("instrument") or "UNKNOWN"
@@ -100,29 +115,26 @@ def _parse_trade_record(data: dict) -> Optional[TradeRecord]:
     position_size = data.get("position_size")
     if position_size is None:
         position_size = data.get("units")
-    try:
-        position_size = float(position_size) if position_size is not None else 1.0
-    except (TypeError, ValueError):
-        position_size = 1.0
+    position_size = _optional_float(position_size) or 1.0
 
     sponsor = TradeRecord(
         trade_id=str(data.get("trade_id") or data.get("broker_trade_id") or data.get("id") or ""),
         symbol=symbol,
         direction=direction,
-        entry_price=float(entry_price),
+        entry_price=entry_price,
         exit_price=exit_price,
         stop_loss=stop_loss if stop_loss is not None else (entry_price * 0.99 if direction == "LONG" else entry_price * 1.01),
         take_profit=take_profit,
             position_size=position_size,
-            account_balance=float(data.get("account_balance") or 10000.0),
-            risk_amount=float(data.get("risk_amount") or 0.0),
+            account_balance=_optional_float(data.get("account_balance")) or 10000.0,
+            risk_amount=_optional_float(data.get("risk_amount")) or 0.0,
             realized_pl=_optional_float(data.get("realized_pl")),
             entry_time=entry_time,
         exit_time=exit_time,
-        spread_at_entry=float(data.get("spread_at_entry") or data.get("spread") or 0.0),
-        slippage_pips=float(data.get("slippage_pips") or data.get("slippage") or 0.0),
-        commission=float(data.get("commission") or 0.0),
-        financing=float(data.get("financing") or 0.0),
+        spread_at_entry=_optional_float(data.get("spread_at_entry") or data.get("spread")) or 0.0,
+        slippage_pips=_optional_float(data.get("slippage_pips") or data.get("slippage")) or 0.0,
+        commission=_optional_float(data.get("commission")) or 0.0,
+        financing=_optional_float(data.get("financing")) or 0.0,
         notes=data.get("notes") or data.get("exit_reason") or "",
         mfe=_optional_float(data.get("mfe")),
         mae=_optional_float(data.get("mae")),
@@ -172,9 +184,10 @@ def _optional_float(value) -> Optional[float]:
     if value is None:
         return None
     try:
-        return float(value)
+        converted = float(value)
     except (TypeError, ValueError):
         return None
+    return converted if math.isfinite(converted) else None
 
 
 def compute_r_multiple(trade: TradeRecord) -> Optional[float]:
@@ -237,8 +250,9 @@ def load_trades_from_database(database_url: str) -> list[TradeRecord]:
 
     trades: list[TradeRecord] = []
     try:
-        conn = sqlite3.connect(db_path)
+        conn = sqlite3.connect(db_path, timeout=30)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=30000")
         rows = conn.execute(
             "SELECT * FROM trade_journal ORDER BY id"
         ).fetchall()

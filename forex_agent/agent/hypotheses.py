@@ -8,6 +8,7 @@ import numpy as np
 
 from forex_agent.data.ingestion import compute_r_values
 from forex_agent.data.schemas import TradeRecord
+from forex_agent.config import load_config
 
 
 def _get_r_values(trades: list[TradeRecord]) -> np.ndarray:
@@ -149,7 +150,12 @@ def _cohens_d(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def propose_experiments(analysis_report: Any) -> list[Experiment]:
+    minimum_sample = load_config().min_sample_size
     experiments: list[Experiment] = []
+
+    metrics = getattr(analysis_report, "metrics", None)
+    if metrics is not None and getattr(metrics, "total_trades", 0) < minimum_sample:
+        return []
 
     patterns = getattr(analysis_report, "recurring_patterns", [])
     for pattern in patterns:
@@ -170,7 +176,7 @@ def propose_experiments(analysis_report: Any) -> list[Experiment]:
                 control_group=f"Trades outside {session} session",
                 treatment_group=f"Trades during {session} session",
                 metric="Expectancy (R-multiple)",
-                min_sample_size=30,
+                min_sample_size=minimum_sample,
                 statistical_test="Welch t-test",
                 acceptance_criteria="p < 0.05 and Cohen's d > 0.3",
                 rejection_criteria="p >= 0.10 or effect size < 0.1",
@@ -193,7 +199,7 @@ def propose_experiments(analysis_report: Any) -> list[Experiment]:
                 control_group=f"Trades on other symbols",
                 treatment_group=f"Trades on {symbol}",
                 metric="Expectancy (R-multiple)",
-                min_sample_size=20,
+                min_sample_size=minimum_sample,
                 statistical_test="Welch t-test",
                 acceptance_criteria="p < 0.05 and mean difference > 0.2R",
                 rejection_criteria="p >= 0.10",
@@ -202,7 +208,6 @@ def propose_experiments(analysis_report: Any) -> list[Experiment]:
             ))
 
     if not experiments:
-        metrics = getattr(analysis_report, "metrics", None)
         if metrics is not None:
             wr = getattr(metrics, "win_rate", 0.0)
             exp_val = getattr(metrics, "expectancy", 0.0)
@@ -214,7 +219,7 @@ def propose_experiments(analysis_report: Any) -> list[Experiment]:
                     control_group="First half of trade history",
                     treatment_group="Second half of trade history",
                     metric="Expectancy (R-multiple)",
-                    min_sample_size=20,
+                    min_sample_size=minimum_sample,
                     statistical_test="Welch t-test on R-multiples",
                     acceptance_criteria="p < 0.05 with Cohen's d > 0.3",
                     rejection_criteria="p >= 0.10 or effect size < 0.1",
@@ -231,7 +236,8 @@ def evaluate_experiment_hypothesis(
     regime_fn: Callable[[TradeRecord], str] | None = None,
 ) -> ExperimentResult:
     closed = [t for t in trades if t.exit_price is not None]
-    if len(closed) < 10:
+    minimum_sample = load_config().min_sample_size
+    if len(closed) < minimum_sample:
         return ExperimentResult(
             hypothesis=hypothesis,
             supported=False,
@@ -240,11 +246,11 @@ def evaluate_experiment_hypothesis(
             p_value=1.0,
             effect_size=0.0,
             confidence="unknown",
-            warning=f"Only {len(closed)} closed trades available; need at least 10",
+            warning=f"Only {len(closed)} closed trades available; need at least {minimum_sample}",
         )
 
     r_values = _get_r_values(closed)
-    if len(r_values) < 10:
+    if len(r_values) < minimum_sample:
         return ExperimentResult(
             hypothesis=hypothesis,
             supported=False,
@@ -253,7 +259,7 @@ def evaluate_experiment_hypothesis(
             p_value=1.0,
             effect_size=0.0,
             confidence="unknown",
-            warning="Could not compute sufficient R-multiples",
+            warning=f"Could not compute {minimum_sample} valid R-multiples",
         )
 
     mid = len(closed) // 2
@@ -296,8 +302,8 @@ def evaluate_experiment_hypothesis(
 
     warning = ""
     total = len(r_values)
-    if total < 30:
-        warning = f"Sample size ({total}) is small; results may not be robust"
+    if total < minimum_sample:
+        warning = f"Sample size ({total}) is below the pre-specified minimum ({minimum_sample}); results are not evidence"
 
     return ExperimentResult(
         hypothesis=hypothesis,

@@ -4,6 +4,7 @@ from typing import Any
 
 from forex_agent.data.schemas import CriticAssessment, TradeRecord
 from forex_agent.data.ingestion import compute_r_multiple, compute_r_values
+from forex_agent.config import load_config
 
 
 def assess_finding(
@@ -23,11 +24,19 @@ def assess_finding(
     adjusted = initial_confidence
     sample = matched_trades or trades
     closed = [t for t in sample if t.exit_price is not None]
+    configured_min_sample = load_config().min_sample_size
 
     # 1. Sample size
     n = len(closed)
     sample_concern = False
-    if n < 10:
+    if n < configured_min_sample:
+        challenges.append(
+            f"Sample size ({n}) is below the pre-specified minimum ({configured_min_sample}); "
+            "treat this as observation only, not statistically meaningful evidence."
+        )
+        adjusted *= 0.5
+        sample_concern = True
+    elif n < 10:
         challenges.append(f"Very small sample size ({n}). Findings are unreliable.")
         adjusted *= 0.5
         sample_concern = True
