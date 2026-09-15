@@ -182,7 +182,23 @@ class FxRiskManager:
             reward_distance = entry - take_profit
 
         stop_pips = pips_between(instrument, entry, stop_loss)
-        if stop_pips < self.strategy.min_stop_pips or stop_pips > self.strategy.max_stop_pips:
+        atr = float(row.get("atr") or 0.0)
+        stop_atr_multiple = risk_distance / atr if atr > 0 else None
+        legacy_stop_filter = (
+            self.strategy.min_stop_pips is not None
+            and self.strategy.max_stop_pips is not None
+            and (stop_pips < self.strategy.min_stop_pips or stop_pips > self.strategy.max_stop_pips)
+        )
+        if (
+            (
+                stop_atr_multiple is not None
+                and (
+                    stop_atr_multiple < self.strategy.min_stop_atr_multiple
+                    or stop_atr_multiple > self.strategy.max_stop_atr_multiple
+                )
+            )
+            or legacy_stop_filter
+        ):
             return None
         if instrument.minimum_stop_distance and risk_distance < instrument.minimum_stop_distance:
             return None

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import os
+import threading
 from dataclasses import asdict, is_dataclass
 from datetime import datetime, timezone
 from enum import Enum
@@ -19,19 +21,35 @@ from fxbot.database import (
     EventLogRow,
     OrderJournalRow,
     PositionSnapshotRow,
+    RunManifestRow,
     SignalJournalRow,
     TradeJournalRow,
     session_factory,
     utc_now,
 )
 from fxbot.models import BotRunState
+from fxbot.security import redact
 
 
 class StructuredJournal:
-    def __init__(self, database_url: str, jsonl_path: str | None = None) -> None:
+    def __init__(
+        self,
+        database_url: str,
+        jsonl_path: str | None = None,
+        *,
+        strategy_hash: str | None = None,
+        code_version: str | None = None,
+        data_hash: str | None = None,
+        experiment_manifest_hash: str | None = None,
+    ) -> None:
         self.sessions = session_factory(database_url)
         self._engine = self.sessions.kw.get("bind")
         self.jsonl_path = Path(jsonl_path) if jsonl_path else None
+        self.strategy_hash = strategy_hash
+        self.code_version = code_version
+        self.data_hash = data_hash
+        self.experiment_manifest_hash = experiment_manifest_hash
+        self._jsonl_lock = threading.Lock()
         if self.jsonl_path:
             self.jsonl_path.parent.mkdir(parents=True, exist_ok=True)
         self._ensure_state()
@@ -84,6 +102,10 @@ class StructuredJournal:
         take_profit: float | None = None,
         risk_amount: float | None = None,
         payload: dict[str, Any] | None = None,
+        strategy_hash: str | None = None,
+        code_version: str | None = None,
+        data_hash: str | None = None,
+        experiment_manifest_hash: str | None = None,
     ) -> SignalJournalRow:
         row = SignalJournalRow(
             timestamp=_aware(timestamp),
@@ -97,6 +119,10 @@ class StructuredJournal:
             take_profit=take_profit,
             risk_amount=risk_amount,
             payload=_jsonable(payload or {}),
+            strategy_hash=strategy_hash or self.strategy_hash,
+            code_version=code_version or self.code_version,
+            data_hash=data_hash or self.data_hash,
+            experiment_manifest_hash=experiment_manifest_hash or self.experiment_manifest_hash,
         )
         with self.sessions.begin() as session:
             session.add(row)
@@ -116,6 +142,10 @@ class StructuredJournal:
         order_type: str,
         risk_amount: float,
         payload: dict[str, Any],
+        strategy_hash: str | None = None,
+        code_version: str | None = None,
+        data_hash: str | None = None,
+        experiment_manifest_hash: str | None = None,
     ) -> tuple[OrderJournalRow, bool]:
         existing = self.find_order(client_order_id)
         if existing is not None:
@@ -130,6 +160,10 @@ class StructuredJournal:
             status="pending",
             risk_amount=risk_amount,
             payload=_jsonable(payload),
+            strategy_hash=strategy_hash or self.strategy_hash,
+            code_version=code_version or self.code_version,
+            data_hash=data_hash or self.data_hash,
+            experiment_manifest_hash=experiment_manifest_hash or self.experiment_manifest_hash,
         )
         with self.sessions.begin() as session:
             session.add(row)
@@ -174,6 +208,10 @@ class StructuredJournal:
         side: str,
         units: float,
         payload: dict[str, Any],
+        strategy_hash: str | None = None,
+        code_version: str | None = None,
+        data_hash: str | None = None,
+        experiment_manifest_hash: str | None = None,
     ) -> OrderJournalRow:
         client_order_id = f"mt5-external-{broker_trade_id}"
         with self.sessions.begin() as session:
@@ -194,6 +232,10 @@ class StructuredJournal:
                     risk_amount=0.0,
                     payload=_jsonable(payload),
                     response=_jsonable(payload),
+                    strategy_hash=strategy_hash or self.strategy_hash,
+                    code_version=code_version or self.code_version,
+                    data_hash=data_hash or self.data_hash,
+                    experiment_manifest_hash=experiment_manifest_hash or self.experiment_manifest_hash,
                 )
                 session.add(row)
             else:
@@ -305,6 +347,10 @@ class StructuredJournal:
         price: float | None,
         estimated_daily_financing: float = 0.0,
         payload: dict[str, Any] | None = None,
+        strategy_hash: str | None = None,
+        code_version: str | None = None,
+        data_hash: str | None = None,
+        experiment_manifest_hash: str | None = None,
     ) -> CurrentPositionRow:
         name = instrument.upper()
         with self.sessions.begin() as session:
@@ -357,6 +403,10 @@ class StructuredJournal:
         financing: float = 0.0,
         exit_reason: str | None = None,
         payload: dict[str, Any] | None = None,
+        strategy_hash: str | None = None,
+        code_version: str | None = None,
+        data_hash: str | None = None,
+        experiment_manifest_hash: str | None = None,
     ) -> TradeJournalRow:
         with self.sessions.begin() as session:
             row = session.scalar(
@@ -369,6 +419,10 @@ class StructuredJournal:
                     side=side,
                     units=units,
                     state=state,
+                    strategy_hash=strategy_hash or self.strategy_hash,
+                    code_version=code_version or self.code_version,
+                    data_hash=data_hash or self.data_hash,
+                    experiment_manifest_hash=experiment_manifest_hash or self.experiment_manifest_hash,
                 )
                 session.add(row)
             row.entry_time = _aware(entry_time) if entry_time else row.entry_time
@@ -379,7 +433,11 @@ class StructuredJournal:
             row.financing = financing
             row.state = state
             row.exit_reason = exit_reason
-            row.payload = _jsonable(payload or row.payload or {})
+            # Broker close-history payloads arrive after the initial fill
+            # record. Merge rather than replace so the strategy context
+            # (quality score, entry feature snapshot, decision time) remains
+            # available for unbiased post-trade calibration.
+            row.payload = _jsonable({**(row.payload or {}), **(payload or {})})
             session.flush()
             session.expunge(row)
         self.write_jsonl("trade", row)
@@ -411,17 +469,64 @@ class StructuredJournal:
                 payload=payload or {},
             )
 
+    def record_run_manifest(
+        self,
+        *,
+        run_id: str,
+        strategy_hash: str,
+        code_version: str,
+        data_hash: str,
+        manifest_hash: str,
+        manifest: dict[str, Any],
+    ) -> RunManifestRow:
+        """Persist an immutable research/forward-test manifest in SQLite."""
+
+        with self.sessions.begin() as session:
+            row = session.get(RunManifestRow, run_id)
+            if row is None:
+                row = RunManifestRow(
+                    run_id=run_id,
+                    strategy_hash=strategy_hash,
+                    code_version=code_version,
+                    data_hash=data_hash,
+                    manifest_hash=manifest_hash,
+                    manifest=_jsonable(manifest),
+                )
+                session.add(row)
+            elif row.manifest_hash != manifest_hash:
+                raise ValueError(f"run manifest {run_id} is immutable")
+            session.flush()
+            session.expunge(row)
+        return row
+
     def log_event(self, event_type: str, message: str, *, level: str = "info", payload: dict[str, Any] | None = None) -> None:
         row = EventLogRow(
             timestamp=utc_now(),
             level=level,
             event_type=event_type,
             message=message,
-            payload=_jsonable(payload or {}),
+            payload=_jsonable(redact(payload or {})),
         )
         with self.sessions.begin() as session:
             session.add(row)
         self.write_jsonl("event", row)
+
+    def recent_events(self, limit: int = 100) -> list[EventLogRow]:
+        return _recent(self.sessions, EventLogRow, limit)
+
+    def recovery_orders(self, limit: int = 100) -> list[OrderJournalRow]:
+        with self.sessions() as session:
+            rows = list(
+                session.scalars(
+                    select(OrderJournalRow)
+                    .where(OrderJournalRow.status.in_(("pending", "unknown")))
+                    .order_by(OrderJournalRow.id)
+                    .limit(limit)
+                )
+            )
+            for row in rows:
+                session.expunge(row)
+            return rows
 
     def latest_equity(self, limit: int = 500) -> list[EquitySnapshotRow]:
         with self.sessions() as session:
@@ -554,8 +659,19 @@ class StructuredJournal:
             "timestamp": utc_now().isoformat(),
             "payload": _jsonable(payload),
         }
-        with self.jsonl_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record, sort_keys=True) + "\n")
+        # JSONL is a compatibility export only; SQLite remains canonical.  A
+        # lock file keeps concurrent worker/API processes from interleaving
+        # records when an operator explicitly enables this export.
+        lock_path = self.jsonl_path.with_suffix(self.jsonl_path.suffix + ".lock")
+        with self._jsonl_lock, lock_path.open("a+b") as lock_handle:
+            _lock_file(lock_handle)
+            try:
+                with self.jsonl_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(redact(record), sort_keys=True) + "\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+            finally:
+                _unlock_file(lock_handle)
 
 
 def row_to_dict(row: Any) -> dict[str, Any]:
@@ -591,3 +707,30 @@ def _jsonable(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_jsonable(item) for item in value]
     return value
+
+
+def _lock_file(handle: Any) -> None:
+    try:
+        import msvcrt
+
+        handle.seek(0)
+        handle.write(b"0")
+        handle.flush()
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+    except ImportError:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+
+
+def _unlock_file(handle: Any) -> None:
+    try:
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    except ImportError:
+        import fcntl
+
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)

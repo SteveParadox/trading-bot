@@ -5,13 +5,14 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+from uuid import uuid4
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
 import pandas as pd
 
-from fxbot.config import FxBotSettings, ensure_runtime_dirs, settings_from_env
+from fxbot.config import FxBotSettings, NewsEvent, ensure_runtime_dirs, settings_from_env
 from fxbot.instruments import (
     FxInstrument,
     PriceSnapshot,
@@ -19,9 +20,11 @@ from fxbot.instruments import (
     position_value_home,
 )
 from fxbot.journal import StructuredJournal
-from fxbot.market_hours import trading_allowed_now
+from fxbot.market_hours import can_trade, news_blackout_reason
 from fxbot.models import BotRunState, FxPortfolioState, FxSignalIntent, Side
-from fxbot.mt5 import Mt5Client, Mt5CredentialsMissing, Mt5Error, extract_order_ids
+from fxbot.mt5 import Mt5Client, Mt5CredentialsMissing, Mt5Error, Mt5RejectedError, extract_order_ids
+from fxbot.operations import freshness
+from fxbot.recovery import RecoveryState, reconcile_order
 from fxbot.risk import FxRiskDecision, FxRiskManager
 from fxbot.strategy import (
     TIMEFRAME_DELTAS,
@@ -30,6 +33,11 @@ from fxbot.strategy import (
     last_closed_row,
     prepare_indicators,
 )
+from fxbot.database import set_lock_retry_callback
+from fxbot.monitoring import OperationalMonitor
+from fxbot.news import NewsGateway, build_news_gateway
+from fxbot.operations import clock_health
+from fxbot.security import code_version, data_hash, experiment_manifest, strategy_config_hash
 
 log = logging.getLogger(__name__)
 
@@ -50,6 +58,8 @@ class ForwardTestWorker:
         client: Mt5Client | None = None,
         journal: StructuredJournal | None = None,
         publisher: Publisher | None = None,
+        monitor: OperationalMonitor | None = None,
+        news: NewsGateway | None = None,
     ) -> None:
         self.settings = settings or settings_from_env()
         ensure_runtime_dirs(self.settings)
@@ -59,7 +69,42 @@ class ForwardTestWorker:
             self.settings.runtime.log_jsonl_path,
         )
         self.publisher = publisher
+        self.monitor = monitor or OperationalMonitor(
+            stale_price_threshold_seconds=self.settings.runtime.max_price_age_seconds,
+            news_data_max_age_seconds=self.settings.strategy.news_data_max_age_seconds,
+        )
+        self.news = news or build_news_gateway(
+            self.settings.strategy,
+            database_url=self.settings.runtime.database_url,
+            monitor=self.monitor,
+            static_events=self.settings.news_events,
+        )
+        # Feed SQLite lock retries into the operational monitor.
+        monitor_ref = self.monitor
+        set_lock_retry_callback(monitor_ref.record_db_lock_retry)
         self.risk = FxRiskManager(self.settings.risk, self.settings.strategy)
+        self.strategy_hash = strategy_config_hash(self.settings)
+        self.code_version = code_version()
+        self.run_id = uuid4().hex
+        self.journal.strategy_hash = self.strategy_hash
+        self.journal.code_version = self.code_version
+        self.journal.data_hash = self.journal.data_hash or data_hash({"source": "mt5", "run_id": self.run_id})
+        manifest = experiment_manifest(
+            strategy_hash=self.strategy_hash,
+            code=self.code_version,
+            data={"source": "mt5", "run_id": self.run_id},
+            splits={"type": "forward_test"},
+            parameters={"instruments": self.settings.instruments},
+        )
+        self.journal.experiment_manifest_hash = manifest["manifest_hash"]
+        self.journal.record_run_manifest(
+            run_id=self.run_id,
+            strategy_hash=self.strategy_hash,
+            code_version=self.code_version,
+            data_hash=manifest["data_hash"],
+            manifest_hash=manifest["manifest_hash"],
+            manifest=manifest,
+        )
         self._stop = asyncio.Event()
         self._instrument_cache: dict[str, FxInstrument] = {}
 
@@ -78,10 +123,17 @@ class ForwardTestWorker:
                 continue
             try:
                 await asyncio.to_thread(self.scan_once)
+                self.monitor.record_broker_reconnect()
             except Mt5CredentialsMissing as exc:
                 self.journal.set_state(BotRunState.PAUSED, "missing_mt5_connection")
                 self.journal.log_event("credentials_missing", str(exc), level="error")
+                self.monitor.record_broker_disconnect(str(exc))
                 await self._publish({"type": "worker_paused", "reason": "missing_mt5_connection"})
+            except Mt5Error as exc:
+                self.journal.set_state(BotRunState.PAUSED, "broker_disconnected")
+                self.journal.log_event("broker_disconnected", str(exc), level="error")
+                self.monitor.record_broker_disconnect(str(exc))
+                await self._publish({"type": "worker_paused", "reason": "broker_disconnected"})
             except Exception as exc:
                 log.exception("forward-test scan failed")
                 self.journal.log_event("scan_error", str(exc), level="error")
@@ -101,8 +153,32 @@ class ForwardTestWorker:
         now = datetime.now(timezone.utc)
         if self.journal.get_state().state != BotRunState.RUNNING.value:
             return
+        if not self.settings.broker.demo_only and not self.settings.runtime.live_release_approved:
+            self.journal.set_state(BotRunState.HALTED, "live_release_gate_required")
+            self.journal.log_event(
+                "live_release_gate_blocked",
+                "Live trading is blocked until the audited release gate is approved",
+                level="critical",
+            )
+            self.monitor.record_operator_review("live release gate not approved")
+            return
         instruments = self._load_instruments()
         prices = self.client.pricing(self.settings.instruments)
+        if not self._check_price_freshness(now, prices.prices):
+            return
+        # Record price freshness for the monitoring dashboard
+        for name, price in prices.prices.items():
+            self.monitor.record_price(name, price.time)
+        self._reconcile_unknown_orders()
+        self.monitor.record_scan_heartbeat()
+        self.journal.log_event("scan_heartbeat", "broker scan completed", payload={"run_id": self.run_id})
+        # Check broker-host clock health every scan
+        try:
+            broker_time = now  # MT5 server time is approximated from local clock
+            ch = clock_health(now, broker_time, max_skew_seconds=300.0)
+            self.monitor.record_clock_health(ch)
+        except Exception:
+            pass
         account = self.client.account_summary()
         positions = self.client.open_positions()
         portfolio = self._portfolio_from_broker(
@@ -127,6 +203,8 @@ class ForwardTestWorker:
         )
         self._sync_trade_history(now)
         self._sync_open_trades(now, instruments, prices.prices, prices.conversion_rates)
+        news_snapshot = self.news.ensure_current(now)
+        self._protect_positions_for_news(now, instruments, prices.prices, news_snapshot.events)
         halt_reason = self.journal.update_protection_state(
             timestamp=now,
             equity=portfolio.equity,
@@ -135,7 +213,10 @@ class ForwardTestWorker:
         )
         if halt_reason:
             self.journal.log_event("risk_halt", halt_reason, level="warning")
+            self.monitor.record_risk_halt(halt_reason)
             return
+        else:
+            self.monitor.clear_risk_halt()
 
         for name in self.settings.instruments:
             instrument = instruments.get(name)
@@ -146,14 +227,68 @@ class ForwardTestWorker:
             if portfolio.pair_exposures.get(name, 0.0) > 0:
                 self._skip(now, name, "pair_position_open")
                 continue
-            allowed, reason = trading_allowed_now(name, self.settings.strategy, self.settings.news_events, now)
-            if not allowed:
-                self._skip(now, name, reason)
+            permission = can_trade(
+                name,
+                now,
+                account_state=portfolio,
+                news_state=news_snapshot,
+                settings=self.settings.strategy,
+            )
+            if not permission.allowed:
+                self._skip(now, name, permission.reason, permission.as_dict())
                 continue
             if price.spread_pips(instrument) > self.settings.strategy.max_spread_pips:
                 self._skip(now, name, "spread_filter", {"spread_pips": price.spread_pips(instrument)})
                 continue
             self._scan_instrument(now, instrument, price, portfolio, prices.conversion_rates)
+
+    def _check_price_freshness(self, now: datetime, prices: dict[str, PriceSnapshot]) -> bool:
+        stale = []
+        for name, price in prices.items():
+            ok, age = freshness(now, price.time, max_age_seconds=self.settings.runtime.max_price_age_seconds)
+            if not ok:
+                item = {"instrument": name, "age_seconds": age}
+                stale.append(item)
+                self.journal.log_event("stale_price", f"stale price for {name}", level="warning", payload=item)
+                self.monitor.record_price(name, price.time)
+            else:
+                self.monitor.record_price(name, price.time)
+        return not stale
+
+    def _reconcile_unknown_orders(self) -> None:
+        for row in self.journal.recovery_orders():
+            # An already-recorded definitive rejection means the order was never
+            # placed: promote it out of the 'unknown' recovery set instead of
+            # re-running the broker lookup (and re-alerting) every scan.
+            if _is_definite_rejection_error(row.error):
+                self.journal.update_order(row.client_order_id, status=RecoveryState.REJECTED.value, error=row.error)
+                self.monitor.clear_unknown_order(row.client_order_id)
+                self.journal.log_event(
+                    "order_rejected",
+                    f"order {row.client_order_id} was rejected by the broker and is not recoverable",
+                    level="warning",
+                    payload={"status": row.status},
+                )
+                continue
+            result = reconcile_order(row, self.client.order_by_client_id)
+            if result.after == RecoveryState.UNKNOWN:
+                self.journal.log_event(
+                    "unknown_order",
+                    f"order {row.client_order_id} remains unresolved",
+                    level="critical",
+                    payload={"status": row.status},
+                )
+                self.monitor.record_unknown_order(row.client_order_id)
+                continue
+            broker = self.client.order_by_client_id(row.client_order_id)
+            self.journal.update_order(
+                row.client_order_id,
+                status=result.after.value,
+                broker_order_id=str(broker.get("id")) if broker else None,
+                response=broker,
+            )
+            self.monitor.clear_unknown_order(row.client_order_id)
+            self.journal.log_event("order_reconciled", f"order {row.client_order_id} reconciled", payload={"state": result.after.value})
 
     def _scan_instrument(
         self,
@@ -194,7 +329,22 @@ class ForwardTestWorker:
             self._skip(now, instrument.name, "closed_signal_candle_unavailable")
             return
         last_close = float(signal_row["close"])
-        deviation_pips = abs(price.mid - last_close) / instrument.pip_size
+        atr_price = float(signal_row.get("atr") or 0.0)
+        spread_price = price.ask - price.bid
+        if atr_price <= 0 or spread_price <= 0:
+            self._skip(now, instrument.name, "volatility_or_spread_unavailable")
+            return
+        spread_atr_ratio = spread_price / atr_price
+        if spread_atr_ratio > self.settings.strategy.max_spread_atr_ratio:
+            self._skip(
+                now,
+                instrument.name,
+                "spread_to_atr_filter",
+                {"spread_atr_ratio": spread_atr_ratio, "max": self.settings.strategy.max_spread_atr_ratio},
+            )
+            return
+        executable_entry = executable_entry_price(price, decision.signal)
+        deviation_pips = abs(executable_entry - last_close) / instrument.pip_size
         if deviation_pips > self.settings.strategy.max_entry_deviation_pips:
             self._skip(now, instrument.name, "entry_deviation_filter", {"deviation_pips": deviation_pips})
             return
@@ -204,9 +354,9 @@ class ForwardTestWorker:
             htf_frame,
             instrument=instrument,
             settings=self.settings.strategy,
-            entry_price=price.mid,
+            entry_price=executable_entry,
             timestamp=decision_time,
-            entry_price_source="broker_mid",
+            entry_price_source="broker_executable_bid_ask",
         )
         if intent is None:
             self._skip(now, instrument.name, "intent_unavailable")
@@ -228,8 +378,9 @@ class ForwardTestWorker:
                 reason=risk.reason,
                 side=intent.side.value,
                 score=intent.score,
-                entry_price=price.mid,
+                entry_price=executable_entry,
                 payload={"risk": asdict(risk), "intent": asdict(intent)},
+                data_hash=data_hash({"instrument": instrument.name, "decision_time": decision_time.isoformat(), "signal": intent.signal_row}),
             )
             return
 
@@ -240,11 +391,12 @@ class ForwardTestWorker:
             reason="signal_and_risk_accepted",
             side=intent.side.value,
             score=intent.score,
-            entry_price=price.mid,
+            entry_price=executable_entry,
             stop_loss=risk.exit_plan.stop_loss,
             take_profit=risk.exit_plan.take_profit,
             risk_amount=risk.risk_amount,
             payload={"risk": asdict(risk), "intent": asdict(intent)},
+            data_hash=data_hash({"instrument": instrument.name, "decision_time": decision_time.isoformat(), "signal": intent.signal_row}),
         )
         self._submit_idempotent(intent, instrument, risk)
 
@@ -262,6 +414,11 @@ class ForwardTestWorker:
                 "stop_loss": risk.exit_plan.stop_loss,
                 "take_profit": take_profit,
                 "leg": leg_name,
+                "signal_score": intent.score,
+                "signal_time": intent.timestamp.isoformat(),
+                "strategy_decision": intent.metadata.get("decision"),
+                "signal_features": intent.metadata.get("score_details", {}),
+                "risk_metadata": risk.metadata,
             }
             row, created = self.journal.reserve_order(
                 client_order_id=client_id,
@@ -272,6 +429,10 @@ class ForwardTestWorker:
                 order_type="MARKET",
                 risk_amount=risk.risk_amount * (units / risk.units) if risk.units else risk.risk_amount,
                 payload=payload,
+                strategy_hash=self.strategy_hash,
+                code_version=self.code_version,
+                data_hash=data_hash(payload),
+                experiment_manifest_hash=self.journal.experiment_manifest_hash,
             )
             if not created and row.status in {"pending", "submitted", "filled", "unknown"}:
                 self.journal.log_event(
@@ -303,7 +464,16 @@ class ForwardTestWorker:
                 )
                 self._record_fill_trade(response, intent, instrument, units, broker_trade_id)
             except Mt5Error as exc:
-                self.journal.update_order(client_id, status="unknown", error=str(exc))
+                # A definitive broker rejection (retcode) means the order was
+                # NOT placed and never can be reconciled, so mark it rejected
+                # instead of leaving it in the recovery loop forever. A timeout
+                # / connection fault (plain Mt5Error) stays "unknown" and is
+                # surfaced through the unknown-order monitor because the order
+                # may still exist at the broker.
+                status = "rejected" if isinstance(exc, Mt5RejectedError) else "unknown"
+                self.journal.update_order(client_id, status=status, error=str(exc))
+                if status == "unknown":
+                    self.monitor.record_unknown_order(client_id)
                 raise
 
     def _order_legs(
@@ -311,20 +481,23 @@ class ForwardTestWorker:
         intent: FxSignalIntent,
         risk: FxRiskDecision,
         instrument: FxInstrument,
-    ) -> list[tuple[str, float, float]]:
+    ) -> list[tuple[str, float, float | None]]:
         if risk.exit_plan is None or not self.settings.strategy.partial_tp_enabled:
             return [("full", risk.units, risk.exit_plan.take_profit if risk.exit_plan else intent.entry_price)]
         tp1_units = instrument.round_units(risk.units * self.settings.strategy.tp1_units_pct)
         tp2_units = instrument.round_units(risk.units - tp1_units)
         if tp1_units <= 0 or tp2_units <= 0:
             return [("full", risk.units, risk.exit_plan.take_profit)]
-        tp2_distance = risk.exit_plan.reward_distance * self.settings.strategy.tp2_multiplier
-        tp2 = (
-            intent.entry_price + tp2_distance
-            if intent.side is Side.LONG
-            else intent.entry_price - tp2_distance
-        )
-        tp2 = instrument_price_round(intent, tp2)
+        runner_r = self.settings.strategy.runner_take_profit_r
+        tp2 = None
+        if runner_r is not None:
+            tp2_distance = risk.exit_plan.risk_distance * runner_r
+            tp2 = instrument_price_round(
+                intent,
+                intent.entry_price + tp2_distance
+                if intent.side is Side.LONG
+                else intent.entry_price - tp2_distance,
+            )
         return [("tp1", tp1_units, risk.exit_plan.take_profit), ("tp2", tp2_units, tp2)]
 
     def _broker_order_if_exists(self, client_id: str) -> dict[str, Any] | None:
@@ -449,6 +622,7 @@ class ForwardTestWorker:
                     snapshot_factor=price.quote_to_home_factor,
                 )
                 self._maybe_move_stop_to_breakeven(trade, instrument, price)
+                self._maybe_update_trailing_stop(trade, instrument, price)
             self.journal.upsert_trade(
                 broker_trade_id=trade_id,
                 instrument=instrument_name,
@@ -527,7 +701,16 @@ class ForwardTestWorker:
             state="open",
             entry_time=_parse_broker_time(fill.get("time")) or intent.timestamp,
             entry_price=_safe_float(fill.get("price"), intent.entry_price),
-            payload=response,
+            payload={
+                **response,
+                "strategy_context": {
+                    "signal_score": intent.score,
+                    "signal_time": intent.timestamp.isoformat(),
+                    "strategy_decision": intent.metadata.get("decision"),
+                    "signal_features": intent.metadata.get("score_details", {}),
+                    "entry_price_source": intent.metadata.get("entry_price_source"),
+                },
+            },
         )
 
     def _maybe_move_stop_to_breakeven(
@@ -569,6 +752,192 @@ class ForwardTestWorker:
             )
         except Mt5Error as exc:
             self.journal.log_event("breakeven_stop_failed", str(exc), level="warning", payload={"trade_id": trade_id})
+
+    def _maybe_update_trailing_stop(
+        self,
+        trade: dict[str, Any],
+        instrument: FxInstrument,
+        price: PriceSnapshot,
+    ) -> None:
+        """Ratchet a profitable trade's stop using the latest closed-candle ATR."""
+        trade_id = str(trade.get("id") or "")
+        entry = _safe_float(trade.get("price"))
+        units = _safe_float(trade.get("currentUnits") or trade.get("initialUnits"))
+        current_stop = _nested_price(trade.get("stopLossOrder"))
+        if not trade_id or entry <= 0 or units == 0 or current_stop is None:
+            return
+        side = Side.LONG if units > 0 else Side.SHORT
+        current_exit = price.bid if side is Side.LONG else price.ask
+        risk_distance = abs(entry - current_stop)
+        profit_distance = (current_exit - entry) * side.sign
+        if risk_distance <= 0 or profit_distance < risk_distance:
+            return
+        try:
+            frame = prepare_indicators(
+                self.client.candles(
+                    instrument.name,
+                    self.settings.strategy.entry_timeframe,
+                    self.settings.strategy.candle_limit,
+                )
+            )
+            row = last_closed_row(frame, self.settings.strategy.entry_timeframe)
+            atr = _safe_float(row.get("atr")) if row is not None else 0.0
+        except (Mt5Error, ValueError, KeyError) as exc:
+            self.journal.log_event(
+                "trailing_stop_unavailable",
+                str(exc),
+                level="warning",
+                payload={"trade_id": trade_id},
+            )
+            return
+        if atr <= 0:
+            return
+
+        distance = atr * self.settings.strategy.trailing_atr_multiplier
+        candidate = current_exit - distance if side is Side.LONG else current_exit + distance
+        if instrument.minimum_stop_distance:
+            if side is Side.LONG:
+                candidate = min(candidate, current_exit - instrument.minimum_stop_distance)
+            else:
+                candidate = max(candidate, current_exit + instrument.minimum_stop_distance)
+        candidate = instrument.round_price(candidate)
+        minimum_move = instrument.pip_size
+        if side is Side.LONG and candidate <= current_stop + minimum_move:
+            return
+        if side is Side.SHORT and candidate >= current_stop - minimum_move:
+            return
+        try:
+            self.client.set_trade_dependent_orders(
+                trade_id=trade_id,
+                instrument=instrument,
+                stop_loss=candidate,
+                take_profit=_nested_price(trade.get("takeProfitOrder")),
+            )
+            self.journal.log_event(
+                "trailing_stop_updated",
+                f"{instrument.name} trade {trade_id} trailing stop ratcheted",
+                payload={"old_stop": current_stop, "new_stop": candidate, "atr": atr},
+            )
+        except Mt5Error as exc:
+            self.journal.log_event(
+                "trailing_stop_update_failed",
+                str(exc),
+                level="warning",
+                payload={"trade_id": trade_id},
+            )
+
+    def _protect_positions_for_news(
+        self,
+        now: datetime,
+        instruments: dict[str, FxInstrument],
+        prices: dict[str, PriceSnapshot],
+        events: list[NewsEvent],
+    ) -> None:
+        """Apply the configured news risk policy to existing open positions.
+
+        ``news_risk_action`` controls what happens to open exposure before a
+        high-impact event:
+          - ``block_entries``     HOLD positions untouched (entries are already
+                                  blocked by the blackout window).
+          - ``protect_and_block`` REDUCE risk by tightening stops to breakeven
+                                  on profitable trades.
+          - ``close_positions``   CLOSE exposed positions before the event.
+        """
+        action = self.settings.strategy.news_risk_action
+        if action == "block_entries":
+            return
+        if not events:
+            return
+        try:
+            trades = self.client.open_trades()
+        except Mt5Error as exc:
+            self.journal.log_event("news_position_protection_unavailable", str(exc), level="warning")
+            return
+        for trade in trades:
+            name = str(trade.get("instrument") or "").upper()
+            instrument = instruments.get(name)
+            price = prices.get(name)
+            if instrument is None or price is None:
+                continue
+            reason = news_blackout_reason(
+                name,
+                events,
+                now,
+                self.settings.strategy.news_blackout_before_minutes,
+                self.settings.strategy.news_blackout_after_minutes,
+                impact_score_min=self.settings.strategy.news_blackout_impact_score_min,
+            )
+            if not reason:
+                continue
+            trade_id = str(trade.get("id") or "")
+            entry = _safe_float(trade.get("price"))
+            units = _safe_float(trade.get("currentUnits") or trade.get("initialUnits"))
+            if not trade_id or entry <= 0 or units == 0:
+                continue
+            if action == "close_positions":
+                self._close_position_for_news(trade_id, name, instrument, units, reason)
+                continue
+            # protect_and_block: tighten profitable trades to breakeven.
+            side = Side.LONG if units > 0 else Side.SHORT
+            current_stop = _nested_price(trade.get("stopLossOrder"))
+            current_exit = price.bid if side is Side.LONG else price.ask
+            if current_stop is None:
+                continue
+            if (current_exit - entry) * side.sign <= 0:
+                continue
+            buffer = self.settings.strategy.breakeven_buffer_pips * instrument.pip_size
+            candidate = instrument.round_price(entry + buffer * side.sign)
+            if side is Side.LONG and current_stop >= candidate:
+                continue
+            if side is Side.SHORT and current_stop <= candidate:
+                continue
+            try:
+                self.client.set_trade_dependent_orders(
+                    trade_id=trade_id,
+                    instrument=instrument,
+                    stop_loss=candidate,
+                    take_profit=_nested_price(trade.get("takeProfitOrder")),
+                )
+                self.journal.log_event(
+                    "news_position_protected",
+                    f"{name} trade {trade_id} stop tightened before high-impact news",
+                    payload={"reason": reason, "new_stop": candidate},
+                )
+            except Mt5Error as exc:
+                self.journal.log_event(
+                    "news_position_protection_failed",
+                    str(exc),
+                    level="warning",
+                    payload={"trade_id": trade_id, "reason": reason},
+                )
+
+    def _close_position_for_news(
+        self,
+        trade_id: str,
+        name: str,
+        instrument: FxInstrument,
+        signed_units: float,
+        reason: str,
+    ) -> None:
+        try:
+            self.client.close_position(
+                trade_id=trade_id,
+                instrument=instrument,
+                signed_units=signed_units,
+                comment="fxft-news-close",
+            )
+            self.journal.log_event(
+                "news_position_closed",
+                f"{name} trade {trade_id} closed before high-impact news",
+                payload={"reason": reason, "units": signed_units},
+            )
+        except Mt5Error as exc:
+            self.journal.log_event(
+                "news_position_close_failed",
+                str(exc),
+                level="warning",
+                payload={"trade_id": trade_id, "reason": reason},
+            )
 
     def _skip(self, timestamp: datetime, instrument: str, reason: str, payload: dict[str, Any] | None = None) -> None:
         self.journal.record_signal(
@@ -625,11 +994,38 @@ def feed_decision_time(
     return closed_at.astimezone(timezone.utc)
 
 
+def executable_entry_price(price: PriceSnapshot, side: Side) -> float:
+    """Use the price available for a market fill, never an optimistic mid.
+
+    Longs execute at ask and shorts at bid. Risk sizing, stop distance, reward
+    distance, journaled expected price, and entry-deviation checks must all use
+    that same side-aware price to avoid understating live trading friction.
+    """
+
+    return price.ask if side is Side.LONG else price.bid
+
+
 def client_order_id(intent: FxSignalIntent, leg: str) -> str:
     raw_timestamp = intent.timestamp.isoformat()
     key = f"{intent.instrument}:{intent.side.value}:{raw_timestamp}:{leg}:{intent.entry_price:.8f}"
     digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
     return f"fxft-{intent.instrument.replace('_', '')}-{leg}-{digest}"[:64]
+
+
+def _is_definite_rejection_error(error: str | None) -> bool:
+    """True for a stored Mt5RejectedError-style message: a broker retcode (e.g.
+    10027/10030) or a local request-validation failure (last_error ``-2`` /
+    ``Invalid ... argument``) means the order was definitively declined and can
+    never reconcile. Timeouts / connection faults are NOT classified this way."""
+    if not error:
+        return False
+    if "failed with retcode" in error:
+        return True
+    # MT5/RES_S_PARAMS returns a negative last_error code for invalid request
+    # parameters — the order was rejected locally before submission.
+    if "Invalid" in error and "argument" in error:
+        return True
+    return False
 
 
 def instrument_price_round(intent: FxSignalIntent, price: float) -> float:

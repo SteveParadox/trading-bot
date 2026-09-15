@@ -133,20 +133,79 @@ def evaluate_signal_frame(
             {"signal": signal.signal.value, "htf": htf_signal.signal.value, **htf_signal.details},
         )
 
+    # A stacked MA arrangement alone can survive well after a move loses
+    # momentum. Require meaningful directional movement and a non-flattening
+    # trend before considering the entry. These checks deliberately use only
+    # closed candles available at decision time.
+    di_edge = _di_edge(entry_row, signal.signal)
+    if di_edge < settings.min_di_edge:
+        return FxSignalDecision(
+            None,
+            "di_edge_filter",
+            {**signal.details, "di_edge": di_edge, "required_di_edge": settings.min_di_edge},
+        )
+
+    previous_entry_row = entry_window.iloc[-2]
+    adx = _safe_float(entry_row.get("adx"))
+    previous_adx = _safe_float(previous_entry_row.get("adx"))
+    if settings.require_adx_non_decreasing and adx < previous_adx:
+        return FxSignalDecision(
+            None,
+            "adx_weakening_filter",
+            {
+                **signal.details,
+                "adx": adx,
+                "previous_adx": previous_adx,
+                "adx_change": adx - previous_adx,
+            },
+        )
+
     atr = float(entry_row.get("atr") or 0.0)
     close = float(entry_row.get("close") or 0.0)
     if atr <= 0 or close <= 0:
         return FxSignalDecision(None, "atr_unavailable", {})
     atr_pips = atr / instrument.pip_size
-    if atr_pips < settings.min_atr_pips or atr_pips > settings.max_atr_pips:
+    atr_pct = atr / close
+    legacy_atr_filter = (
+        settings.min_atr_pips is not None
+        and settings.max_atr_pips is not None
+        and (atr_pips < settings.min_atr_pips or atr_pips > settings.max_atr_pips)
+    )
+    if atr_pct < settings.min_atr_pct or atr_pct > settings.max_atr_pct or legacy_atr_filter:
         return FxSignalDecision(
             None,
-            "atr_pip_filter",
-            {"atr_pips": atr_pips, "min": settings.min_atr_pips, "max": settings.max_atr_pips},
+            "atr_volatility_filter",
+            {
+                "atr_pips": atr_pips,
+                "atr_pct": atr_pct,
+                "min_atr_pct": settings.min_atr_pct,
+                "max_atr_pct": settings.max_atr_pct,
+                "legacy_min_atr_pips": settings.min_atr_pips,
+                "legacy_max_atr_pips": settings.max_atr_pips,
+            },
+        )
+
+    slope_index = len(entry_window) - 1 - settings.ma28_slope_lookback
+    if slope_index < 0:
+        return FxSignalDecision(None, "ma28_slope_history_unavailable", {})
+    past_ma28 = _safe_float(entry_window.iloc[slope_index].get("ma28"))
+    ma28 = _safe_float(entry_row.get("ma28"))
+    directional_ma28_slope_atr = ((ma28 - past_ma28) * signal.signal.sign) / atr
+    if settings.require_ma28_slope and directional_ma28_slope_atr < settings.min_ma28_slope_atr:
+        return FxSignalDecision(
+            None,
+            "ma28_slope_filter",
+            {
+                **signal.details,
+                "ma28": ma28,
+                "past_ma28": past_ma28,
+                "ma28_slope_lookback": settings.ma28_slope_lookback,
+                "directional_ma28_slope_atr": directional_ma28_slope_atr,
+                "required_ma28_slope_atr": settings.min_ma28_slope_atr,
+            },
         )
 
     entry_extension_atr = _entry_extension_atr(entry_row, signal.signal)
-    ma28 = _safe_float(entry_row.get("ma28"))
     distance_ma28_pips = pips_between(instrument, close, ma28) if close > 0 and ma28 > 0 else 0.0
     if settings.max_entry_extension_atr is not None and entry_extension_atr > settings.max_entry_extension_atr:
         return FxSignalDecision(
@@ -169,10 +228,30 @@ def evaluate_signal_frame(
         "signal_close": close,
         "atr_price": atr,
         "atr_pips": atr_pips,
+        "atr_pct": atr_pct,
         "entry_extension_atr": entry_extension_atr,
         "distance_ma28_pips": distance_ma28_pips,
         "instrument": instrument.name,
+        "di_edge": di_edge,
+        "previous_adx": previous_adx,
+        "adx_change": adx - previous_adx,
+        "ma28_slope_lookback": settings.ma28_slope_lookback,
+        "directional_ma28_slope_atr": directional_ma28_slope_atr,
     }
+    score_details = _score_signal_details(entry_row, details, settings, instrument, signal.signal)
+    if score_details.score < settings.min_signal_score:
+        return FxSignalDecision(
+            None,
+            "signal_quality_filter",
+            {
+                **details,
+                "quality_score": score_details.score,
+                "required_quality_score": settings.min_signal_score,
+                "score_details": score_details.__dict__,
+            },
+        )
+    details["quality_score"] = score_details.score
+    details["score_details"] = score_details.__dict__
     return FxSignalDecision(signal.signal, "signal_confirmed", details)
 
 
@@ -310,11 +389,19 @@ def _score_signal_details(
 
     adx_points = _normalize_points(adx, settings.adx_min, settings.score_adx_ceiling, 45.0)
     di_points = _normalize_points(di_edge, 0.0, settings.score_di_edge_ceiling, 35.0)
-    volume_points = _normalize_points(
-        current_volume_ratio,
-        settings.score_volume_ratio_floor,
-        settings.score_volume_ratio_ceiling,
-        20.0,
+    # Spot-FX volume from MT5 is normally tick volume, not a consolidated
+    # traded-volume feed. It is useful only when an operator deliberately
+    # enables it as a confirmation filter; otherwise it must not silently
+    # decide whether a score clears the entry threshold.
+    volume_points = (
+        _normalize_points(
+            current_volume_ratio,
+            settings.score_volume_ratio_floor,
+            settings.score_volume_ratio_ceiling,
+            20.0,
+        )
+        if settings.require_volume_confirmation
+        else 0.0
     )
     score = _bounded_score(adx_points + di_points + volume_points)
     return FxScoreDetails(
@@ -460,6 +547,14 @@ def _entry_extension_atr(row: pd.Series, signal: Side) -> float:
     if signal is Side.LONG:
         return max((close - ma7) / atr, 0.0)
     return max((ma7 - close) / atr, 0.0)
+
+
+def _di_edge(row: pd.Series, signal: Side) -> float:
+    """Return directional DI separation, positive only for the chosen side."""
+
+    di_plus = _safe_float(row.get("di_plus"))
+    di_minus = _safe_float(row.get("di_minus"))
+    return di_plus - di_minus if signal is Side.LONG else di_minus - di_plus
 
 
 def _normalize_points(value: float, floor: float, ceiling: float, max_points: float) -> float:

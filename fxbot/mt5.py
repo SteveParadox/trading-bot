@@ -32,6 +32,10 @@ class Mt5Error(RuntimeError):
     pass
 
 
+class Mt5RejectedError(Mt5Error):
+    """Order was definitively declined by the broker terminal (not placed)."""
+
+
 class Mt5CredentialsMissing(Mt5Error):
     pass
 
@@ -228,7 +232,7 @@ class Mt5Client:
         instrument: FxInstrument,
         signed_units: float,
         stop_loss: float,
-        take_profit: float,
+        take_profit: float | None,
         client_order_id: str,
         comment: str,
     ) -> dict[str, Any]:
@@ -253,7 +257,7 @@ class Mt5Client:
             "type": _constant(mt5, "ORDER_TYPE_BUY", 0) if side is Side.LONG else _constant(mt5, "ORDER_TYPE_SELL", 1),
             "price": price,
             "sl": instrument.round_price(stop_loss),
-            "tp": instrument.round_price(take_profit),
+            "tp": instrument.round_price(take_profit) if take_profit is not None else 0.0,
             "deviation": self.settings.deviation_points,
             "magic": self.settings.magic_number,
             "comment": _mt5_comment(client_order_id, comment),
@@ -296,6 +300,47 @@ class Mt5Client:
             request["tp"] = instrument.round_price(take_profit)
         result = mt5.order_send(request)
         return {"mt5": self._checked_result(result, "order_send SLTP"), "request": request}
+
+    def close_position(
+        self,
+        *,
+        trade_id: str,
+        instrument: FxInstrument,
+        signed_units: float,
+        comment: str = "fxft-news-close",
+    ) -> dict[str, Any]:
+        """Close a position at market, mirroring the open-order request shape."""
+        self._ensure_connected()
+        mt5 = self._module()
+        instrument_name = instrument.name
+        symbol = instrument.broker_symbol or self.settings.broker_symbol_for(instrument_name)
+        side = Side.LONG if signed_units > 0 else Side.SHORT
+        tick_payload = self._price_snapshot(instrument_name)
+        price = tick_payload.ask if side is Side.LONG else tick_payload.bid
+        volume = instrument.units_to_volume(abs(signed_units))
+        if volume <= 0 or (instrument.volume_min and volume < instrument.volume_min):
+            raise Mt5Error(f"{instrument_name} MT5 volume {volume} is below broker minimum")
+        request = {
+            "action": _constant(mt5, "TRADE_ACTION_DEAL", 1),
+            "symbol": symbol,
+            "volume": volume,
+            "type": _constant(mt5, "ORDER_TYPE_SELL", 1) if side is Side.LONG else _constant(mt5, "ORDER_TYPE_BUY", 0),
+            "position": int(trade_id),
+            "price": price,
+            "deviation": self.settings.deviation_points,
+            "magic": self.settings.magic_number,
+            "comment": comment,
+            "type_time": _constant(mt5, "ORDER_TIME_GTC", 0),
+            "type_filling": self._validated_order_filling({"symbol": symbol, "type_filling": 0}),
+        }
+        result = mt5.order_send(request)
+        result_payload = self._checked_result(result, "order_send close")
+        return {
+            "mt5": result_payload,
+            "request": request,
+            "price": _safe_float(result_payload.get("price"), price),
+            "deal_id": str(result_payload.get("deal") or ""),
+        }
 
     def shutdown(self) -> None:
         if self._connected:
@@ -489,7 +534,7 @@ class Mt5Client:
             _constant(self._module(), "TRADE_RETCODE_DONE_PARTIAL", 10010),
         }
         if retcode not in ok_codes:
-            raise Mt5Error(f"MT5 {operation} failed with retcode {retcode}: {payload}")
+            raise Mt5RejectedError(f"MT5 {operation} failed with retcode {retcode}: {payload}")
         return payload
 
     def _closed_trade_events(self, deals: tuple[Any, ...]) -> list[dict[str, Any]]:
