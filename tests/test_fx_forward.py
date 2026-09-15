@@ -6,12 +6,12 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pandas as pd
 
 from fxbot.config import BrokerSettings, FxBotSettings, RiskSettings, RuntimeSettings, StrategySettings
-from fxbot.forward import ForwardTestWorker
+from fxbot.forward import ForwardTestWorker, client_order_id, executable_entry_price
 from fxbot.instruments import FxInstrument, PriceSnapshot
 from fxbot.journal import StructuredJournal
 from fxbot.models import BotRunState, FxSignalIntent, Side
@@ -27,8 +27,16 @@ class FixedDatetime(datetime):
         return FIXED_NOW if tz is None else FIXED_NOW.astimezone(tz)
 
 
+class ExecutableEntryPriceTests(unittest.TestCase):
+    def test_long_uses_ask_and_short_uses_bid_for_strategy_risk_inputs(self) -> None:
+        price = PriceSnapshot("EUR_USD", bid=1.1000, ask=1.1003, time=FIXED_NOW)
+
+        self.assertEqual(executable_entry_price(price, Side.LONG), 1.1003)
+        self.assertEqual(executable_entry_price(price, Side.SHORT), 1.1000)
+
+
 def trending_frame(start: float, step: float, rows: int = 120) -> pd.DataFrame:
-    index = pd.date_range("2026-01-06T07:00:00Z", periods=rows, freq="15min")
+    index = pd.date_range("2026-01-05T08:00:00Z", periods=rows, freq="15min")
     closes = [start + i * step for i in range(rows)]
     opens = [close - step * 0.5 for close in closes]
     highs = [max(open_, close) + abs(step) * 2 for open_, close in zip(opens, closes)]
@@ -208,6 +216,158 @@ class ForwardWorkerTests(unittest.TestCase):
                 worker._submit_idempotent(intent, FxInstrument("EUR_USD"), decision)
 
                 self.assertEqual(len(client.created), 1)
+
+    def test_rejected_order_is_terminal_not_unknown(self) -> None:
+        from fxbot.mt5 import Mt5RejectedError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = FxBotSettings(
+                broker=BrokerSettings(),
+                strategy=StrategySettings(partial_tp_enabled=False),
+                risk=RiskSettings(),
+                runtime=RuntimeSettings(database_url=f"sqlite:///{Path(tmp) / 'journal.db'}", log_jsonl_path=str(Path(tmp) / "j.jsonl")),
+            )
+
+            class RejectingClient(FakeMt5Client):
+                def create_market_order(self, **kwargs):
+                    raise Mt5RejectedError("MT5 order_send failed with retcode 10027: {'comment': 'AutoTrading disabled by client'}")
+
+            with closing(StructuredJournal(settings.runtime.database_url, settings.runtime.log_jsonl_path)) as journal:
+                worker = ForwardTestWorker(settings, client=RejectingClient(), journal=journal)
+                intent = FxSignalIntent(
+                    instrument="EUR_USD",
+                    side=Side.LONG,
+                    timestamp=datetime(2026, 1, 6, 14, 0, tzinfo=timezone.utc),
+                    entry_price=1.1,
+                    signal_row={"atr": 0.001},
+                )
+                decision = FxRiskDecision(
+                    allowed=True,
+                    reason="accepted",
+                    units=1000,
+                    signed_units=1000,
+                    risk_amount=10,
+                    exit_plan=FxExitPlan(1.09, 1.12, 0.01, 0.02, 2.0, 100, 200),
+                )
+
+                with self.assertRaises(Mt5RejectedError):
+                    worker._submit_idempotent(intent, FxInstrument("EUR_USD"), decision)
+
+                order = journal.find_order(client_order_id(intent, "full"))
+                self.assertIsNotNone(order)
+                # A definite rejection must exit the recovery loop, never stay 'unknown'.
+                self.assertEqual(order.status, "rejected")
+                self.assertNotIn(order.status, {"pending", "unknown"})
+                self.assertEqual(len(journal.recovery_orders()), 0)
+
+    def test_timeout_order_stays_unknown_for_recovery(self) -> None:
+        from fxbot.mt5 import Mt5Error
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = FxBotSettings(
+                broker=BrokerSettings(),
+                strategy=StrategySettings(partial_tp_enabled=False),
+                risk=RiskSettings(),
+                runtime=RuntimeSettings(database_url=f"sqlite:///{Path(tmp) / 'journal.db'}", log_jsonl_path=str(Path(tmp) / "j.jsonl")),
+            )
+
+            class TimingOutClient(FakeMt5Client):
+                def create_market_order(self, **kwargs):
+                    raise Mt5Error("MT5 order_send returned no result: (-1, 'Timeout expired')")
+
+            with closing(StructuredJournal(settings.runtime.database_url, settings.runtime.log_jsonl_path)) as journal:
+                worker = ForwardTestWorker(settings, client=TimingOutClient(), journal=journal)
+                intent = FxSignalIntent(
+                    instrument="EUR_USD",
+                    side=Side.LONG,
+                    timestamp=datetime(2026, 1, 6, 14, 0, tzinfo=timezone.utc),
+                    entry_price=1.1,
+                    signal_row={"atr": 0.001},
+                )
+                decision = FxRiskDecision(
+                    allowed=True,
+                    reason="accepted",
+                    units=1000,
+                    signed_units=1000,
+                    risk_amount=10,
+                    exit_plan=FxExitPlan(1.09, 1.12, 0.01, 0.02, 2.0, 100, 200),
+                )
+
+                with self.assertRaises(Mt5Error):
+                    worker._submit_idempotent(intent, FxInstrument("EUR_USD"), decision)
+
+                order = journal.find_order(client_order_id(intent, "full"))
+                self.assertIsNotNone(order)
+                # A timeout stays unknown so the recovery loop can re-check it.
+                self.assertEqual(order.status, "unknown")
+                self.assertEqual(len(journal.recovery_orders()), 1)
+
+    def test_runner_has_no_static_cap_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = FxBotSettings(
+                broker=BrokerSettings(),
+                strategy=StrategySettings(partial_tp_enabled=True),
+                runtime=RuntimeSettings(
+                    database_url=f"sqlite:///{Path(tmp) / 'journal.db'}",
+                    log_jsonl_path=str(Path(tmp) / "j.jsonl"),
+                ),
+            )
+            with closing(StructuredJournal(settings.runtime.database_url, settings.runtime.log_jsonl_path)) as journal:
+                worker = ForwardTestWorker(settings, client=FakeMt5Client(), journal=journal)
+                intent = FxSignalIntent(
+                    instrument="EUR_USD",
+                    side=Side.LONG,
+                    timestamp=FIXED_NOW,
+                    entry_price=1.1,
+                    signal_row={"atr": 0.001},
+                )
+                decision = FxRiskDecision(
+                    allowed=True,
+                    reason="accepted",
+                    units=1000,
+                    signed_units=1000,
+                    risk_amount=10,
+                    exit_plan=FxExitPlan(1.09, 1.12, 0.01, 0.02, 2.0, 100, 200),
+                )
+
+                legs = worker._order_legs(intent, decision, FxInstrument("EUR_USD"))
+
+                self.assertEqual([leg[0] for leg in legs], ["tp1", "tp2"])
+                self.assertIsNone(legs[1][2])
+
+    def test_atr_trailing_stop_ratchets_profitable_trade(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            entry = trending_frame(1.08, 0.00025)
+            settings = FxBotSettings(
+                broker=BrokerSettings(),
+                strategy=StrategySettings(trade_sessions_utc=()),
+                runtime=RuntimeSettings(
+                    database_url=f"sqlite:///{Path(tmp) / 'journal.db'}",
+                    log_jsonl_path=str(Path(tmp) / "j.jsonl"),
+                ),
+            )
+            with closing(StructuredJournal(settings.runtime.database_url, settings.runtime.log_jsonl_path)) as journal:
+                client = FakeMt5Client(entry_frame=entry)
+                client.set_trade_dependent_orders = Mock()
+                worker = ForwardTestWorker(settings, client=client, journal=journal)
+                instrument = FxInstrument("EUR_USD")
+                price = PriceSnapshot("EUR_USD", bid=1.13, ask=1.1301, time=FIXED_NOW)
+
+                worker._maybe_update_trailing_stop(
+                    {
+                        "id": "trade-1",
+                        "price": 1.10,
+                        "currentUnits": 1000,
+                        "stopLossOrder": {"price": 1.09},
+                        "takeProfitOrder": None,
+                    },
+                    instrument,
+                    price,
+                )
+
+                client.set_trade_dependent_orders.assert_called_once()
+                new_stop = client.set_trade_dependent_orders.call_args.kwargs["stop_loss"]
+                self.assertGreater(new_stop, 1.09)
 
 
 if __name__ == "__main__":

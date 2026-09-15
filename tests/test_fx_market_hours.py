@@ -31,7 +31,17 @@ class FxMarketHoursTests(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertEqual(reason, "session_filter")
 
+    def test_required_news_data_fails_closed(self) -> None:
+        allowed, reason = trading_allowed_now(
+            "EUR_USD",
+            StrategySettings(require_news_data=True, trade_sessions_utc=()),
+            [],
+            datetime(2026, 1, 6, 14, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertFalse(allowed)
+        self.assertEqual(reason, "news_data_unavailable")
+
 
 if __name__ == "__main__":
     unittest.main()
-

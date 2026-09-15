@@ -106,6 +106,64 @@ class StructuredJournalTests(unittest.TestCase):
                 self.assertEqual(reason, "daily_loss_halt")
                 self.assertEqual(journal.get_state().state, BotRunState.HALTED.value)
 
+    def test_filtered_trade_outcome_uses_realized_pnl_and_financing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with closing(StructuredJournal(f"sqlite:///{Path(tmp) / 'journal.db'}")) as journal:
+                timestamp = datetime(2026, 1, 6, 14, 0, tzinfo=timezone.utc)
+                journal.upsert_trade(
+                    broker_trade_id="winner-after-financing",
+                    instrument="EUR_USD",
+                    side="LONG",
+                    units=1000,
+                    state="closed",
+                    entry_time=timestamp,
+                    realized_pl=2.0,
+                    financing=-1.0,
+                )
+                journal.upsert_trade(
+                    broker_trade_id="loser-after-financing",
+                    instrument="EUR_USD",
+                    side="LONG",
+                    units=1000,
+                    state="closed",
+                    entry_time=timestamp,
+                    realized_pl=-2.0,
+                    financing=1.0,
+                )
+
+                wins = journal.filtered_trades(outcome="win")
+                losses = journal.filtered_trades(outcome="loss")
+
+                self.assertEqual([row.broker_trade_id for row in wins], ["winner-after-financing"])
+                self.assertEqual([row.broker_trade_id for row in losses], ["loser-after-financing"])
+
+    def test_trade_close_preserves_initial_strategy_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with closing(StructuredJournal(f"sqlite:///{Path(tmp) / 'journal.db'}")) as journal:
+                timestamp = datetime(2026, 1, 6, 14, 0, tzinfo=timezone.utc)
+                journal.upsert_trade(
+                    broker_trade_id="context-preserved",
+                    instrument="EUR_USD",
+                    side="LONG",
+                    units=1000,
+                    state="open",
+                    entry_time=timestamp,
+                    payload={"strategy_context": {"signal_score": 73.5}},
+                )
+                closed = journal.upsert_trade(
+                    broker_trade_id="context-preserved",
+                    instrument="EUR_USD",
+                    side="LONG",
+                    units=1000,
+                    state="closed",
+                    exit_time=timestamp,
+                    realized_pl=5.0,
+                    payload={"exit_source": "mt5_history"},
+                )
+
+                self.assertEqual(closed.payload["strategy_context"]["signal_score"], 73.5)
+                self.assertEqual(closed.payload["exit_source"], "mt5_history")
+
 
 if __name__ == "__main__":
     unittest.main()
