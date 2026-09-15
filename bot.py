@@ -942,7 +942,7 @@ def validate_market_quality(
         )
         return False
 
-    atr_pct = float(signal_row.get("atr_pct") or 0)
+    atr_pct = safe_float(signal_row.get("atr_pct"))
     if atr_pct < MIN_ATR_PCT or atr_pct > MAX_ATR_PCT:
         log.info(
             "[%s] ATR %.2f%% outside %.2f%%-%.2f%% range; skipping",
@@ -1149,7 +1149,7 @@ def emergency_close_position(symbol: str, reason: str) -> None:
         return
 
     side = "Sell" if position.get("side") == "Buy" else "Buy"
-    qty = float(position.get("size") or 0)
+    qty = safe_float(position.get("size"))
     if qty <= 0:
         return
 
@@ -1468,8 +1468,8 @@ def move_stop_to_breakeven_if_ready(
     tp1_order_id = state.get("tp1_order_id")
     tp1_still_open = bool(tp1_order_id and tp1_order_id in active_order_ids)
     current_qty = decimal_step(position_size(position), info.qty_step, ROUND_DOWN)
-    initial_qty = float(state.get("initial_qty") or 0)
-    tp1_qty = float(state.get("tp1_qty") or 0)
+    initial_qty = safe_float(state.get("initial_qty"))
+    tp1_qty = safe_float(state.get("tp1_qty"))
     expected_after_tp1 = max(0.0, initial_qty - tp1_qty)
     tp1_size_reduction_confirmed = current_qty <= expected_after_tp1 + (info.qty_step / 2)
     any_size_reduced = current_qty < max(0.0, initial_qty - info.qty_step / 2)
@@ -1579,7 +1579,7 @@ def update_trailing_stop_if_active(symbol: str, position: dict[str, Any]) -> Non
     try:
         df = calculate_indicators(fetch_klines(symbol, TIMEFRAME))
         row = df.iloc[-2]
-        atr = float(row.get("atr") or 0)
+        atr = safe_float(row.get("atr"), float("nan"))
     except Exception as exc:
         log.warning("[%s] Trailing stop skipped: ATR unavailable (%s)", symbol, exc)
         return
@@ -1601,9 +1601,9 @@ def update_trailing_stop_if_active(symbol: str, position: dict[str, Any]) -> Non
         else current_price + (atr * TRAIL_ATR_MULTIPLIER)
     )
     new_trail = round_stop_price(signal, raw_trail, info)
-    current_trail = float(state.get("sl") or 0)
+    current_trail = safe_float(state.get("sl"))
     min_move = info.tick_size * max(1, TRAIL_MIN_MOVE_TICKS)
-    elapsed = time.time() - float(state.get("last_update") or 0)
+    elapsed = time.time() - safe_float(state.get("last_update"))
     if elapsed < TRAIL_UPDATE_MIN_SECONDS:
         log.debug(
             "[%s] Trailing stop throttle active: %.1fs elapsed < %ss",
@@ -2039,16 +2039,18 @@ def scan_symbol(symbol: str) -> TradeCandidate | None:
 
     df_htf = calculate_indicators(fetch_klines(symbol, HTF_TIMEFRAME))
     htf_decision = get_htf_trend(df_htf, return_decision=True)
-    assert isinstance(htf_decision, TrendDecision)
+    if not isinstance(htf_decision, TrendDecision):
+        raise RuntimeError(f"[{symbol}] unexpected HTF decision type: {type(htf_decision)!r}")
     if htf_decision.trend is None:
         log_htf_rejection(symbol, htf_decision)
         return None
 
     df = calculate_indicators(fetch_klines(symbol, TIMEFRAME))
     signal_decision = get_signal(df, return_decision=True)
-    assert isinstance(signal_decision, SignalDecision)
+    if not isinstance(signal_decision, SignalDecision):
+        raise RuntimeError(f"[{symbol}] unexpected signal decision type: {type(signal_decision)!r}")
     row = df.iloc[-2]
-    last_close = float(row["close"])
+    last_close = safe_float(row.get("close"), float("nan"))
 
     if not signal_decision.signal:
         log_signal_rejection(symbol, signal_decision)

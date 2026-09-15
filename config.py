@@ -14,6 +14,13 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _get_str(name: str, default: str) -> str:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip()
+
+
 def _get_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None:
@@ -25,14 +32,20 @@ def _get_float(name: str, default: float) -> float:
     raw = os.getenv(name)
     if raw is None or raw.strip() == "":
         return default
-    return float(raw)
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a valid float, got {raw!r}") from exc
 
 
 def _get_int(name: str, default: int) -> int:
     raw = os.getenv(name)
     if raw is None or raw.strip() == "":
         return default
-    return int(raw)
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a valid integer, got {raw!r}") from exc
 
 
 def _get_csv(name: str, default: Iterable[str]) -> list[str]:
@@ -42,9 +55,17 @@ def _get_csv(name: str, default: Iterable[str]) -> list[str]:
     return [item.strip().upper() for item in raw.split(",") if item.strip()]
 
 
+def _get_choice(name: str, default: str, choices: set[str]) -> str:
+    value = _get_str(name, default).lower()
+    if value not in choices:
+        allowed = ", ".join(sorted(choices))
+        raise ValueError(f"{name} must be one of: {allowed}")
+    return value
+
+
 # API credentials are read from .env. Keep .env out of source control.
-API_KEY = os.getenv("API_KEY", "")
-API_SECRET = os.getenv("API_SECRET", "")
+API_KEY = _get_str("API_KEY", "")
+API_SECRET = _get_str("API_SECRET", "")
 
 # Start safe by default. Set TESTNET=false and DRY_RUN=false in .env only after
 # you have watched the bot behave correctly with small size.
@@ -53,8 +74,8 @@ DRY_RUN = _get_bool("DRY_RUN", True)
 
 # Symbols and candles
 SYMBOLS = _get_csv("SYMBOLS", ["SAGAUSDT", "BUSDT"])
-TIMEFRAME = os.getenv("TIMEFRAME", "5")
-HTF_TIMEFRAME = os.getenv("HTF_TIMEFRAME", "60")
+TIMEFRAME = _get_str("TIMEFRAME", "5")
+HTF_TIMEFRAME = _get_str("HTF_TIMEFRAME", "60")
 CANDLE_LIMIT = _get_int("CANDLE_LIMIT", 150)
 LOOP_INTERVAL = _get_int("LOOP_INTERVAL", 60)
 
@@ -128,8 +149,8 @@ FUNDING_RATE_MIN_SHORT = _get_float("FUNDING_RATE_MIN_SHORT", -0.0005)
 # - STOP_MODE="atr": stop at ATR_SL_MULTIPLIER x ATR from entry.
 # - TP_MODE="rr": take-profit is MIN_RISK_REWARD x risk distance.
 # - TP_MODE="fixed": use TP_DISTANCE below.
-STOP_MODE = os.getenv("STOP_MODE", "ma").strip().lower()
-TP_MODE = os.getenv("TP_MODE", "rr").strip().lower()
+STOP_MODE = _get_choice("STOP_MODE", "ma", {"ma", "atr"})
+TP_MODE = _get_choice("TP_MODE", "rr", {"rr", "fixed"})
 ATR_SL_MULTIPLIER = _get_float("ATR_SL_MULTIPLIER", 1.5)
 
 # Fixed take-profit distances are used only when TP_MODE="fixed".
@@ -155,7 +176,7 @@ POSITION_CONFIRM_RETRIES = _get_int("POSITION_CONFIRM_RETRIES", 5)
 POSITION_CONFIRM_DELAY = _get_float("POSITION_CONFIRM_DELAY", 1.0)
 TRAIL_UPDATE_MIN_SECONDS = _get_int("TRAIL_UPDATE_MIN_SECONDS", 30)
 TRAIL_MIN_MOVE_TICKS = _get_int("TRAIL_MIN_MOVE_TICKS", 2)
-ORDER_LINK_PREFIX = os.getenv("ORDER_LINK_PREFIX", "riskbot")
+ORDER_LINK_PREFIX = _get_str("ORDER_LINK_PREFIX", "riskbot")
 EMERGENCY_CLOSE_ON_PROTECTION_FAILURE = _get_bool(
     "EMERGENCY_CLOSE_ON_PROTECTION_FAILURE",
     True,

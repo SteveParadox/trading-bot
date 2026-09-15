@@ -46,6 +46,22 @@ Optional high-impact news blackout events can be loaded from a JSON file:
 FX_NEWS_EVENTS_FILE=data/news_events.example.json
 ```
 
+News safety behavior is deterministic and runs outside the strategy and the
+research LLM. The live entry gate evaluates market hours, calendar freshness,
+currency/instrument relevance, high/medium impact windows, event overrides,
+manual block/allow mode, and the emergency news kill switch before risk sizing
+and MT5 execution. For a real account, `FX_REQUIRE_NEWS_DATA` defaults to
+`true`; keep a licensed or otherwise verified calendar provider configured and
+confirm its timestamps are UTC-normalized. A stale calendar blocks new entries
+but does not cancel existing positions automatically.
+
+Useful controls include `FX_MEDIUM_IMPACT_NEWS_ENABLED`,
+`FX_NEWS_RESTRICTED_CURRENCIES`, `FX_NEWS_RESTRICTED_INSTRUMENTS`,
+`FX_NEWS_EVENT_OVERRIDES`, `FX_NEWS_MANUAL_OVERRIDE`, and
+`FX_NEWS_EMERGENCY_KILL_SWITCH`. The dashboard `/api/news` response exposes
+the same structured decision used by the worker, including the matching event,
+impact, timing, and restriction reason.
+
 ## Run The Backend
 
 Start the FastAPI service. The worker runs as a background task, but it will not
@@ -123,6 +139,15 @@ pip-value conversion, broker contract/volume-step handling, account-leverage
 margin sizing, swap logging from MT5 positions/deals, and portfolio exposure
 caps by pair/gross/currency. Full rationale is in
 `docs/FX_STRATEGY_RATIONALE.md`.
+
+The default FX entry profile is intentionally selective: it requires a
+minimum quality score, directional DI separation, non-decreasing ADX, MA28
+slope in the trade direction, an aligned higher-timeframe momentum candle, and
+a bounded distance from MA7. These are configurable filters, not profitability
+guarantees. Risk and target calculations use executable prices (ask for longs,
+bid for shorts) rather than the midpoint so forward-test sizing is not
+optimistically understated. See `winstrat.txt` for the current tuning decision
+record and validation requirements.
 
 ---
 
