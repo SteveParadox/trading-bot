@@ -19,6 +19,7 @@ Architecture (news.txt spec):
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import threading
 import time
@@ -27,6 +28,7 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
@@ -65,6 +67,21 @@ class NewsProvider(ABC):
     def fetch(self) -> list[NewsEvent]:
         """Return normalized events for the configured horizon."""
 
+    def validate_snapshot(self, events: list[NewsEvent], now: datetime) -> None:
+        """Optionally reject expired coverage, even after a successful download."""
+
+
+class NewsRateLimitError(RuntimeError):
+    """A provider-requested cooldown; do not retry on every trading scan."""
+
+    def __init__(self, retry_after_seconds: float) -> None:
+        # Reject non-finite server values; bound hostile/accidental huge values
+        # so datetime arithmetic cannot make the safety gate itself crash.
+        if not math.isfinite(retry_after_seconds):
+            retry_after_seconds = 300.0
+        self.retry_after_seconds = min(7 * 86400.0, max(300.0, retry_after_seconds))
+        super().__init__(f"news provider rate limited; retry after {self.retry_after_seconds:g}s")
+
 
 class ManualJsonNewsProvider(NewsProvider):
     """Read a JSON list of events from a file (the manual/fallback provider)."""
@@ -100,6 +117,8 @@ class HttpNewsProvider(NewsProvider):
     """
 
     name = "http"
+    strict_records = False
+    minimum_retry_seconds = 0
 
     def __init__(
         self,
@@ -136,9 +155,19 @@ class HttpNewsProvider(NewsProvider):
                     payload = json.loads(response.read().decode("utf-8"))
                 break
             except HTTPError as exc:
-                # Do not retry permanent client errors; a rate limit is
-                # transient and can recover on the next exponential attempt.
-                if 400 <= exc.code < 500 and exc.code != 429:
+                if exc.code == 429:
+                    raw_delay = exc.headers.get("Retry-After", "300") if exc.headers else "300"
+                    try:
+                        delay = float(raw_delay)
+                    except ValueError:
+                        try:
+                            delay = (parsedate_to_datetime(raw_delay) - datetime.now(timezone.utc)).total_seconds()
+                        except (TypeError, ValueError, OverflowError):
+                            delay = 300.0
+                    raise NewsRateLimitError(delay) from exc
+                # Permanent client errors fail immediately. Rate limits above
+                # use the gateway cooldown rather than short in-request retries.
+                if 400 <= exc.code < 500:
                     raise
                 if attempt >= self.max_retries:
                     raise
@@ -155,15 +184,19 @@ class HttpNewsProvider(NewsProvider):
         events = []
         for item in row:
             if not isinstance(item, dict):
-                continue
-            normalized = self.normalize_item(item)
-            if not isinstance(normalized, dict):
+                if self.strict_records:
+                    raise ValueError(f"{self.name} returned a non-object event")
                 continue
             try:
-                events.append(_news_event_from_dict(normalized))
-            except ValueError:
+                events.append(self.parse_item(item))
+            except (ValueError, TypeError, AttributeError) as exc:
+                if self.strict_records:
+                    raise ValueError(f"{self.name} returned an invalid event") from exc
                 continue
         return events
+
+    def parse_item(self, item: dict[str, Any]) -> NewsEvent:
+        return _news_event_from_dict(self.normalize_item(item))
 
     def extract_items(self, payload: Any) -> list[dict[str, Any]]:
         """Return the list of raw event dicts from the provider payload."""
@@ -198,34 +231,62 @@ class ForexFactoryProvider(HttpNewsProvider):
     """Economic-calendar provider that parses the public Forex Factory JSON.
 
     Source: ``https://nfs.faireconomy.media/ff_calendar_thisweek.json`` (and the
-    ``..._nextweek.json`` variant). The provider normalizes the API's nested
-    ``days[].items[]`` shape (includes ``date``, ``impact``, ``title``,
-    ``country.code``, ``forecast``, ``previous``, ``actual``) into the canonical
-    ``NewsEvent`` records, so downstream strategy code stays provider-agnostic.
-
-    The endpoint is a stable, widely used community calendar feed. It is still a
-    third-party feed -- operators who need contractual uptime should point the
-    provider at a licensed API via ``news_api_endpoint`` instead.
+    ``..._nextweek.json`` variant). The public export is a flat list with
+    ``title``, a currency in ``country``, and offset-aware ISO ``date`` values.
+    Legacy nested ``days[].items[]`` exports remain supported. Neither an
+    unsupported shape nor a partially invalid week is a known-empty calendar.
+    This third-party calendar has no uptime/latency guarantee; demo use only.
     """
 
     name = "forexfactory"
+    strict_records = True
+    minimum_retry_seconds = 300
 
     def __init__(self, week_offset: int = 0, *, timeout_seconds: int = 30) -> None:
         week = "thisweek" if week_offset == 0 else ("nextweek" if week_offset > 0 else "lastweek")
+        self.week_offset = 0 if week_offset == 0 else (1 if week_offset > 0 else -1)
         endpoint = f"https://nfs.faireconomy.media/ff_calendar_{week}.json"
-        super().__init__(endpoint, timeout_seconds=timeout_seconds)
+        super().__init__(endpoint, timeout_seconds=timeout_seconds, max_retries=0)
 
     def extract_items(self, payload: Any) -> list[dict[str, Any]]:
-        if not isinstance(payload, dict):
-            return []
-        items: list[dict[str, Any]] = []
-        for day in payload.get("days") or []:
-            if not isinstance(day, dict):
-                continue
-            for item in day.get("items") or []:
-                if isinstance(item, dict):
-                    items.append(item)
+        if isinstance(payload, list):
+            items = payload
+        elif isinstance(payload, dict) and isinstance(payload.get("days"), list):
+            items = []
+            for day in payload["days"]:
+                if not isinstance(day, dict) or not isinstance(day.get("items"), list):
+                    raise ValueError("forexfactory returned an invalid day")
+                items.extend(day["items"])
+        else:
+            raise ValueError("forexfactory returned an unsupported calendar shape")
+        if not items or any(not isinstance(item, dict) for item in items):
+            raise ValueError("forexfactory returned an empty or invalid weekly calendar")
         return items
+
+    def parse_item(self, item: dict[str, Any]) -> NewsEvent:
+        event = super().parse_item(item)
+        if len(event.currency) != 3 or not event.currency.isalpha():
+            raise ValueError("forexfactory event has an invalid currency")
+        if event.impact not in {"high", "medium", "low", "holiday", "non-economic"}:
+            raise ValueError("forexfactory event has an unknown impact")
+        if not item.get("impact"):
+            raise ValueError("forexfactory event is missing impact")
+        raw_time = str(item.get("date") or "")
+        if ":" not in raw_time:
+            raise ValueError("forexfactory event is missing a release time")
+        return event
+
+    def validate_snapshot(self, events: list[NewsEvent], now: datetime) -> None:
+        local = _as_utc(now).astimezone(_NY_TZ)
+        start = local.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(
+            days=(local.weekday() + 1) % 7
+        ) + timedelta(weeks=self.week_offset)
+        end = start + timedelta(days=7)
+        if not any(
+            event.source == self.name and start <= event.starts_at.astimezone(_NY_TZ) < end
+            for event in events
+        ):
+            raise ValueError("forexfactory calendar does not cover the requested week")
 
     def normalize_item(self, item: dict[str, Any]) -> dict[str, Any]:
         country = item.get("country") or {}
@@ -237,8 +298,7 @@ class ForexFactoryProvider(HttpNewsProvider):
         event_id = str(item.get("id") or "").strip() or None
         if event_id:
             event_id = "".join(ch for ch in event_id if ch.isalnum() or ch in "-_")[:64]
-        # FF community feed timestamps are in New York time -- convert to UTC
-        # so downstream blackout windows are evaluated correctly.
+        # Honor explicit offsets; legacy naive timestamps use New York time.
         starts_at_utc = _ff_time_to_utc_iso(raw_time)
         return {
             "name": item.get("title"),
@@ -261,16 +321,14 @@ class ForexFactoryProvider(HttpNewsProvider):
 
 _SUFFIX_MULTIPLIERS = {"k": 1e3, "m": 1e6, "b": 1e9}
 
-# Forex Factory community feed timestamps are in New York time (12-hour
-# format like "2026-09-16 12:30pm").  This helper parses them in the
-# America/New_York zone and returns a UTC ISO string so downstream code
-# can treat all timestamps as UTC.
+# The public export carries ISO offsets. Legacy 12-hour timestamps without
+# an offset use America/New_York; never overwrite an explicit source offset.
 
 _NY_TZ = ZoneInfo("America/New_York")
 
 
 def _ff_time_to_utc_iso(raw_time: str) -> str:
-    """Parse a Forex Factory NY-time string and return a UTC ISO timestamp."""
+    """Normalize an ISO-offset or legacy New York timestamp to UTC."""
     if not raw_time:
         return ""
     text = raw_time.strip()
@@ -732,10 +790,13 @@ class NewsGateway:
         self._lock = threading.Lock()
         self._last_refresh_at: datetime | None = None
         self._last_error: str | None = None
-        # After a failed refresh the next retry is allowed after this short
-        # backoff instead of the full throttle interval, so a transient outage
-        # recovers quickly without hammering a downed provider every scan.
-        self._failure_backoff = min(30, self.refresh_throttle_seconds // 2)
+        self._retry_not_before: datetime | None = None
+        # Respect a provider's minimum retry spacing; generic providers retain
+        # the existing short recovery backoff.
+        self._failure_backoff = max(
+            min(30, self.refresh_throttle_seconds // 2),
+            getattr(self.provider, "minimum_retry_seconds", 0),
+        )
 
     @property
     def max_age_seconds(self) -> int:
@@ -755,17 +816,26 @@ class NewsGateway:
             # A successfully fetched cache -- even one whose current window
             # legitimately holds no events -- reports freshness by age, never as
             # an unexplained outage. Only a never-fetched cache is UNKNOWN.
+            events = deduplicate_events(self.cache.all() if self.cache is not None else [])
+            stale = self._stale(last_updated, now)
+            error = self._last_error
+            try:
+                self._validate_snapshot(events, now)
+            except ValueError as exc:
+                stale = True
+                error = str(exc)
             return NewsSnapshot(
-                events=deduplicate_events(self.cache.all() if self.cache is not None else []),
-                stale=self._stale(last_updated, now),
+                events=events,
+                stale=stale,
                 last_updated=last_updated,
                 age_seconds=self._age_seconds(last_updated, now),
                 source=self.provider.name if self.provider is not None else "cache",
-                last_error=self._last_error,
+                last_error=error,
             )
-        if self.static_events:
+        if self.static_events and self.provider is None:
             # No persistent cache populated: the configured static snapshot is the
-            # operator-provided source of truth until a provider is wired in.
+            # operator-provided source of truth only when no provider is wired
+            # in. Static rows must not mask a live provider's initial failure.
             return NewsSnapshot(
                 events=deduplicate_events(self.static_events),
                 stale=False,
@@ -774,10 +844,21 @@ class NewsGateway:
                 source="static",
                 last_error=None,
             )
-        return NewsSnapshot(events=[], stale=True, source="empty", last_error=self._last_error)
+        return NewsSnapshot(
+            events=[], stale=True,
+            source=self.provider.name if self.provider is not None else "empty",
+            last_error=self._last_error,
+        )
+
+    def _validate_snapshot(self, events: list[NewsEvent], now: datetime) -> None:
+        validator = getattr(self.provider, "validate_snapshot", None)
+        if validator is not None:
+            validator(events, now)
 
     def _refresh_due(self, now: datetime) -> bool:
         if self.provider is None or self.cache is None:
+            return False
+        if self._retry_not_before is not None and _as_utc(now) < self._retry_not_before:
             return False
         if self._last_refresh_at is None:
             return True
@@ -796,19 +877,23 @@ class NewsGateway:
     def _refresh_from_provider(self, now: datetime) -> bool:
         """Attempt a provider refresh. Returns True when the cache was updated.
 
-        On success the throttle timestamp advances so repeated calls within the
-        interval are free. On failure it is left at the previous value so the
-        next cycle retries promptly -- an outage must not postpone recovery for
-        the full throttle window.
+        Success advances the fetch clock. Failures leave cache freshness
+        unchanged and schedule a provider-aware retry cooldown.
         """
+        if self.provider is None or self.cache is None:
+            return False
+        if self._retry_not_before is not None and _as_utc(now) < self._retry_not_before:
+            return False
         try:
             events = deduplicate_events(self.provider.fetch())
+            self._validate_snapshot(events, now)
             # Step 4 (impact scoring): always compute our own impact score before
             # caching, so downstream consumers never depend on provider labels.
             self.cache.upsert_many(score_events(events), fetched_at=now)
             self.cache.prune(_as_utc(now) - PRUNE_HORIZON)
             self._last_refresh_at = _as_utc(now)
             self._last_error = None
+            self._retry_not_before = None
         except Exception as exc:
             # Fail-safe: an API outage (or a malformed/unsupported payload) must
             # never be interpreted as "no news" and must never break the scan
@@ -817,9 +902,11 @@ class NewsGateway:
             # monitoring/recovery. Re-arm the throttle so the next cycle retries
             # after a short backoff instead of the full throttle interval.
             current = _as_utc(now)
-            self._last_refresh_at = current - timedelta(
-                seconds=max(0, self.refresh_throttle_seconds - self._failure_backoff)
-            )
+            backoff = self._failure_backoff
+            if isinstance(exc, NewsRateLimitError):
+                backoff = max(backoff, exc.retry_after_seconds)
+            self._retry_not_before = current + timedelta(seconds=backoff)
+            self._last_refresh_at = current - timedelta(seconds=self.refresh_throttle_seconds)
             self._last_error = f"{type(exc).__name__}: {exc}"
             if self.monitor is not None:
                 last_updated = self.cache.last_fetched()
@@ -847,7 +934,7 @@ class NewsGateway:
 
     def sync_upcoming(self, now: datetime | None = None) -> NewsSnapshot:
         """Force a provider refresh (regardless of throttle) and return the
-        snapshot. Used by the periodic sync loop (news_sync_interval_seconds)."""
+        snapshot. Provider error/rate-limit cooldowns still apply."""
         current = _as_utc(now or datetime.now(timezone.utc))
         with self._lock:
             self._refresh_from_provider(current)
