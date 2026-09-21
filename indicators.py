@@ -79,7 +79,6 @@ MIN_SIGNAL_CANDLES = max(
 
 MIN_HTF_CANDLES = BASE_MIN_CANDLES
 
-
 @dataclass(frozen=True)
 class SignalDecision:
     signal: str | None
