@@ -23,7 +23,6 @@ import math
 import sqlite3
 import threading
 import time
-import urllib.request
 from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -32,8 +31,9 @@ from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
-from urllib.error import HTTPError, URLError
 from zoneinfo import ZoneInfo
+
+import httpx
 
 from fxbot.config import (
     NewsEvent,
@@ -128,6 +128,7 @@ class HttpNewsProvider(NewsProvider):
         api_key_header: str = "X-API-Key",
         timeout_seconds: int = 30,
         max_retries: int = 2,
+        trust_env: bool = True,
     ) -> None:
         parsed = urlparse(endpoint)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
@@ -139,6 +140,9 @@ class HttpNewsProvider(NewsProvider):
         self.api_key_header = api_key_header
         self.timeout_seconds = timeout_seconds
         self.max_retries = max(0, int(max_retries))
+        # Generic/licensed providers may intentionally rely on a corporate
+        # proxy. Public free feeds can opt out when they need a direct request.
+        self.trust_env = trust_env
 
     def _request_headers(self) -> dict[str, str]:
         headers = {"Accept": "application/json"}
@@ -147,16 +151,22 @@ class HttpNewsProvider(NewsProvider):
         return headers
 
     def fetch(self) -> list[NewsEvent]:
-        request = urllib.request.Request(self.endpoint, headers=self._request_headers())
         payload: Any | None = None
         for attempt in range(self.max_retries + 1):
             try:
-                with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:  # noqa: S310
-                    payload = json.loads(response.read().decode("utf-8"))
+                with httpx.Client(
+                    timeout=httpx.Timeout(self.timeout_seconds),
+                    headers=self._request_headers(),
+                    follow_redirects=True,
+                    trust_env=self.trust_env,
+                ) as client:
+                    response = client.get(self.endpoint)
+                    response.raise_for_status()
+                    payload = response.json()
                 break
-            except HTTPError as exc:
-                if exc.code == 429:
-                    raw_delay = exc.headers.get("Retry-After", "300") if exc.headers else "300"
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code == 429:
+                    raw_delay = exc.response.headers.get("Retry-After", "300")
                     try:
                         delay = float(raw_delay)
                     except ValueError:
@@ -167,12 +177,12 @@ class HttpNewsProvider(NewsProvider):
                     raise NewsRateLimitError(delay) from exc
                 # Permanent client errors fail immediately. Rate limits above
                 # use the gateway cooldown rather than short in-request retries.
-                if 400 <= exc.code < 500:
+                if 400 <= exc.response.status_code < 500:
                     raise
                 if attempt >= self.max_retries:
                     raise
                 time.sleep(min(2.0, 0.25 * (2**attempt)))
-            except (OSError, URLError, TimeoutError):
+            except (httpx.RequestError, OSError, TimeoutError):
                 if attempt >= self.max_retries:
                     raise
                 time.sleep(min(2.0, 0.25 * (2**attempt)))
@@ -246,7 +256,24 @@ class ForexFactoryProvider(HttpNewsProvider):
         week = "thisweek" if week_offset == 0 else ("nextweek" if week_offset > 0 else "lastweek")
         self.week_offset = 0 if week_offset == 0 else (1 if week_offset > 0 else -1)
         endpoint = f"https://nfs.faireconomy.media/ff_calendar_{week}.json"
-        super().__init__(endpoint, timeout_seconds=timeout_seconds, max_retries=0)
+        # The public export works reliably with a browser-compatible request
+        # and must not inherit an accidental local HTTP_PROXY value. This is a
+        # free demo feed, so a direct connection is safer than routing market
+        # calendar data through an unknown proxy.
+        super().__init__(
+            endpoint,
+            timeout_seconds=timeout_seconds,
+            max_retries=0,
+            trust_env=False,
+        )
+
+    def _request_headers(self) -> dict[str, str]:
+        headers = super()._request_headers()
+        headers.update({
+            "Accept": "application/json, text/plain, */*",
+            "User-Agent": "Mozilla/5.0",
+        })
+        return headers
 
     def extract_items(self, payload: Any) -> list[dict[str, Any]]:
         if isinstance(payload, list):
