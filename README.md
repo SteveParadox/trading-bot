@@ -54,6 +54,68 @@ Optional high-impact news blackout events can be loaded from a JSON file:
 FX_NEWS_EVENTS_FILE=data/news_events.example.json
 ```
 
+### Free Forex Factory calendar (demo/forward testing only)
+
+Merge [configs/fx_forexfactory_demo.env.example](configs/fx_forexfactory_demo.env.example)
+into your existing `.env` without replacing MT5 credentials. The sniper shadow
+profile includes these news settings too. Configuration is opt-in; no global
+provider default or running account is changed by installing this code.
+
+```env
+MT5_DEMO_ONLY=true
+FX_LIVE_TRADING_ENABLED=false
+FX_NEWS_API_ENDPOINT=
+FX_NEWS_API_KEY=
+FX_NEWS_EVENTS_FILE=
+FX_NEWS_EVENTS_JSON=
+FX_USE_FOREX_FACTORY=true
+FX_REQUIRE_NEWS_DATA=true
+FX_NEWS_SYNC_INTERVAL_SECONDS=300
+FX_NEWS_DATA_MAX_AGE_SECONDS=3600
+FX_NEWS_MANUAL_OVERRIDE=none
+FX_NEWS_EVENT_OVERRIDES=
+```
+
+The provider reads the public
+[Forex Factory weekly JSON export](https://nfs.faireconomy.media/ff_calendar_thisweek.json).
+It accepts the flat event array (currency in `country`, offset-aware ISO `date`),
+as well as the legacy nested format. Timestamps are normalized to UTC, missing
+actuals remain unknown, and the existing scorer and pair-aware blackout gate
+remain authoritative. The example retains the 30-minute pre/post high-impact
+blackouts; AI cannot authorize an entry rejected by the news gate.
+
+Validate without starting MT5 or the trading worker:
+
+```bash
+python -m fxbot.news_check --env-file configs/fx_forexfactory_demo.env.example
+```
+
+This command uses a temporary cache, prints source/state/event count/upcoming
+high-impact events, and exits nonzero for unavailable news. The profile is
+applied only to the check process; merge it into `.env` and restart the backend
+to enable it in the worker. After restart, check `/api/news` for the
+`forexfactory` source, freshness, and parsed events before starting a demo run.
+
+Provider priority remains HTTP endpoint, then manual file, then Forex Factory;
+clear the higher-priority inputs to select the free feed. Unsupported JSON,
+malformed events (including partial failures), empty weekly exports, and expired
+weekly coverage are failures, not evidence of "no news". Generic providers may
+still return an authoritative empty calendar. A static snapshot cannot mask an
+initial live-provider failure. Ordinary fetch failures retain the last good cache
+only until its 3600-second age limit; they do not reset its freshness. Entries
+are blocked if there is no usable cache. HTTP 429 honors `Retry-After` with a
+minimum five-minute cooldown; other free-feed failures also back off five minutes.
+
+This free export has no guaranteed uptime, complete breaking-news coverage, or
+release-time latency. Cache age measures our successful retrieval, not proof
+that the publisher updated every event. The requested-week check detects old
+weekly exports but cannot detect every upstream omission or delay. It is a
+scheduled-event safety filter, not a low-latency news-trading signal. Do not rely
+on it alone for funded/live trading: configuration rejects this provider when
+demo protection is disabled or live trading is enabled. Use a separately
+validated/licensed provider before any live rollout. Do not bypass freshness
+or blackout blocks to force a trade.
+
 News safety behavior is deterministic and runs outside the strategy and the
 research LLM. The live entry gate evaluates market hours, calendar freshness,
 currency/instrument relevance, high/medium impact windows, event overrides,

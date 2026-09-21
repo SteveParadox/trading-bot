@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import io
+import json
 import tempfile
 import unittest
 from contextlib import closing
@@ -124,6 +126,36 @@ class FakeMt5Client:
 
 
 class ForwardWorkerTests(unittest.TestCase):
+    def test_free_news_blocks_before_strategy_or_order_submission(self) -> None:
+        scenarios = (
+            ([{"title": "CPI m/m", "country": "USD", "date": "2026-01-06T09:10:00-05:00", "impact": "High"}], "news_blackout:"),
+            ({"error": "unavailable"}, "news_data_stale"),
+        )
+        for payload, reason in scenarios:
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as tmp:
+                settings = FxBotSettings(
+                    instruments=["EUR_USD"],
+                    strategy=StrategySettings(
+                        news_use_forex_factory=True,
+                        require_news_data=True,
+                        trade_sessions_utc=(),
+                    ),
+                    runtime=RuntimeSettings(database_url=f"sqlite:///{Path(tmp) / 'journal.db'}"),
+                )
+                with closing(StructuredJournal(settings.runtime.database_url, None)) as journal:
+                    client = FakeMt5Client()
+                    worker = ForwardTestWorker(settings, client=client, journal=journal)
+                    journal.set_state(BotRunState.RUNNING, "test news gate")
+                    with (
+                        patch("fxbot.forward.datetime", FixedDatetime),
+                        patch("fxbot.news.urllib.request.urlopen", return_value=io.BytesIO(json.dumps(payload).encode())),
+                        patch.object(worker, "_scan_instrument") as scan,
+                    ):
+                        worker.scan_once()
+                    scan.assert_not_called()
+                    self.assertEqual(client.created_orders, [])
+                    self.assertTrue(journal.recent_signals(limit=1)[0].reason.startswith(reason))
+
     def test_scan_once_places_market_order_from_confirmed_indicator_signal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             entry = trending_frame(1.08, 0.00025)

@@ -586,6 +586,20 @@ class FxBotSettings:
     news_events: list[NewsEvent] = field(default_factory=list)
     sniper: SniperSettings = field(default_factory=SniperSettings)
 
+    def __post_init__(self) -> None:
+        # Provider precedence must match build_news_gateway. An opt-in FF flag
+        # must not invalidate a separately configured HTTP or manual provider.
+        uses_free_feed = (
+            self.strategy.news_use_forex_factory
+            and not self.strategy.news_api_endpoint
+            and not self.strategy.news_events_file
+        )
+        if uses_free_feed:
+            if not self.broker.demo_only or self.runtime.live_trading_enabled:
+                raise ValueError("Forex Factory free feed is demo/forward-test only; configure another news provider for live trading")
+            if not self.strategy.require_news_data:
+                raise ValueError("Forex Factory requires FX_REQUIRE_NEWS_DATA=true")
+
 
 def settings_from_env() -> FxBotSettings:
     demo_only = _get_bool("MT5_DEMO_ONLY", True)
