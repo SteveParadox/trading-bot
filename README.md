@@ -5,6 +5,14 @@ journal, persisted risk halts, and a React dashboard. The original Bybit bot
 remains in this repo for reference and backtesting continuity, but the FX path
 lives under `fxbot/` and is the runnable product for MT5 forward testing.
 
+## Experimental sniper qualification
+
+The optional FX entry layer defaults to `FX_SNIPER_MODE=off`. Start with shadow
+observations using the [configuration and research guide](docs/FX_SNIPER_RESEARCH.md).
+The [baseline audit](docs/FX_SNIPER_AUDIT.md) records the rationale and evidence
+limits. No profitability improvement has been established. Install offline
+FX test dependencies with `pip install -r requirements-fx-research.txt`.
+
 ## FX Safety Defaults
 
 This build defaults to `MT5_DEMO_ONLY=true` and refuses to run when the

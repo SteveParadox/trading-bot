@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
+import math
 
 import pandas as pd
 
@@ -223,7 +224,10 @@ class Mt5Client:
             for row in rows:
                 payload = _as_dict(row)
                 if str(payload.get("comment") or "").startswith(marker):
-                    return {"id": str(payload.get("ticket") or payload.get("order") or ""), "mt5": payload}
+                    identifier = str(payload.get("ticket") or payload.get("order") or "")
+                    return {"id": identifier, "mt5": payload,
+                            "state": "filled" if getter_name == "positions_get" else "submitted",
+                            "trade_id": identifier if getter_name == "positions_get" else None}
         return None
 
     def create_market_order(
@@ -235,6 +239,8 @@ class Mt5Client:
         take_profit: float | None,
         client_order_id: str,
         comment: str,
+        approved_entry_price: float | None = None,
+        max_spread_price: float | None = None,
     ) -> dict[str, Any]:
         self._ensure_connected()
         mt5 = self._module()
@@ -247,6 +253,12 @@ class Mt5Client:
         tick_payload = _as_dict(tick)
         side = Side.LONG if signed_units > 0 else Side.SHORT
         price = _safe_float(tick_payload.get("ask" if side is Side.LONG else "bid"))
+        if approved_entry_price is not None:
+            bid, ask = _safe_float(tick_payload.get("bid")), _safe_float(tick_payload.get("ask"))
+            if not all(math.isfinite(v) for v in (bid, ask, approved_entry_price)) or bid <= 0 or ask <= bid or (price - approved_entry_price) * side.sign > 0:
+                raise Mt5RejectedError("Executable price moved beyond sniper risk approval")
+            if max_spread_price is not None and ask - bid > max_spread_price:
+                raise Mt5RejectedError("Spread moved beyond sniper execution approval")
         volume = instrument.units_to_volume(abs(signed_units))
         if volume <= 0 or (instrument.volume_min and volume < instrument.volume_min):
             raise Mt5Error(f"{instrument.name} MT5 volume {volume} is below broker minimum")
@@ -316,7 +328,7 @@ class Mt5Client:
         symbol = instrument.broker_symbol or self.settings.broker_symbol_for(instrument_name)
         side = Side.LONG if signed_units > 0 else Side.SHORT
         tick_payload = self._price_snapshot(instrument_name)
-        price = tick_payload.ask if side is Side.LONG else tick_payload.bid
+        price = tick_payload.bid if side is Side.LONG else tick_payload.ask
         volume = instrument.units_to_volume(abs(signed_units))
         if volume <= 0 or (instrument.volume_min and volume < instrument.volume_min):
             raise Mt5Error(f"{instrument_name} MT5 volume {volume} is below broker minimum")
@@ -331,8 +343,8 @@ class Mt5Client:
             "magic": self.settings.magic_number,
             "comment": comment,
             "type_time": _constant(mt5, "ORDER_TIME_GTC", 0),
-            "type_filling": self._validated_order_filling({"symbol": symbol, "type_filling": 0}),
         }
+        request["type_filling"] = self._validated_order_filling(request)
         result = mt5.order_send(request)
         result_payload = self._checked_result(result, "order_send close")
         return {

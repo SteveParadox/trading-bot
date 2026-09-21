@@ -76,6 +76,5 @@ def reconcile_order(
     except Exception:
         return transition(row.status, RecoveryEvent.RECONCILIATION_FAILED)
     if broker_order:
-        return transition(row.status, RecoveryEvent.BROKER_FOUND)
+        return transition(row.status, RecoveryEvent.FILL_CONFIRMED if broker_order.get("state") == "filled" else RecoveryEvent.BROKER_FOUND)
     return transition(row.status, RecoveryEvent.BROKER_NOT_FOUND)
-

@@ -458,6 +458,24 @@ class StructuredJournal:
                     row.updated_at = _aware(timestamp)
                     row.payload = {}
 
+    def find_trade(self, broker_trade_id: str) -> TradeJournalRow | None:
+        with self.sessions() as session:
+            row = session.scalar(select(TradeJournalRow).where(TradeJournalRow.broker_trade_id == broker_trade_id))
+            if row is not None:
+                session.expunge(row)
+            return row
+
+    def update_trade_payload(self, broker_trade_id: str, payload: dict[str, Any]) -> None:
+        with self.sessions.begin() as session:
+            row = session.scalar(select(TradeJournalRow).where(TradeJournalRow.broker_trade_id == broker_trade_id))
+            if row is not None:
+                row.payload = _jsonable({**(row.payload or {}), **payload})
+
+    def has_unresolved_orders(self) -> bool:
+        with self.sessions() as session:
+            return session.scalar(select(OrderJournalRow.id).where(
+                OrderJournalRow.status.in_(("pending", "unknown", "submitted", "operator_review"))).limit(1)) is not None
+
     def upsert_trade(
         self,
         *,
@@ -590,7 +608,7 @@ class StructuredJournal:
             rows = list(
                 session.scalars(
                     select(OrderJournalRow)
-                    .where(OrderJournalRow.status.in_(("pending", "unknown")))
+                    .where(OrderJournalRow.status.in_(("pending", "unknown", "submitted")))
                     .order_by(OrderJournalRow.id)
                     .limit(limit)
                 )
