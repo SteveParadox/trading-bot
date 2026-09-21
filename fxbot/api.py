@@ -255,6 +255,11 @@ def create_app(settings: FxBotSettings | None = None) -> FastAPI:
     def orders(limit: int = Query(default=200, ge=1, le=1000)) -> list[dict[str, Any]]:
         return [row_to_dict(row) for row in journal.recent_orders(limit=limit)]
 
+    @app.get("/api/ai-deliberations", dependencies=[Depends(require_api_key)])
+    def ai_deliberations(limit: int = Query(default=200, ge=1, le=1000)) -> list[dict[str, Any]]:
+        """Research/audit records only; this endpoint has no trading controls."""
+        return [row_to_dict(row) for row in journal.recent_ai_deliberations(limit=limit)]
+
     @app.get("/api/performance", dependencies=[Depends(require_api_key)])
     def performance(instrument: str | None = None, start: str | None = None, end: str | None = None) -> dict[str, Any]:
         return performance_summary(
@@ -688,6 +693,12 @@ def _config_payload(settings: FxBotSettings) -> dict[str, Any]:
     strategy_payload["news_api_key_configured"] = bool(settings.strategy.news_api_key)
     strategy_payload["news_api_endpoint_configured"] = bool(settings.strategy.news_api_endpoint)
     payload["strategy"] = strategy_payload
+    ai_payload = dict(payload.get("ai") or {})
+    ai_payload.pop("api_key", None)
+    ai_payload.pop("endpoint", None)
+    ai_payload["api_key_configured"] = bool(settings.ai.api_key)
+    ai_payload["endpoint_configured"] = bool(settings.ai.endpoint)
+    payload["ai"] = ai_payload
     payload["broker"] = {
         "provider": settings.broker.provider,
         "server": redact(settings.broker.server),

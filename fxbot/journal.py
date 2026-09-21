@@ -12,9 +12,11 @@ from pathlib import Path
 from typing import Any
 
 from sqlalchemy import desc, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, close_all_sessions, sessionmaker
 
 from fxbot.database import (
+    AiDeliberationRow,
     BotStateRow,
     CurrentPositionRow,
     EquitySnapshotRow,
@@ -130,6 +132,75 @@ class StructuredJournal:
             session.expunge(row)
         self.write_jsonl("signal", row)
         return row
+
+    def update_signal(
+        self,
+        signal_id: int,
+        *,
+        status: str | None = None,
+        reason: str | None = None,
+        payload_update: dict[str, Any] | None = None,
+    ) -> SignalJournalRow | None:
+        """Annotate a parent signal without creating a duplicate signal row."""
+        with self.sessions.begin() as session:
+            row = session.get(SignalJournalRow, signal_id)
+            if row is None:
+                return None
+            if status is not None:
+                row.status = status
+            if reason is not None:
+                row.reason = reason
+            if payload_update:
+                row.payload = _jsonable({**(row.payload or {}), **payload_update})
+            session.flush()
+            session.expunge(row)
+        self.write_jsonl("signal_updated", row)
+        return row
+
+    def record_ai_deliberation(self, *, payload: dict[str, Any]) -> tuple[AiDeliberationRow, bool]:
+        """Persist a validated audit or failure idempotently by parent signal."""
+        signal_id = str(payload["signal_id"])
+        try:
+            with self.sessions.begin() as session:
+                existing = session.scalar(select(AiDeliberationRow).where(AiDeliberationRow.signal_id == signal_id))
+                if existing is not None:
+                    session.expunge(existing)
+                    return existing, False
+                # Keep SQLAlchemy DateTime values typed; only JSON columns need
+                # recursive conversion for dataclasses/enums.
+                normalized = dict(payload)
+                normalized["evidence"] = _jsonable(normalized.get("evidence") or {})
+                normalized["response"] = _jsonable(normalized.get("response")) if normalized.get("response") is not None else None
+                for name in (
+                    "reasoning_issues", "reasoning_supporting_factors", "market_context_issues",
+                    "market_context_supporting_factors", "contradictions",
+                ):
+                    normalized[name] = _jsonable(normalized.get(name) or [])
+                row = AiDeliberationRow(**normalized)
+                session.add(row)
+                session.flush()
+                session.expunge(row)
+        except IntegrityError:
+            # A second worker can observe no row before the unique insert from
+            # the first worker commits. The uniqueness constraint is the final
+            # idempotency authority; return the winner instead of surfacing a
+            # harmless duplicate-race failure to the scan loop.
+            existing = self.find_ai_deliberation(signal_id)
+            if existing is not None:
+                return existing, False
+            raise
+        self.write_jsonl("ai_deliberation", row)
+        return row, True
+
+    def find_ai_deliberation(self, signal_id: str) -> AiDeliberationRow | None:
+        with self.sessions() as session:
+            row = session.scalar(select(AiDeliberationRow).where(AiDeliberationRow.signal_id == signal_id))
+            if row is not None:
+                session.expunge(row)
+            return row
+
+    def recent_ai_deliberations(self, limit: int = 200) -> list[AiDeliberationRow]:
+        return _recent(self.sessions, AiDeliberationRow, limit)
 
     def reserve_order(
         self,

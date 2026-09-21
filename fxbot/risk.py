@@ -42,6 +42,25 @@ class FxRiskDecision:
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
+def reward_covers_spread(
+    exit_plan: FxExitPlan,
+    spread_price: float,
+    minimum_reward_to_spread_ratio: float,
+) -> bool:
+    """Require a planned target to clear a configurable multiple of spread.
+
+    A small gross target can look attractive in a backtest while being mostly
+    consumed by executable bid/ask cost. This deliberately uses price distance
+    so it works consistently for both JPY and non-JPY FX pairs.
+    """
+
+    if minimum_reward_to_spread_ratio <= 0:
+        return True
+    if spread_price <= 0 or not math.isfinite(spread_price):
+        return False
+    return exit_plan.reward_distance / spread_price >= minimum_reward_to_spread_ratio
+
+
 class FxRiskManager:
     def __init__(self, risk: RiskSettings, strategy: StrategySettings) -> None:
         self.risk = risk

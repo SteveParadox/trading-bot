@@ -326,6 +326,13 @@ class StrategySettings:
     score_di_edge_ceiling: float = 25.0
     score_volume_ratio_floor: float = 0.8
     score_volume_ratio_ceiling: float = 2.0
+    # Close-location strength is a directional candle-quality gate. A long
+    # entry must close in the upper portion of its completed candle (and a
+    # short in the lower portion) when this is enabled.
+    min_entry_close_strength: float = 0.0
+    # Tiny targets are only viable when their gross reward comfortably exceeds
+    # the current bid/ask spread. Zero keeps the legacy behavior.
+    min_reward_to_spread_ratio: float = 0.0
     trade_sessions_utc: tuple[str, ...] = ("london", "new_york", "overlap")
     avoid_rollover_minutes: int = 15
     close_before_weekend_minutes: int = 60
@@ -381,6 +388,10 @@ class StrategySettings:
             raise ValueError("strategy.score_volume_ratio_floor cannot be negative")
         if self.score_volume_ratio_ceiling <= self.score_volume_ratio_floor:
             raise ValueError("strategy.score_volume_ratio_ceiling must exceed score_volume_ratio_floor")
+        if not 0 <= self.min_entry_close_strength <= 1:
+            raise ValueError("strategy.min_entry_close_strength must be between 0 and 1")
+        if self.min_reward_to_spread_ratio < 0:
+            raise ValueError("strategy.min_reward_to_spread_ratio cannot be negative")
         if not 0 <= self.min_signal_score <= 100:
             raise ValueError("strategy.min_signal_score must be between 0 and 100")
         if self.min_di_edge < 0:
@@ -480,6 +491,50 @@ class RuntimeSettings:
 
 
 @dataclass(frozen=True)
+class AiDeliberationSettings:
+    """Configuration for the isolated, optional signal-audit service.
+
+    This object deliberately contains no broker, risk, or order settings.  The
+    AI service receives an immutable evidence package and returns untrusted
+    audit data only.
+    """
+
+    mode: str = "off"
+    provider: str = "openai_compatible"
+    endpoint: str = ""
+    api_key: str = ""
+    model: str = ""
+    timeout_seconds: float = 8.0
+    max_output_tokens: int = 1200
+    max_retries: int = 1
+    prompt_version: str = "v1"
+    fail_policy: str = "fail_closed_if_confirmation_required"
+    flag_blocks: bool = False
+    reject_blocks: bool = False
+    minimum_confidence: float = 0.70
+    advisory_require_confirmation: bool = False
+
+    def __post_init__(self) -> None:
+        mode = self.mode.lower().strip()
+        if mode not in {"off", "shadow", "advisory"}:
+            raise ValueError("ai.mode must be off, shadow, or advisory")
+        if self.provider.lower().strip() not in {"openai_compatible", "none"}:
+            raise ValueError("ai.provider must be openai_compatible or none")
+        if self.timeout_seconds <= 0:
+            raise ValueError("ai.timeout_seconds must be positive")
+        if self.max_output_tokens < 64:
+            raise ValueError("ai.max_output_tokens must be at least 64")
+        if self.max_retries < 0 or self.max_retries > 3:
+            raise ValueError("ai.max_retries must be between 0 and 3")
+        if not 0.0 <= self.minimum_confidence <= 1.0:
+            raise ValueError("ai.minimum_confidence must be between 0 and 1")
+        if self.fail_policy not in {"fail_open", "fail_closed_if_confirmation_required"}:
+            raise ValueError("ai.fail_policy is not supported")
+        object.__setattr__(self, "mode", mode)
+        object.__setattr__(self, "provider", self.provider.lower().strip())
+
+
+@dataclass(frozen=True)
 class NewsEvent:
     """Canonical internal news-event schema.
 
@@ -507,10 +562,6 @@ class NewsEvent:
     source_url: str = ""
     status: str = "scheduled"
     confidence: float | None = None
-    description: str = ""
-    source_url: str = ""
-    status: str = "scheduled"
-    confidence: float | None = None
 
     @property
     def event_name(self) -> str:
@@ -530,6 +581,7 @@ class FxBotSettings:
     strategy: StrategySettings = field(default_factory=StrategySettings)
     risk: RiskSettings = field(default_factory=RiskSettings)
     runtime: RuntimeSettings = field(default_factory=RuntimeSettings)
+    ai: AiDeliberationSettings = field(default_factory=AiDeliberationSettings)
     news_events: list[NewsEvent] = field(default_factory=list)
 
 
@@ -589,6 +641,8 @@ def settings_from_env() -> FxBotSettings:
             score_di_edge_ceiling=_get_float("FX_SCORE_DI_EDGE_CEILING", 25.0),
             score_volume_ratio_floor=_get_float("FX_SCORE_VOLUME_RATIO_FLOOR", 0.80),
             score_volume_ratio_ceiling=_get_float("FX_SCORE_VOLUME_RATIO_CEILING", 2.0),
+            min_entry_close_strength=_get_float("FX_MIN_ENTRY_CLOSE_STRENGTH", 0.0),
+            min_reward_to_spread_ratio=_get_float("FX_MIN_REWARD_TO_SPREAD_RATIO", 0.0),
             trade_sessions_utc=tuple(
                 item.lower() for item in _get_csv("FX_TRADE_SESSIONS_UTC", ["london", "new_york", "overlap"])
             ),
@@ -644,6 +698,22 @@ def settings_from_env() -> FxBotSettings:
             live_trading_enabled=_get_bool("FX_LIVE_TRADING_ENABLED", False),
             live_release_ack=_get_str("FX_LIVE_RELEASE_ACK", ""),
             max_price_age_seconds=_get_int("FX_MAX_PRICE_AGE_SECONDS", 120),
+        ),
+        ai=AiDeliberationSettings(
+            mode=_get_str("FX_AI_DELIBERATION", "off"),
+            provider=_get_str("FX_AI_PROVIDER", "openai_compatible"),
+            endpoint=_get_str("FX_AI_ENDPOINT", ""),
+            api_key=_get_str("FX_AI_API_KEY", ""),
+            model=_get_str("FX_AI_MODEL", ""),
+            timeout_seconds=_get_float("FX_AI_TIMEOUT_SECONDS", 8.0),
+            max_output_tokens=_get_int("FX_AI_MAX_OUTPUT_TOKENS", 1200),
+            max_retries=_get_int("FX_AI_MAX_RETRIES", 1),
+            prompt_version=_get_str("AI_DELIBERATION_PROMPT_VERSION", "v1"),
+            fail_policy=_get_str("FX_AI_FAIL_POLICY", "fail_closed_if_confirmation_required"),
+            flag_blocks=_get_bool("FX_AI_FLAG_BLOCKS", False),
+            reject_blocks=_get_bool("FX_AI_REJECT_BLOCKS", False),
+            minimum_confidence=_get_float("FX_AI_MIN_CONFIDENCE", 0.70),
+            advisory_require_confirmation=_get_bool("FX_AI_ADVISORY_REQUIRE_CONFIRMATION", False),
         ),
         news_events=load_news_events(),
     )

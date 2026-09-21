@@ -185,6 +185,19 @@ def evaluate_signal_frame(
             },
         )
 
+    entry_close_strength = _entry_close_strength(entry_row, signal.signal)
+    if entry_close_strength < settings.min_entry_close_strength:
+        return FxSignalDecision(
+            None,
+            "entry_close_strength_filter",
+            {
+                **signal.details,
+                "entry_close_strength": entry_close_strength,
+                "required_entry_close_strength": settings.min_entry_close_strength,
+                "signal": signal.signal.value,
+            },
+        )
+
     slope_index = len(entry_window) - 1 - settings.ma28_slope_lookback
     if slope_index < 0:
         return FxSignalDecision(None, "ma28_slope_history_unavailable", {})
@@ -229,6 +242,7 @@ def evaluate_signal_frame(
         "atr_price": atr,
         "atr_pips": atr_pips,
         "atr_pct": atr_pct,
+        "entry_close_strength": entry_close_strength,
         "entry_extension_atr": entry_extension_atr,
         "distance_ma28_pips": distance_ma28_pips,
         "instrument": instrument.name,
@@ -547,6 +561,19 @@ def _entry_extension_atr(row: pd.Series, signal: Side) -> float:
     if signal is Side.LONG:
         return max((close - ma7) / atr, 0.0)
     return max((ma7 - close) / atr, 0.0)
+
+
+def _entry_close_strength(row: pd.Series, signal: Side) -> float:
+    """Return the directional close location within a completed OHLC candle."""
+
+    high = _safe_float(row.get("high"))
+    low = _safe_float(row.get("low"))
+    close = _safe_float(row.get("close"))
+    candle_range = high - low
+    if not all(math.isfinite(value) for value in (high, low, close)) or candle_range <= 0:
+        return 0.0
+    raw = (close - low) / candle_range if signal is Side.LONG else (high - close) / candle_range
+    return max(0.0, min(1.0, raw))
 
 
 def _di_edge(row: pd.Series, signal: Side) -> float:

@@ -6,7 +6,7 @@ import asyncio
 import hashlib
 import logging
 from uuid import uuid4
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
 from typing import Any, Awaitable, Callable
 
@@ -20,12 +20,12 @@ from fxbot.instruments import (
     position_value_home,
 )
 from fxbot.journal import StructuredJournal
-from fxbot.market_hours import can_trade, news_blackout_reason
+from fxbot.market_hours import active_sessions, can_trade, news_blackout_reason
 from fxbot.models import BotRunState, FxPortfolioState, FxSignalIntent, Side
 from fxbot.mt5 import Mt5Client, Mt5CredentialsMissing, Mt5Error, Mt5RejectedError, extract_order_ids
 from fxbot.operations import freshness
 from fxbot.recovery import RecoveryState, reconcile_order
-from fxbot.risk import FxRiskDecision, FxRiskManager
+from fxbot.risk import FxRiskDecision, FxRiskManager, reward_covers_spread
 from fxbot.strategy import (
     TIMEFRAME_DELTAS,
     build_signal_intent,
@@ -36,6 +36,14 @@ from fxbot.strategy import (
 from fxbot.database import set_lock_retry_callback
 from fxbot.monitoring import OperationalMonitor
 from fxbot.news import NewsGateway, build_news_gateway
+from fxbot.ai_deliberation import (
+    AiAuditResponse,
+    AiDeliberationResult,
+    AiDeliberationService,
+    apply_ai_execution_policy,
+    build_signal_evidence,
+    validate_ai_audit_response,
+)
 from fxbot.operations import clock_health
 from fxbot.security import code_version, data_hash, experiment_manifest, strategy_config_hash
 
@@ -60,6 +68,7 @@ class ForwardTestWorker:
         publisher: Publisher | None = None,
         monitor: OperationalMonitor | None = None,
         news: NewsGateway | None = None,
+        deliberator: AiDeliberationService | None = None,
     ) -> None:
         self.settings = settings or settings_from_env()
         ensure_runtime_dirs(self.settings)
@@ -79,6 +88,7 @@ class ForwardTestWorker:
             monitor=self.monitor,
             static_events=self.settings.news_events,
         )
+        self.deliberator = deliberator or AiDeliberationService(self.settings.ai)
         # Feed SQLite lock retries into the operational monitor.
         monitor_ref = self.monitor
         set_lock_retry_callback(monitor_ref.record_db_lock_retry)
@@ -147,6 +157,7 @@ class ForwardTestWorker:
         shutdown = getattr(self.client, "shutdown", None)
         if shutdown is not None:
             shutdown()
+        self.deliberator.close()
         self.journal.close()
 
     def scan_once(self) -> None:
@@ -240,7 +251,7 @@ class ForwardTestWorker:
             if price.spread_pips(instrument) > self.settings.strategy.max_spread_pips:
                 self._skip(now, name, "spread_filter", {"spread_pips": price.spread_pips(instrument)})
                 continue
-            self._scan_instrument(now, instrument, price, portfolio, prices.conversion_rates)
+            self._scan_instrument(now, instrument, price, portfolio, prices.conversion_rates, news_snapshot)
 
     def _check_price_freshness(self, now: datetime, prices: dict[str, PriceSnapshot]) -> bool:
         stale = []
@@ -297,6 +308,7 @@ class ForwardTestWorker:
         price: PriceSnapshot,
         portfolio: FxPortfolioState,
         conversion_rates: dict[str, float],
+        news_snapshot: Any,
     ) -> None:
         entry_frame = prepare_indicators(
             self.client.candles(instrument.name, self.settings.strategy.entry_timeframe, self.settings.strategy.candle_limit)
@@ -384,7 +396,34 @@ class ForwardTestWorker:
             )
             return
 
-        self.journal.record_signal(
+        if not reward_covers_spread(
+            risk.exit_plan,
+            spread_price,
+            self.settings.strategy.min_reward_to_spread_ratio,
+        ):
+            ratio = risk.exit_plan.reward_distance / spread_price if spread_price > 0 else 0.0
+            self.journal.record_signal(
+                timestamp=now,
+                instrument=instrument.name,
+                status="rejected",
+                reason="target_cost_filter",
+                side=intent.side.value,
+                score=intent.score,
+                entry_price=executable_entry,
+                stop_loss=risk.exit_plan.stop_loss,
+                take_profit=risk.exit_plan.take_profit,
+                risk_amount=risk.risk_amount,
+                payload={
+                    "risk": asdict(risk),
+                    "intent": asdict(intent),
+                    "reward_to_spread_ratio": ratio,
+                    "required_reward_to_spread_ratio": self.settings.strategy.min_reward_to_spread_ratio,
+                },
+                data_hash=data_hash({"instrument": instrument.name, "decision_time": decision_time.isoformat(), "signal": intent.signal_row}),
+            )
+            return
+
+        signal_row = self.journal.record_signal(
             timestamp=now,
             instrument=instrument.name,
             status="accepted",
@@ -398,6 +437,93 @@ class ForwardTestWorker:
             payload={"risk": asdict(risk), "intent": asdict(intent)},
             data_hash=data_hash({"instrument": instrument.name, "decision_time": decision_time.isoformat(), "signal": intent.signal_row}),
         )
+        # This deterministic key identifies the parent setup across retries and
+        # its partial exit legs. It is intentionally independent of SQLite's
+        # surrogate signal-row id so a restarted scan cannot create another AI
+        # deliberation for the same closed candle.
+        parent_signal_id = parent_signal_id_for(intent)
+        ai_result: AiDeliberationResult | None = None
+        ai_row = None
+        if self.settings.ai.mode != "off":
+            ai_row = self.journal.find_ai_deliberation(parent_signal_id)
+            if ai_row is not None:
+                ai_result = _ai_result_from_row(ai_row)
+            else:
+                evidence = build_signal_evidence(
+                    signal_id=parent_signal_id,
+                    intent=intent,
+                    instrument=instrument,
+                    price=price,
+                    portfolio=portfolio,
+                    risk=risk,
+                    strategy=self.settings.strategy,
+                    news_events=news_snapshot.events,
+                    news_stale=news_snapshot.stale,
+                    active_sessions=active_sessions(intent.timestamp),
+                    now=now,
+                    demo_only=self.settings.broker.demo_only,
+                )
+                ai_result = self.deliberator.deliberate(evidence)
+                try:
+                    ai_row, _ = self.journal.record_ai_deliberation(
+                        payload=_ai_journal_payload(
+                            signal_id=parent_signal_id,
+                            timestamp=now,
+                            instrument=instrument.name,
+                            side=intent.side.value,
+                            settings=self.settings.ai,
+                            evidence=evidence.to_dict(),
+                            evidence_hash=evidence.evidence_hash(),
+                            result=ai_result,
+                        )
+                    )
+                except Exception as exc:
+                    # An optional audit persistence issue must not stop the
+                    # deterministic shadow path. Advisory confirmation treats
+                    # it as a failed AI result below, never as an accidental
+                    # allow. Core signal/order journaling has already occurred.
+                    log.exception("AI deliberation persistence failed for %s", parent_signal_id)
+                    ai_result = AiDeliberationResult(
+                        response=None,
+                        latency_ms=ai_result.latency_ms,
+                        failure_reason=f"ai_persistence_failed:{type(exc).__name__}",
+                    )
+                response = ai_result.response
+                log.info(
+                    "ai_deliberation signal_id=%s pair=%s direction=%s score=%.2f mode=%s decision=%s confidence=%s reasoning=%s context=%s latency_ms=%s failure=%s",
+                    parent_signal_id, instrument.name, intent.side.value, intent.score, self.settings.ai.mode,
+                    response.decision if response else None, response.confidence if response else None,
+                    response.reasoning_audit["status"] if response else None,
+                    response.market_context["status"] if response else None,
+                    ai_result.latency_ms, ai_result.failure_reason,
+                )
+        policy = apply_ai_execution_policy(
+            hard_safety_allowed=risk.allowed and risk.exit_plan is not None,
+            settings=self.settings.ai,
+            result=ai_result,
+        )
+        if self.settings.ai.mode != "off":
+            self.journal.update_signal(
+                signal_row.id,
+                status="accepted" if policy.allowed else "advisory_blocked",
+                reason="signal_and_risk_accepted" if policy.allowed else policy.reason,
+                payload_update={
+                    "parent_signal_id": parent_signal_id,
+                    "ai_deliberation_id": ai_row.id if ai_row is not None else None,
+                    "ai_execution_policy": asdict(policy),
+                },
+            )
+            if not policy.allowed:
+                return
+            intent = replace(
+                intent,
+                metadata={
+                    **intent.metadata,
+                    "parent_signal_id": parent_signal_id,
+                    "parent_signal_row_id": signal_row.id,
+                    "ai_deliberation_id": ai_row.id if ai_row is not None else None,
+                },
+            )
         self._submit_idempotent(intent, instrument, risk)
 
     def _submit_idempotent(self, intent: FxSignalIntent, instrument: FxInstrument, risk: FxRiskDecision) -> None:
@@ -419,6 +545,9 @@ class ForwardTestWorker:
                 "strategy_decision": intent.metadata.get("decision"),
                 "signal_features": intent.metadata.get("score_details", {}),
                 "risk_metadata": risk.metadata,
+                "parent_signal_id": intent.metadata.get("parent_signal_id"),
+                "parent_signal_row_id": intent.metadata.get("parent_signal_row_id"),
+                "ai_deliberation_id": intent.metadata.get("ai_deliberation_id"),
             }
             row, created = self.journal.reserve_order(
                 client_order_id=client_id,
@@ -709,6 +838,9 @@ class ForwardTestWorker:
                     "strategy_decision": intent.metadata.get("decision"),
                     "signal_features": intent.metadata.get("score_details", {}),
                     "entry_price_source": intent.metadata.get("entry_price_source"),
+                    "parent_signal_id": intent.metadata.get("parent_signal_id"),
+                    "parent_signal_row_id": intent.metadata.get("parent_signal_row_id"),
+                    "ai_deliberation_id": intent.metadata.get("ai_deliberation_id"),
                 },
             },
         )
@@ -1010,6 +1142,73 @@ def client_order_id(intent: FxSignalIntent, leg: str) -> str:
     key = f"{intent.instrument}:{intent.side.value}:{raw_timestamp}:{leg}:{intent.entry_price:.8f}"
     digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
     return f"fxft-{intent.instrument.replace('_', '')}-{leg}-{digest}"[:64]
+
+
+def parent_signal_id_for(intent: FxSignalIntent) -> str:
+    """Stable idempotency key for a parent signal, not an order leg."""
+    timestamp = intent.timestamp.replace(tzinfo=timezone.utc) if intent.timestamp.tzinfo is None else intent.timestamp.astimezone(timezone.utc)
+    raw_timestamp = timestamp.isoformat()
+    # The closed-candle decision, not a changing live bid/ask, defines the
+    # parent signal. Price remains in evidence and order idempotency but must
+    # not create duplicate audits during repeated scans of one signal candle.
+    key = f"{intent.instrument}:{intent.side.value}:{raw_timestamp}"
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:24]
+    return f"fxsig-{intent.instrument.replace('_', '')}-{digest}"[:64]
+
+
+def _ai_journal_payload(
+    *,
+    signal_id: str,
+    timestamp: datetime,
+    instrument: str,
+    side: str,
+    settings: Any,
+    evidence: dict[str, Any],
+    evidence_hash: str,
+    result: AiDeliberationResult,
+) -> dict[str, Any]:
+    response = result.response.to_dict() if result.response else None
+    reasoning = (response or {}).get("reasoning_audit", {})
+    context = (response or {}).get("market_context", {})
+    output_hash = data_hash(response) if response is not None else None
+    return {
+        "signal_id": signal_id,
+        "timestamp": timestamp,
+        "instrument": instrument,
+        "side": side,
+        "model": settings.model,
+        "prompt_version": settings.prompt_version,
+        "mode": settings.mode,
+        "status": "completed" if response else "failed",
+        "decision": response.get("decision") if response else None,
+        "confidence": response.get("confidence") if response else None,
+        "reasoning_audit_status": reasoning.get("status"),
+        "reasoning_issues": reasoning.get("issues", []),
+        "reasoning_supporting_factors": reasoning.get("supporting_factors", []),
+        "market_context_status": context.get("status"),
+        "market_context_issues": context.get("issues", []),
+        "market_context_supporting_factors": context.get("supporting_factors", []),
+        "contradictions": response.get("contradictions", []) if response else [],
+        "recommended_action": response.get("recommended_action") if response else None,
+        "summary": response.get("summary", "") if response else "",
+        "evidence_hash": evidence_hash,
+        "output_hash": output_hash,
+        "latency_ms": result.latency_ms,
+        "failure_reason": result.failure_reason,
+        "evidence": evidence,
+        "response": response,
+    }
+
+
+def _ai_result_from_row(row: Any) -> AiDeliberationResult:
+    response = row.response
+    if not isinstance(response, dict):
+        return AiDeliberationResult(None, int(row.latency_ms or 0), row.failure_reason or "previous_ai_failure")
+    try:
+        audit = validate_ai_audit_response(response)
+    except Exception:
+        return AiDeliberationResult(None, int(row.latency_ms or 0), "stored_ai_response_invalid")
+    return AiDeliberationResult(audit, int(row.latency_ms or 0), row.failure_reason)
 
 
 def _is_definite_rejection_error(error: str | None) -> bool:

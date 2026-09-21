@@ -107,6 +107,41 @@ class TradeJournalRow(Base):
     experiment_manifest_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
 
 
+class AiDeliberationRow(Base):
+    """One immutable AI audit per parent signal, never per exit/order leg."""
+
+    __tablename__ = "ai_deliberations"
+    __table_args__ = (UniqueConstraint("signal_id", name="uq_ai_deliberation_signal_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    signal_id: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False, index=True)
+    instrument: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    side: Mapped[str] = mapped_column(String(16), nullable=False)
+    model: Mapped[str] = mapped_column(String(128), default="", nullable=False)
+    prompt_version: Mapped[str] = mapped_column(String(32), nullable=False)
+    mode: Mapped[str] = mapped_column(String(16), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
+    decision: Mapped[str | None] = mapped_column(String(16), nullable=True, index=True)
+    confidence: Mapped[float | None] = mapped_column(Float, nullable=True)
+    reasoning_audit_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    reasoning_issues: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    reasoning_supporting_factors: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    market_context_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    market_context_issues: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    market_context_supporting_factors: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    contradictions: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    recommended_action: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    summary: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    evidence_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    output_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    failure_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+    evidence: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    response: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
 class RunManifestRow(Base):
     __tablename__ = "run_manifest"
 
