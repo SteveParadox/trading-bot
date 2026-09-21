@@ -6,5 +6,16 @@ export default defineConfig({
   server: {
     host: "127.0.0.1",
     port: 5173
+  },
+  build: {
+    rollupOptions: {
+      output: {
+        // Keep the charting vendor code isolated for better caching and
+        // independent loading from application code.
+        manualChunks: {
+          charts: ["recharts"]
+        }
+      }
+    }
   }
 });
