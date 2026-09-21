@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import math
 from uuid import uuid4
 from dataclasses import asdict, replace
 from datetime import datetime, timedelta, timezone
@@ -31,6 +32,7 @@ from fxbot.strategy import (
     build_signal_intent,
     evaluate_signal_frame,
     last_closed_row,
+    last_closed_window,
     prepare_indicators,
 )
 from fxbot.database import set_lock_retry_callback
@@ -46,6 +48,7 @@ from fxbot.ai_deliberation import (
 )
 from fxbot.operations import clock_health
 from fxbot.security import code_version, data_hash, experiment_manifest, strategy_config_hash
+from fxbot.sniper import qualify_entry, qualify_execution, exit_reason
 
 log = logging.getLogger(__name__)
 
@@ -229,6 +232,10 @@ class ForwardTestWorker:
         else:
             self.monitor.clear_risk_halt()
 
+        if self.journal.has_unresolved_orders():
+            self.journal.log_event("entry_blocked_unresolved_order", "Reconcile outstanding orders before allocating new risk")
+            return
+
         for name in self.settings.instruments:
             instrument = instruments.get(name)
             price = prices.prices.get(name)
@@ -251,7 +258,10 @@ class ForwardTestWorker:
             if price.spread_pips(instrument) > self.settings.strategy.max_spread_pips:
                 self._skip(now, name, "spread_filter", {"spread_pips": price.spread_pips(instrument)})
                 continue
-            self._scan_instrument(now, instrument, price, portfolio, prices.conversion_rates, news_snapshot)
+            # One submitted setup per scan: the next one must use a fresh
+            # broker account snapshot instead of spending this budget twice.
+            if self._scan_instrument(now, instrument, price, portfolio, prices.conversion_rates, news_snapshot):
+                break
 
     def _check_price_freshness(self, now: datetime, prices: dict[str, PriceSnapshot]) -> bool:
         stale = []
@@ -296,6 +306,7 @@ class ForwardTestWorker:
                 row.client_order_id,
                 status=result.after.value,
                 broker_order_id=str(broker.get("id")) if broker else None,
+                broker_trade_id=str(broker["trade_id"]) if broker and broker.get("trade_id") else None,
                 response=broker,
             )
             self.monitor.clear_unknown_order(row.client_order_id)
@@ -309,7 +320,7 @@ class ForwardTestWorker:
         portfolio: FxPortfolioState,
         conversion_rates: dict[str, float],
         news_snapshot: Any,
-    ) -> None:
+    ) -> bool | None:
         entry_frame = prepare_indicators(
             self.client.candles(instrument.name, self.settings.strategy.entry_timeframe, self.settings.strategy.candle_limit)
         )
@@ -374,6 +385,32 @@ class ForwardTestWorker:
             self._skip(now, instrument.name, "intent_unavailable")
             return
 
+        sniper = None
+        if self.settings.sniper.mode != "off":
+            window = last_closed_window(entry_frame, self.settings.strategy.entry_timeframe, timestamp=decision_time)
+            sniper = qualify_entry(window, intent.side, executable_entry, self.settings.sniper)
+            snapshot = {**sniper.snapshot, "baseline": decision.details,
+                        "news_stale": news_snapshot.stale, "sessions": sorted(active_sessions(now)),
+                        "bid": price.bid, "ask": price.ask,
+                        "quote_time": price.time.isoformat(), "observed_at": now.isoformat()}
+            # Check freshness against real decision time, not candle-derived time.
+            stale_frames = []
+            for frame, timeframe in ((entry_frame, self.settings.strategy.entry_timeframe),
+                                     (htf_frame, self.settings.strategy.htf_timeframe)):
+                closed_at = frame.index[-1] + TIMEFRAME_DELTAS[timeframe]
+                age = (pd.Timestamp(now) - closed_at).total_seconds()
+                if age < 0 or age > TIMEFRAME_DELTAS[timeframe].total_seconds() + self.settings.runtime.max_price_age_seconds:
+                    stale_frames.append({"timeframe": timeframe, "age_seconds": age})
+            if stale_frames:
+                snapshot["rejections"] = [*snapshot.get("rejections", []), "SNIPER_REJECT_STALE_CANDLES"]
+                snapshot["stale_frames"] = stale_frames
+            intent = replace(intent, metadata={**intent.metadata, "sniper": snapshot})
+            if self.settings.sniper.mode == "enforce" and self.settings.sniper.structure_stop and sniper.allowed:
+                intent = replace(intent, metadata={**intent.metadata, "sniper_structure_stop": snapshot["structure_stop"]})
+            if self.settings.sniper.mode == "enforce" and self.settings.sniper.slippage_pips_per_side is not None and self.settings.sniper.commission_pips_round_trip is not None:
+                extra_cost = instrument.pip_size * (2 * self.settings.sniper.slippage_pips_per_side + self.settings.sniper.commission_pips_round_trip)
+                intent = replace(intent, metadata={**intent.metadata, "execution_cost_price": extra_cost})
+
         risk = self.risk.evaluate_intent(
             intent,
             instrument,
@@ -395,6 +432,23 @@ class ForwardTestWorker:
                 data_hash=data_hash({"instrument": instrument.name, "decision_time": decision_time.isoformat(), "signal": intent.signal_row}),
             )
             return
+
+        if sniper is not None:
+            sniper = qualify_execution(intent.metadata["sniper"], reward=risk.exit_plan.reward_distance,
+                                       spread=spread_price, pip_size=instrument.pip_size, settings=self.settings.sniper)
+            intent = replace(intent, metadata={**intent.metadata, "sniper": sniper.snapshot})
+            self.journal.log_event("sniper_candidate", sniper.reason, payload={
+                "instrument": instrument.name, "decision_time": decision_time.isoformat(),
+                "would_allow": sniper.allowed, "snapshot": sniper.snapshot,
+                "baseline_risk": asdict(risk), "shadow_only": self.settings.sniper.mode == "shadow"})
+            if self.settings.sniper.mode == "enforce" and not sniper.allowed:
+                self.journal.record_signal(timestamp=now, instrument=instrument.name, status="rejected",
+                                           reason=sniper.reason, side=intent.side.value, score=intent.score,
+                                           entry_price=executable_entry, payload={"intent": asdict(intent), "risk": asdict(risk)})
+                return
+
+        intent = replace(intent, metadata={**intent.metadata, "initial_stop": risk.exit_plan.stop_loss,
+                                          "initial_risk_distance": risk.exit_plan.risk_distance})
 
         if not reward_covers_spread(
             risk.exit_plan,
@@ -524,11 +578,56 @@ class ForwardTestWorker:
                     "ai_deliberation_id": ai_row.id if ai_row is not None else None,
                 },
             )
-        self._submit_idempotent(intent, instrument, risk)
-
-    def _submit_idempotent(self, intent: FxSignalIntent, instrument: FxInstrument, risk: FxRiskDecision) -> None:
-        if risk.exit_plan is None:
+        if self.settings.sniper.mode == "enforce" and not self._revalidate_sniper_execution(intent, instrument, risk):
+            self.journal.update_signal(signal_row.id, status="rejected", reason="SNIPER_REJECT_REVALIDATION")
             return
+        return self._submit_idempotent(intent, instrument, risk)
+
+    def _revalidate_sniper_execution(self, intent: FxSignalIntent, instrument: FxInstrument, risk: FxRiskDecision) -> bool:
+        """Never let an AI delay grandfather expired deterministic approval."""
+        now = datetime.now(timezone.utc)
+        if self.journal.get_state().state != BotRunState.RUNNING.value:
+            return False
+        if self.journal.has_unresolved_orders():
+            return False
+        if not self.settings.broker.demo_only and not self.settings.runtime.live_release_approved:
+            return False
+        prices = self.client.pricing(self.settings.instruments)
+        price = prices.prices.get(instrument.name)
+        if price is None or not self._check_price_freshness(now, prices.prices):
+            return False
+        if not all(math.isfinite(v) and v > 0 for v in (price.bid, price.ask)) or price.ask <= price.bid:
+            return False
+        if price.time > now or (executable_entry_price(price, intent.side) - intent.entry_price) * intent.side.sign > 0:
+            return False  # Do not increase approved stop risk after price movement.
+        if (now - intent.timestamp).total_seconds() > TIMEFRAME_DELTAS[self.settings.strategy.entry_timeframe].total_seconds():
+            return False
+        portfolio = self._portfolio_from_broker(now, self._load_instruments(), prices.prices, prices.conversion_rates,
+                                               account=self.client.account_summary(), positions=self.client.open_positions())
+        if portfolio.pair_exposures.get(instrument.name, 0) > 0:
+            return False
+        if self.journal.update_protection_state(timestamp=now, equity=portfolio.equity,
+                max_daily_loss_pct=self.settings.risk.max_daily_loss_pct, max_drawdown_pct=self.settings.risk.max_drawdown_pct):
+            return False
+        news = self.news.ensure_current(now)
+        if not can_trade(instrument.name, now, account_state=portfolio, news_state=news, settings=self.settings.strategy).allowed:
+            return False
+        fresh_risk = self.risk.evaluate_intent(intent, instrument, portfolio, conversion_rates=prices.conversion_rates,
+                                             snapshot_quote_factor=price.quote_to_home_factor, now=now)
+        if not fresh_risk.allowed or fresh_risk.units < risk.units:
+            return False
+        spread = price.ask - price.bid
+        if price.spread_pips(instrument) > self.settings.strategy.max_spread_pips or spread / intent.signal_row["atr"] > self.settings.strategy.max_spread_atr_ratio:
+            return False
+        if not reward_covers_spread(risk.exit_plan, spread, self.settings.strategy.min_reward_to_spread_ratio):
+            return False
+        return qualify_execution(intent.metadata["sniper"], reward=risk.exit_plan.reward_distance,
+                                 spread=spread, pip_size=instrument.pip_size, settings=self.settings.sniper).allowed
+
+    def _submit_idempotent(self, intent: FxSignalIntent, instrument: FxInstrument, risk: FxRiskDecision) -> bool:
+        if risk.exit_plan is None:
+            return False
+        submitted = False
         legs = self._order_legs(intent, risk, instrument)
         for leg_name, units, take_profit in legs:
             client_id = client_order_id(intent, leg_name)
@@ -548,6 +647,8 @@ class ForwardTestWorker:
                 "parent_signal_id": intent.metadata.get("parent_signal_id"),
                 "parent_signal_row_id": intent.metadata.get("parent_signal_row_id"),
                 "ai_deliberation_id": intent.metadata.get("ai_deliberation_id"),
+                "sniper": intent.metadata.get("sniper"),
+                "initial_stop": intent.metadata.get("initial_stop"),
             }
             row, created = self.journal.reserve_order(
                 client_order_id=client_id,
@@ -563,7 +664,7 @@ class ForwardTestWorker:
                 data_hash=data_hash(payload),
                 experiment_manifest_hash=self.journal.experiment_manifest_hash,
             )
-            if not created and row.status in {"pending", "submitted", "filled", "unknown"}:
+            if not created and row.status in {"pending", "submitted", "filled", "closed", "unknown", "operator_review"}:
                 self.journal.log_event(
                     "idempotent_order_skip",
                     f"{client_id} already recorded as {row.status}",
@@ -573,6 +674,7 @@ class ForwardTestWorker:
             broker_order = self._broker_order_if_exists(client_id)
             if broker_order:
                 self.journal.update_order(client_id, status="submitted", broker_order_id=str(broker_order.get("id")), response=broker_order)
+                submitted = True
                 continue
             try:
                 response = self.client.create_market_order(
@@ -582,7 +684,12 @@ class ForwardTestWorker:
                     take_profit=take_profit,
                     client_order_id=client_id,
                     comment=f"{intent.side.value} {instrument.name} {leg_name}",
+                    **({"approved_entry_price": intent.entry_price,
+                        "max_spread_price": min(self.settings.strategy.max_spread_pips * instrument.pip_size,
+                                                self.settings.strategy.max_spread_atr_ratio * intent.signal_row["atr"])}
+                       if self.settings.sniper.mode == "enforce" else {}),
                 )
+                submitted = True
                 broker_order_id, broker_trade_id = extract_order_ids(response)
                 self.journal.update_order(
                     client_id,
@@ -604,6 +711,7 @@ class ForwardTestWorker:
                 if status == "unknown":
                     self.monitor.record_unknown_order(client_id)
                 raise
+        return submitted
 
     def _order_legs(
         self,
@@ -611,7 +719,7 @@ class ForwardTestWorker:
         risk: FxRiskDecision,
         instrument: FxInstrument,
     ) -> list[tuple[str, float, float | None]]:
-        if risk.exit_plan is None or not self.settings.strategy.partial_tp_enabled:
+        if risk.exit_plan is None or not self.settings.strategy.partial_tp_enabled or risk.metadata.get("remaining_position_slots", 2) < 2:
             return [("full", risk.units, risk.exit_plan.take_profit if risk.exit_plan else intent.entry_price)]
         tp1_units = instrument.round_units(risk.units * self.settings.strategy.tp1_units_pct)
         tp2_units = instrument.round_units(risk.units - tp1_units)
@@ -750,8 +858,10 @@ class ForwardTestWorker:
                     conversion_rates=conversions,
                     snapshot_factor=price.quote_to_home_factor,
                 )
-                self._maybe_move_stop_to_breakeven(trade, instrument, price)
-                self._maybe_update_trailing_stop(trade, instrument, price)
+                closing = self._manage_sniper_trade(now, trade, instrument, price)
+                if not closing:
+                    self._maybe_move_stop_to_breakeven(trade, instrument, price)
+                    self._maybe_update_trailing_stop(trade, instrument, price)
             self.journal.upsert_trade(
                 broker_trade_id=trade_id,
                 instrument=instrument_name,
@@ -841,9 +951,97 @@ class ForwardTestWorker:
                     "parent_signal_id": intent.metadata.get("parent_signal_id"),
                     "parent_signal_row_id": intent.metadata.get("parent_signal_row_id"),
                     "ai_deliberation_id": intent.metadata.get("ai_deliberation_id"),
+                    "sniper": intent.metadata.get("sniper"),
+                    "initial_stop": intent.metadata.get("initial_stop"),
+                    "initial_risk_distance": intent.metadata.get("initial_risk_distance"),
                 },
             },
         )
+
+    def _initial_risk_distance(self, trade_id: str, entry: float, current_stop: float) -> float:
+        recorded = self.journal.find_trade(trade_id)
+        context = (recorded.payload or {}).get("strategy_context", {}) if recorded is not None else {}
+        initial_stop = context.get("initial_stop")
+        return abs(entry - float(initial_stop)) if initial_stop is not None else abs(entry - current_stop)
+
+    def _manage_sniper_trade(self, now: datetime, trade: dict[str, Any], instrument: FxInstrument, price: PriceSnapshot) -> bool:
+        """Sample excursions, then evaluate exits only for enforce-owned trades.
+
+        Samples are liquidation quotes; they are lower bounds on true intratrade
+        extrema, never tick-complete MAE/MFE. Context survives reconciliation.
+        """
+        trade_id = str(trade.get("id") or "")
+        recorded = self.journal.find_trade(trade_id)
+        if recorded is None:
+            return False
+        payload = recorded.payload or {}
+        context = payload.get("strategy_context", {})
+        snapshot = context.get("sniper")
+        if not snapshot:
+            return False
+        units = _safe_float(trade.get("currentUnits") or trade.get("initialUnits"))
+        entry = _safe_float(trade.get("price"))
+        if units == 0 or entry <= 0:
+            return False
+        side = Side.LONG if units > 0 else Side.SHORT
+        liquidation = price.bid if side is Side.LONG else price.ask
+        move = (liquidation - entry) * side.sign
+        telemetry = dict(payload.get("sniper_excursions", {}))
+        if move > telemetry.get("mfe", 0.0):
+            telemetry["mfe_time"] = now.isoformat()
+        telemetry.update({"mfe": max(telemetry.get("mfe", 0.0), move, 0.0),
+                          "mae": max(telemetry.get("mae", 0.0), -move, 0.0),
+                          "last_sample": now.isoformat(), "sampled_only": True})
+        self.journal.update_trade_payload(trade_id, {"sniper_excursions": telemetry})
+        if self.settings.sniper.mode != "enforce" or snapshot.get("mode") != "enforce":
+            return False
+        if not (self.settings.sniper.failure_exit or self.settings.sniper.time_exit):
+            return False
+        # A successful/uncertain close is reconciled through broker history;
+        # never retry it automatically and risk issuing duplicate requests.
+        pending = payload.get("sniper_exit", {}).get("status")
+        if pending in {"pending", "submitted", "unknown"}:
+            return True
+        opened_at = _parse_broker_time(trade.get("openTime")) or recorded.entry_time
+        if opened_at is None:
+            return False
+        opened = pd.Timestamp(opened_at)
+        opened = opened.tz_localize("UTC") if opened.tzinfo is None else opened.tz_convert("UTC")
+        try:
+            frame = prepare_indicators(self.client.candles(instrument.name, self.settings.strategy.entry_timeframe,
+                                                          self.settings.strategy.candle_limit))
+            window = last_closed_window(frame, self.settings.strategy.entry_timeframe, timestamp=now)
+            if window.empty:
+                return False
+            row = window.iloc[-1]
+            closed_at = row.name + TIMEFRAME_DELTAS[self.settings.strategy.entry_timeframe]
+            if (pd.Timestamp(now) - closed_at).total_seconds() > TIMEFRAME_DELTAS[self.settings.strategy.entry_timeframe].total_seconds() + self.settings.runtime.max_price_age_seconds:
+                return False
+            bars_held = int((window.index >= opened).sum())
+            if bars_held == 0:
+                return False
+            reason = exit_reason(side=side, close=float(row.close), di_plus=float(row.di_plus), di_minus=float(row.di_minus),
+                                 entry=entry, entry_atr=snapshot["atr"], trigger_level=snapshot["trigger_level"],
+                                 bars_held=bars_held, settings=replace(self.settings.sniper, failure_exit=False)
+                                 if snapshot.get("trigger") == "none" else self.settings.sniper)
+        except (Mt5Error, ValueError, KeyError) as exc:
+            self.journal.log_event("sniper_exit_data_unavailable", str(exc), payload={"trade_id": trade_id})
+            return False
+        if reason is None:
+            return False
+        event = {"reason": reason, "decision_time": now.isoformat(), "bar": row.name.isoformat(), "status": "pending"}
+        self.journal.update_trade_payload(trade_id, {"sniper_exit": event})
+        try:
+            response = self.client.close_position(trade_id=trade_id, instrument=instrument, signed_units=units,
+                                                  comment="fxft-sniper-exit")
+            event.update({"status": "submitted", "response": response})
+        except Mt5RejectedError as exc:
+            event.update({"status": "rejected", "error": str(exc)})
+        except Mt5Error as exc:
+            event.update({"status": "unknown", "error": str(exc)})
+        self.journal.update_trade_payload(trade_id, {"sniper_exit": event})
+        self.journal.log_event("sniper_exit", reason, payload={"trade_id": trade_id, **event})
+        return True
 
     def _maybe_move_stop_to_breakeven(
         self,
@@ -859,7 +1057,7 @@ class ForwardTestWorker:
             return
         side = Side.LONG if units > 0 else Side.SHORT
         current_exit = price.bid if side is Side.LONG else price.ask
-        risk_distance = abs(entry - stop_price)
+        risk_distance = self._initial_risk_distance(trade_id, entry, stop_price)
         profit_distance = (current_exit - entry) * side.sign
         if risk_distance <= 0 or profit_distance < risk_distance:
             return
@@ -877,6 +1075,7 @@ class ForwardTestWorker:
                 stop_loss=new_stop,
                 take_profit=take_profit,
             )
+            trade["stopLossOrder"] = {"price": new_stop}
             self.journal.log_event(
                 "breakeven_stop_updated",
                 f"{instrument.name} trade {trade_id} stop moved to breakeven",
@@ -900,7 +1099,7 @@ class ForwardTestWorker:
             return
         side = Side.LONG if units > 0 else Side.SHORT
         current_exit = price.bid if side is Side.LONG else price.ask
-        risk_distance = abs(entry - current_stop)
+        risk_distance = self._initial_risk_distance(trade_id, entry, current_stop)
         profit_distance = (current_exit - entry) * side.sign
         if risk_distance <= 0 or profit_distance < risk_distance:
             return
@@ -945,6 +1144,7 @@ class ForwardTestWorker:
                 stop_loss=candidate,
                 take_profit=_nested_price(trade.get("takeProfitOrder")),
             )
+            trade["stopLossOrder"] = {"price": candidate}
             self.journal.log_event(
                 "trailing_stop_updated",
                 f"{instrument.name} trade {trade_id} trailing stop ratcheted",

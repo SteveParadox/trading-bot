@@ -12,6 +12,7 @@ from typing import Iterable
 from dotenv import load_dotenv
 
 from fxbot.instruments import normalize_instrument_name
+from fxbot.sniper import SniperSettings, settings_from_env as sniper_settings_from_env
 
 load_dotenv()
 
@@ -583,11 +584,13 @@ class FxBotSettings:
     runtime: RuntimeSettings = field(default_factory=RuntimeSettings)
     ai: AiDeliberationSettings = field(default_factory=AiDeliberationSettings)
     news_events: list[NewsEvent] = field(default_factory=list)
+    sniper: SniperSettings = field(default_factory=SniperSettings)
 
 
 def settings_from_env() -> FxBotSettings:
     demo_only = _get_bool("MT5_DEMO_ONLY", True)
     return FxBotSettings(
+        sniper=sniper_settings_from_env(_get_str, _get_bool, _get_float, _get_int, _get_optional_float),
         instruments=_get_instruments("FX_INSTRUMENTS", DEFAULT_INSTRUMENTS),
         broker=BrokerSettings(
             login=_get_optional_int("MT5_LOGIN"),

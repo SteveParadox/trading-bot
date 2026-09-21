@@ -100,7 +100,10 @@ class FxRiskManager:
             conversion_rates=conversion_rates,
             snapshot_factor=snapshot_quote_factor,
         )
-        risk_per_unit = exit_plan.risk_distance * quote_factor
+        extra_cost = float(intent.metadata.get("execution_cost_price", 0.0))
+        if not math.isfinite(extra_cost) or extra_cost < 0:
+            return FxRiskDecision(False, "invalid_execution_cost", exit_plan=exit_plan)
+        risk_per_unit = (exit_plan.risk_distance + extra_cost) * quote_factor
         if risk_per_unit <= 0 or not math.isfinite(risk_per_unit):
             return FxRiskDecision(False, "invalid_risk_per_unit", exit_plan=exit_plan)
 
@@ -165,6 +168,8 @@ class FxRiskManager:
                 "portfolio_risk_after": portfolio.portfolio_risk + risk_amount,
                 "gross_exposure_after": portfolio.gross_exposure + position_value,
                 "margin_rate": instrument.margin_rate,
+                "execution_cost_price": extra_cost,
+                "remaining_position_slots": self.risk.max_open_positions - portfolio.open_positions,
             },
         )
 
@@ -173,7 +178,12 @@ class FxRiskManager:
         row = intent.signal_row
         if entry <= 0 or not math.isfinite(entry):
             return None
-        if self.strategy.stop_mode == "atr":
+        structural_stop = intent.metadata.get("sniper_structure_stop")
+        if structural_stop is not None:
+            raw_stop = float(structural_stop)
+            if not math.isfinite(raw_stop) or raw_stop <= 0:
+                return None
+        elif self.strategy.stop_mode == "atr":
             atr = float(row.get("atr") or 0.0)
             if atr <= 0 or not math.isfinite(atr):
                 return None
@@ -220,6 +230,8 @@ class FxRiskManager:
         ):
             return None
         if instrument.minimum_stop_distance and risk_distance < instrument.minimum_stop_distance:
+            return None
+        if instrument.minimum_stop_distance and reward_distance < instrument.minimum_stop_distance:
             return None
         if reward_distance <= 0 or risk_distance <= 0:
             return None
