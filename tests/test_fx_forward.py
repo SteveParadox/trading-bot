@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import io
 import json
 import tempfile
 import unittest
@@ -146,9 +145,16 @@ class ForwardWorkerTests(unittest.TestCase):
                     client = FakeMt5Client()
                     worker = ForwardTestWorker(settings, client=client, journal=journal)
                     journal.set_state(BotRunState.RUNNING, "test news gate")
+                    response = Mock()
+                    response.json.return_value = payload
+                    response.raise_for_status.return_value = None
+                    news_client = Mock()
+                    news_client.__enter__ = Mock(return_value=news_client)
+                    news_client.__exit__ = Mock(return_value=False)
+                    news_client.get.return_value = response
                     with (
                         patch("fxbot.forward.datetime", FixedDatetime),
-                        patch("fxbot.news.urllib.request.urlopen", return_value=io.BytesIO(json.dumps(payload).encode())),
+                        patch("fxbot.news.httpx.Client", return_value=news_client),
                         patch.object(worker, "_scan_instrument") as scan,
                     ):
                         worker.scan_once()

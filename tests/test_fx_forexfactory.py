@@ -12,6 +12,7 @@ from email.utils import format_datetime
 from pathlib import Path
 from urllib.error import HTTPError
 
+import httpx
 import pytest
 from dotenv import dotenv_values
 
@@ -39,14 +40,25 @@ def payload():
 def http(monkeypatch):
     calls = []
     state = {}
+    real_client = httpx.Client
 
-    def respond(request, timeout):
+    def respond(request):
         calls.append(request)
         if "error" in state:
-            raise state["error"]
-        return io.BytesIO(json.dumps(state["payload"]).encode())
+            error = state["error"]
+            if isinstance(error, HTTPError):
+                headers = dict(error.headers.items()) if error.headers else {}
+                return httpx.Response(error.code, headers=headers, request=request)
+            raise error
+        return httpx.Response(200, content=json.dumps(state["payload"]), request=request)
 
-    monkeypatch.setattr("fxbot.news.urllib.request.urlopen", respond)
+    transport = httpx.MockTransport(respond)
+
+    def client(*args, **kwargs):
+        kwargs["transport"] = transport
+        return real_client(*args, **kwargs)
+
+    monkeypatch.setattr("fxbot.news.httpx.Client", client)
     return state, calls
 
 
@@ -60,8 +72,9 @@ def test_flat_feed_fetch_normalizes_and_does_not_invent_actuals(payload, http):
     state["payload"] = payload
     events = ForexFactoryProvider().fetch()
     assert len(events) == 3
-    assert calls[0].full_url == "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-    assert calls[0].get_header("X-api-key") is None
+    assert str(calls[0].url) == "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+    assert calls[0].headers.get("X-api-key") is None
+    assert calls[0].headers["User-Agent"] == "Mozilla/5.0"
     assert events[0].starts_at == datetime(2026, 9, 10, 12, 30, tzinfo=timezone.utc)
     assert events[0].currency == "USD"
     assert events[0].impact == "high"
