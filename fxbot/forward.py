@@ -723,7 +723,7 @@ class ForwardTestWorker:
             return [("full", risk.units, risk.exit_plan.take_profit if risk.exit_plan else intent.entry_price)]
         tp1_units = instrument.round_units(risk.units * self.settings.strategy.tp1_units_pct)
         tp2_units = instrument.round_units(risk.units - tp1_units)
-        if tp1_units <= 0 or tp2_units <= 0:
+        if tp1_units < instrument.minimum_trade_size or tp2_units < instrument.minimum_trade_size:
             return [("full", risk.units, risk.exit_plan.take_profit)]
         runner_r = self.settings.strategy.runner_take_profit_r
         tp2 = None

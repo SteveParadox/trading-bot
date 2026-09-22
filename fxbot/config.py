@@ -707,7 +707,7 @@ def settings_from_env() -> FxBotSettings:
             api_key=_get_str("FX_API_KEY", ""),
             log_jsonl_path=_get_str("FX_JSONL_JOURNAL", "") or None,
             frontend_origin=_get_str("FX_FRONTEND_ORIGIN", "http://127.0.0.1:5173"),
-            cors_origins=tuple(_get_csv("FX_CORS_ORIGINS", [])),
+            cors_origins=tuple(item.strip() for item in _get_str("FX_CORS_ORIGINS", "").split(",") if item.strip()),
             start_worker_with_api=_get_bool("FX_START_WORKER_WITH_API", True),
             bind_host=_get_str("FX_API_HOST", "127.0.0.1"),
             api_port=_get_int("FX_API_PORT", 8000),

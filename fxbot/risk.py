@@ -214,9 +214,8 @@ class FxRiskManager:
         atr = float(row.get("atr") or 0.0)
         stop_atr_multiple = risk_distance / atr if atr > 0 else None
         legacy_stop_filter = (
-            self.strategy.min_stop_pips is not None
-            and self.strategy.max_stop_pips is not None
-            and (stop_pips < self.strategy.min_stop_pips or stop_pips > self.strategy.max_stop_pips)
+            (self.strategy.min_stop_pips is not None and stop_pips < self.strategy.min_stop_pips)
+            or (self.strategy.max_stop_pips is not None and stop_pips > self.strategy.max_stop_pips)
         )
         if (
             (
