@@ -178,6 +178,12 @@ def create_app(settings: FxBotSettings | None = None) -> FastAPI:
 
     @app.middleware("http")
     async def protect_api(request: Request, call_next):
+        # Browser CORS preflight requests do not include the API key.  They
+        # must reach CORSMiddleware so it can return the appropriate
+        # Access-Control-Allow-* headers; authenticating OPTIONS here causes
+        # remote Vercel browsers to fail before the actual request is sent.
+        if request.method == "OPTIONS":
+            return await call_next(request)
         if request.url.path.startswith("/api/"):
             key = request.headers.get("X-API-Key", "")
             if not resolved_settings.runtime.api_key or key != resolved_settings.runtime.api_key:
