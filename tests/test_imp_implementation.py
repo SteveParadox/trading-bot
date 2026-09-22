@@ -458,6 +458,21 @@ def test_protect_api_auth_runs_before_rate_limit() -> None:
     assert auth_sec < rate_sec
 
 
+def test_api_middleware_allows_cors_preflight_before_auth() -> None:
+    """OPTIONS must reach CORSMiddleware without an API key.
+
+    Browsers intentionally omit X-API-Key on the preflight request. If the
+    auth middleware rejects it first, the Vercel dashboard reports a CORS
+    error even when the configured origin is correct.
+    """
+    import fxbot.api as api_mod
+
+    source = open(api_mod.__file__, encoding="utf-8").read()
+    options_guard = source.index('if request.method == "OPTIONS":')
+    api_guard = source.index('if request.url.path.startswith("/api/"):')
+    assert options_guard < api_guard
+
+
 def test_api_middleware_routes_all_guarded_paths() -> None:
     """Every /api/* read route name is registered behind the auth middleware."""
     import fxbot.api as api_mod
