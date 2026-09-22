@@ -198,7 +198,7 @@ def create_app(settings: FxBotSettings | None = None) -> FastAPI:
         allow_origins=list(dict.fromkeys((resolved_settings.runtime.frontend_origin, *resolved_settings.runtime.cors_origins))),
         allow_credentials=False,
         allow_methods=["GET", "POST", "OPTIONS"],
-        allow_headers=["X-API-Key", "Content-Type"],
+        allow_headers=["X-API-Key", "Content-Type", "ngrok-skip-browser-warning"],
     )
 
     def require_api_key(x_api_key: str | None = Depends(api_key_header)) -> None:
