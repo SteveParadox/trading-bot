@@ -286,6 +286,7 @@ def test_closed_signal_cannot_reenter_on_the_same_trigger(tmp_path):
     risk = FxRiskManager(config.risk, config.strategy).evaluate_intent(intent, instrument, FxPortfolioState(10000, 10000, 0, 0))
     with closing(StructuredJournal(config.runtime.database_url)) as journal:
         worker = ForwardTestWorker(config, client=client, journal=journal)
+        journal.set_state(BotRunState.RUNNING)
         assert worker._submit_idempotent(intent, instrument, risk)
         order = journal.recent_orders()[0]
         journal.mark_trade_orders_closed(order.broker_trade_id)

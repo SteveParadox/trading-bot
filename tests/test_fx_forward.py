@@ -58,8 +58,12 @@ class FakeMt5Client:
     def __init__(self, *, entry_frame: pd.DataFrame | None = None, htf_frame: pd.DataFrame | None = None) -> None:
         self.created: list[str] = []
         self.created_orders: list[dict] = []
-        self.entry_frame = entry_frame
-        self.htf_frame = htf_frame if htf_frame is not None else entry_frame
+        self.entry_frame = entry_frame.copy() if entry_frame is not None else None
+        source = htf_frame if htf_frame is not None else entry_frame
+        self.htf_frame = source.copy() if source is not None else None
+        for frame, freq in ((self.entry_frame, "15min"), (self.htf_frame, "1h")):
+            if frame is not None:
+                frame.index = pd.date_range(end=pd.Timestamp(FIXED_NOW) - pd.Timedelta(freq), periods=len(frame), freq=freq)
         last_close = float(entry_frame.iloc[-1]["close"]) if entry_frame is not None else 1.1
         self.price = PriceSnapshot("EUR_USD", bid=last_close - 0.00005, ask=last_close + 0.00005, time=FIXED_NOW)
 
@@ -250,6 +254,7 @@ class ForwardWorkerTests(unittest.TestCase):
                     exit_plan=FxExitPlan(1.09, 1.12, 0.01, 0.02, 2.0, 100, 200),
                 )
 
+                journal.set_state(BotRunState.RUNNING)
                 worker._submit_idempotent(intent, FxInstrument("EUR_USD"), decision)
                 worker._submit_idempotent(intent, FxInstrument("EUR_USD"), decision)
 
@@ -288,6 +293,7 @@ class ForwardWorkerTests(unittest.TestCase):
                     exit_plan=FxExitPlan(1.09, 1.12, 0.01, 0.02, 2.0, 100, 200),
                 )
 
+                journal.set_state(BotRunState.RUNNING)
                 with self.assertRaises(Mt5RejectedError):
                     worker._submit_idempotent(intent, FxInstrument("EUR_USD"), decision)
 
@@ -331,6 +337,7 @@ class ForwardWorkerTests(unittest.TestCase):
                     exit_plan=FxExitPlan(1.09, 1.12, 0.01, 0.02, 2.0, 100, 200),
                 )
 
+                journal.set_state(BotRunState.RUNNING)
                 with self.assertRaises(Mt5Error):
                     worker._submit_idempotent(intent, FxInstrument("EUR_USD"), decision)
 
@@ -368,11 +375,13 @@ class ForwardWorkerTests(unittest.TestCase):
                     exit_plan=FxExitPlan(1.09, 1.12, 0.01, 0.02, 2.0, 100, 200),
                 )
 
+                worker._hedging_enabled = True
                 legs = worker._order_legs(intent, decision, FxInstrument("EUR_USD"))
 
                 self.assertEqual([leg[0] for leg in legs], ["tp1", "tp2"])
                 self.assertIsNone(legs[1][2])
 
+    @patch("fxbot.forward.datetime", FixedDatetime)
     def test_atr_trailing_stop_ratchets_profitable_trade(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             entry = trending_frame(1.08, 0.00025)

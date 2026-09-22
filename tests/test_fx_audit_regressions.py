@@ -41,7 +41,7 @@ def test_additional_cors_origin_keeps_browser_case(monkeypatch):
 
 
 def test_split_falls_back_when_leg_is_below_broker_minimum():
-    worker = SimpleNamespace(settings=FxBotSettings())
+    worker = SimpleNamespace(settings=FxBotSettings(), _hedging_enabled=True)
     instrument = FxInstrument("EUR_USD", minimum_trade_size=1000, trade_unit_step=100)
     intent = FxSignalIntent(instrument="EUR_USD", side=Side.LONG,
                             timestamp=datetime.now(timezone.utc), entry_price=1.1,

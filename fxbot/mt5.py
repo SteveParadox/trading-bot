@@ -64,7 +64,7 @@ class Mt5Client:
         account = mt5.account_info()
         if account is None:
             self._mark_disconnected()
-            raise Mt5CredentialsMissing(f"MT5 account_info failed: {mt5.last_error()}")
+            raise Mt5Error(f"MT5 account_info failed: {mt5.last_error()}")
         payload = _as_dict(account)
         positions = self._positions()
         return {
@@ -78,6 +78,7 @@ class Mt5Client:
             "login": str(payload.get("login") or ""),
             "server": str(payload.get("server") or self.settings.server),
             "trade_mode": payload.get("trade_mode"),
+            "hedging_enabled": payload.get("margin_mode") == _constant(mt5, "ACCOUNT_MARGIN_MODE_RETAIL_HEDGING", 2),
             "leverage": payload.get("leverage"),
             "margin_free": payload.get("margin_free"),
             "profit": payload.get("profit"),
@@ -372,10 +373,10 @@ class Mt5Client:
             kwargs["server"] = self.settings.server
         ok = mt5.initialize(self.settings.terminal_path, **kwargs) if self.settings.terminal_path else mt5.initialize(**kwargs)
         if not ok:
-            raise Mt5CredentialsMissing(f"MT5 initialize failed: {mt5.last_error()}")
+            raise Mt5Error(f"MT5 initialize failed: {mt5.last_error()}")
         account = mt5.account_info()
         if account is None:
-            raise Mt5CredentialsMissing(f"MT5 account_info failed after initialize: {mt5.last_error()}")
+            raise Mt5Error(f"MT5 account_info failed after initialize: {mt5.last_error()}")
         self._assert_demo_account(account)
         self._connected = True
 

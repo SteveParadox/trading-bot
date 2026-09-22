@@ -18,6 +18,33 @@ is excluded.
    Such orders now use one full-size leg with the planned take-profit.
 4. `config.py`: the generic CSV reader uppercased additional CORS origins.
    Browser origin matching is exact; these values now retain their case.
+5. Transient MT5 failures now retry with exponential backoff capped at 300
+   seconds. Connection status no longer overwrites operator pause/halt state.
+   Missing SDK or a refused real account still pauses entry permission.
+6. Paused and halted workers reconcile trades and manage software exits using
+   fresh quotes. STOPPED still stops all worker activity. A stale quote for
+   another configured symbol blocks new risk but does not disable management
+   of positions with fresh quotes. Broker SL/TP remain essential during outages.
+7. Both live entry timeframes must have recent, closed UTC bars; future,
+   duplicated, unordered, empty and timezone-naive history is rejected.
+   Trailing stops also require current history. Strategy evaluation uses actual
+   UTC, while order identity uses signal-candle close time to prevent re-entry
+   on the same trigger. Future ticks are no longer treated as fresh.
+8. Clock health now compares host time with an actual tick timestamp, rather
+   than comparing host time with itself. Quote lag can also mean market inactivity.
+9. Split exits require confirmed MT5 hedging mode. Netting or unknown account
+   mode uses a single order with the planned take-profit.
+10. `FX_EXECUTION_COST_PIPS_ROUND_TRIP` adds commission and slippage allowance
+    to risk sizing and breakeven protection. Targets fully consumed by the
+    allowance are rejected. Breakeven/news stop modifications must respect the
+    broker's minimum distance and never loosen an existing stop.
+11. Minimum-volume rejections now report the binding cap, all unit limits,
+    broker minimum units and minimum-lot risk/notional in account currency.
+    Orders are never rounded upward past risk limits. Programmatic exposure
+    defaults now match the existing environment defaults (0.35/1.20/0.70).
+12. Submission rechecks RUNNING before each exit leg so a pause during signal
+    evaluation cannot bypass entry permission. An already in-flight broker
+    request cannot be recalled by pausing the worker.
 
 ## Performance constraints and remaining risks
 
@@ -38,30 +65,57 @@ is excluded.
 - The 1.5-pip entry-deviation limit includes the difference between executable
   ask/bid and the signal close. It can reject trades even below the separate
   3-pip spread ceiling. Review `entry_deviation_filter` frequencies before tuning.
-- Candle freshness: `feed_decision_time` anchors decisions to the last candle
-  instead of host UTC. Baseline entries have no equivalent of sniper enforce's
-  candle-age guard. Fresh ticks do not prove fresh history. The helper's
-  simulated-clock assumption is not the documented general MT5 contract:
-  https://www.mql5.com/en/docs/python_metatrader5/mt5copyratesfrom_py documents UTC.
-  Capture host/tick/bar timestamps before changing this workaround.
-- Clock monitoring compares host time with itself and cannot detect broker
-  skew. A healthy clock indicator is currently not independent evidence.
-- Any stale quoted instrument aborts the entire scan before trade management.
-  Paused/stopped/halted workers also skip software management; broker-side
-  SL/TP remain, but software breakeven/trailing/time exits do not run.
-- A broker exception pauses the worker. Its paused loop does not attempt
-  automatic reconnection. Check `broker_disconnected` and `missing_mt5_connection`.
-- Independent TP/runner orders need validation on the actual account mode:
-  the MT5 adapter has no explicit netting-versus-hedging gate. Do not assume
-  two orders produce two independent positions on every broker account.
+- MT5 documents UTC bar/tick timestamps:
+  https://www.mql5.com/en/docs/python_metatrader5/mt5copyratesfrom_py.
+  If the new freshness check blocks the deployment, correct host/terminal
+  timestamps and history synchronization rather than shifting decision time.
+- Account-mode behavior follows MT5's netting/hedging distinction:
+  https://www.metatrader5.com/en/terminal/help/trading/general_concept.
+  Broker acceptance, fill quality, freeze levels and account-specific contract
+  specifications still require a demo smoke test on the actual deployment.
 - Free calendar failure/staleness intentionally blocks entries with required
   news enabled. Earlier DNS/403 reports are known deployment blockers, not
   proof of an entry-strategy defect. Preserve fail-closed behavior.
 - Small-profit performance must be measured after commission, spread,
-  slippage and swap. Baseline breakeven's 0.2-pip buffer does not establish
-  net breakeven for every broker. Cost assumptions require actual fills.
+  slippage and swap. The configurable cost allowance defaults to zero for
+  compatibility; this is not a claim that execution is free. Stops can slip,
+  so an estimated breakeven level does not guarantee a net-zero exit.
+
+## Deployment and cost configuration
+
+After merging, pull main on Lightsail and restart the Python worker/API.
+No frontend deployment or ngrok restart is needed for these worker changes.
+An existing operator/error pause remains paused; after verifying MT5 health,
+use Start to re-enable entries. Do not run two workers against one account.
+
+Keep demo-only, live-release restrictions and required news enabled. Set in
+the backend environment, using measured round-trip commission plus adverse
+slippage converted to pips:
+
+```dotenv
+FX_EXECUTION_COST_PIPS_ROUND_TRIP=0.0
+FX_BREAKEVEN_BUFFER_PIPS=0.2
+```
+
+Replace 0.0 with an evidence-based allowance before evaluating net performance.
+Do not add the quoted spread again: entries use executable ask/bid and exits
+use the liquidation side. Swap is separate. This global allowance is a coarse
+budget across symbols; mixed instruments and account currencies need careful
+calibration. Sniper enforce uses the larger of this allowance and its own
+commission/slippage allowance for sizing, not their sum.
+
+Entry thresholds, leverage, daily loss/drawdown limits and target multiples
+were not relaxed to manufacture more trades. A broker/account whose minimum
+lot exceeds the risk budget remains incompatible at that equity. Tune only
+after cost-inclusive out-of-sample and demo comparisons establish improvement.
 
 ## Next evidence needed
+
+Validation after the reliability fixes: 600 FX/config/indicator tests passed,
+including 23 new performance-safety cases, plus 2 subtests. There are 17
+pre-existing datetime deprecation warnings. Full legacy test collection still
+requires the missing `backtester.bybit_data` module. No Windows MT5 terminal,
+live fills or Lightsail deployment were exercised by these offline tests.
 
 Export recent signal rejection counts, order rejections, closed trades and
 execution costs from the deployment, plus account currency/equity and broker
