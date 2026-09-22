@@ -7,6 +7,15 @@ const configuredApiBase = import.meta.env.VITE_API_BASE_URL?.trim();
 const API_BASE = (configuredApiBase || (import.meta.env.DEV ? "http://127.0.0.1:8000" : window.location.origin)).replace(/\/$/, "");
 const DEFAULT_TIMEOUT_MS = 15_000;
 
+function isNgrokEndpoint(apiBase: string): boolean {
+  try {
+    const hostname = new URL(apiBase).hostname.toLowerCase();
+    return hostname.endsWith(".ngrok-free.app") || hostname.endsWith(".ngrok-free.dev") || hostname.endsWith(".ngrok.io");
+  } catch {
+    return false;
+  }
+}
+
 export class ApiError extends Error {
   readonly status: number;
 
@@ -58,6 +67,13 @@ export async function fetchJson<T>(path: string, init?: RequestInit): Promise<T>
     if (storedKey) {
       headers.set("X-API-Key", storedKey);
     }
+  }
+
+  // ngrok's free browser-warning page otherwise returns a 200 response
+  // without the backend's CORS headers. This header tells ngrok to forward
+  // browser API calls directly to FastAPI.
+  if (isNgrokEndpoint(API_BASE) && !headers.has("ngrok-skip-browser-warning")) {
+    headers.set("ngrok-skip-browser-warning", "true");
   }
 
   try {
