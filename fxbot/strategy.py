@@ -167,9 +167,8 @@ def evaluate_signal_frame(
     atr_pips = atr / instrument.pip_size
     atr_pct = atr / close
     legacy_atr_filter = (
-        settings.min_atr_pips is not None
-        and settings.max_atr_pips is not None
-        and (atr_pips < settings.min_atr_pips or atr_pips > settings.max_atr_pips)
+        (settings.min_atr_pips is not None and atr_pips < settings.min_atr_pips)
+        or (settings.max_atr_pips is not None and atr_pips > settings.max_atr_pips)
     )
     if atr_pct < settings.min_atr_pct or atr_pct > settings.max_atr_pct or legacy_atr_filter:
         return FxSignalDecision(

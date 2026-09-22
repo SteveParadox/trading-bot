@@ -120,38 +120,40 @@ class ForwardTestWorker:
         )
         self._stop = asyncio.Event()
         self._instrument_cache: dict[str, FxInstrument] = {}
+        self._hedging_enabled = False
 
     async def run_forever(self) -> None:
         await self._publish({"type": "worker_started"})
+        failures = 0
         while not self._stop.is_set():
             state = self.journal.get_state().state
             if state == BotRunState.STOPPED.value:
                 await asyncio.sleep(1.0)
                 continue
-            if state == BotRunState.PAUSED.value:
-                await asyncio.sleep(2.0)
-                continue
-            if state == BotRunState.HALTED.value:
-                await asyncio.sleep(5.0)
-                continue
+            delay = self.settings.runtime.loop_interval_seconds
             try:
                 await asyncio.to_thread(self.scan_once)
                 self.monitor.record_broker_reconnect()
+                failures = 0
             except Mt5CredentialsMissing as exc:
-                self.journal.set_state(BotRunState.PAUSED, "missing_mt5_connection")
+                if self.journal.get_state().state == BotRunState.RUNNING.value:
+                    self.journal.set_state(BotRunState.PAUSED, "missing_mt5_connection")
                 self.journal.log_event("credentials_missing", str(exc), level="error")
                 self.monitor.record_broker_disconnect(str(exc))
                 await self._publish({"type": "worker_paused", "reason": "missing_mt5_connection"})
             except Mt5Error as exc:
-                self.journal.set_state(BotRunState.PAUSED, "broker_disconnected")
+                # Connectivity is operational health, not an operator command.
+                # Retry without overwriting a pause/halt or auto-resuming it.
+                failures += 1
+                delay = min(300.0, max(1.0, delay) * 2 ** min(failures, 8))
                 self.journal.log_event("broker_disconnected", str(exc), level="error")
                 self.monitor.record_broker_disconnect(str(exc))
-                await self._publish({"type": "worker_paused", "reason": "broker_disconnected"})
+                await self._publish({"type": "broker_reconnecting", "retry_seconds": delay})
             except Exception as exc:
                 log.exception("forward-test scan failed")
                 self.journal.log_event("scan_error", str(exc), level="error")
                 await self._publish({"type": "scan_error", "error": str(exc)})
-            await asyncio.sleep(self.settings.runtime.loop_interval_seconds)
+            await asyncio.sleep(delay)
 
     def stop(self) -> None:
         self._stop.set()
@@ -165,7 +167,7 @@ class ForwardTestWorker:
 
     def scan_once(self) -> None:
         now = datetime.now(timezone.utc)
-        if self.journal.get_state().state != BotRunState.RUNNING.value:
+        if self.journal.get_state().state == BotRunState.STOPPED.value:
             return
         if not self.settings.broker.demo_only and not self.settings.runtime.live_release_approved:
             self.journal.set_state(BotRunState.HALTED, "live_release_gate_required")
@@ -178,22 +180,32 @@ class ForwardTestWorker:
             return
         instruments = self._load_instruments()
         prices = self.client.pricing(self.settings.instruments)
-        if not self._check_price_freshness(now, prices.prices):
-            return
+        now = datetime.now(timezone.utc)
+        prices_ready = self._check_price_freshness(now, prices.prices)
+        fresh_prices = {name: price for name, price in prices.prices.items()
+                        if freshness(now, price.time, max_age_seconds=self.settings.runtime.max_price_age_seconds)[0]}
         # Record price freshness for the monitoring dashboard
         for name, price in prices.prices.items():
             self.monitor.record_price(name, price.time)
         self._reconcile_unknown_orders()
         self.monitor.record_scan_heartbeat()
         self.journal.log_event("scan_heartbeat", "broker scan completed", payload={"run_id": self.run_id})
-        # Check broker-host clock health every scan
-        try:
-            broker_time = now  # MT5 server time is approximated from local clock
-            ch = clock_health(now, broker_time, max_skew_seconds=300.0)
-            self.monitor.record_clock_health(ch)
-        except Exception:
-            pass
+        # Tick time is an independent observation; market inactivity may also
+        # explain lag, so the freshness monitor retains the per-symbol detail.
+        if prices.prices:
+            self.monitor.record_clock_health(clock_health(
+                now, max(price.time for price in prices.prices.values()), max_skew_seconds=300.0))
+        self._sync_trade_history(now)
+        self._sync_open_trades(now, instruments, fresh_prices, prices.conversion_rates)
+        news_snapshot = self.news.ensure_current(now)
+        self._protect_positions_for_news(now, instruments, fresh_prices, news_snapshot.events)
+        # Never size new risk from incomplete/stale portfolio marks. Protection
+        # above still runs for positions with a usable quote.
+        if not prices_ready or set(self.settings.instruments) - fresh_prices.keys():
+            self.journal.log_event("entry_blocked_price_data", "Fresh quotes required for all configured instruments")
+            return
         account = self.client.account_summary()
+        self._hedging_enabled = account.get("hedging_enabled") is True
         positions = self.client.open_positions()
         portfolio = self._portfolio_from_broker(
             now,
@@ -215,10 +227,6 @@ class ForwardTestWorker:
                 "account_currency": portfolio.account_currency,
             },
         )
-        self._sync_trade_history(now)
-        self._sync_open_trades(now, instruments, prices.prices, prices.conversion_rates)
-        news_snapshot = self.news.ensure_current(now)
-        self._protect_positions_for_news(now, instruments, prices.prices, news_snapshot.events)
         halt_reason = self.journal.update_protection_state(
             timestamp=now,
             equity=portfolio.equity,
@@ -231,6 +239,9 @@ class ForwardTestWorker:
             return
         else:
             self.monitor.clear_risk_halt()
+
+        if self.journal.get_state().state != BotRunState.RUNNING.value:
+            return
 
         if self.journal.has_unresolved_orders():
             self.journal.log_event("entry_blocked_unresolved_order", "Reconcile outstanding orders before allocating new risk")
@@ -321,17 +332,16 @@ class ForwardTestWorker:
         conversion_rates: dict[str, float],
         news_snapshot: Any,
     ) -> bool | None:
-        entry_frame = prepare_indicators(
-            self.client.candles(instrument.name, self.settings.strategy.entry_timeframe, self.settings.strategy.candle_limit)
-        )
-        htf_frame = prepare_indicators(
-            self.client.candles(instrument.name, self.settings.strategy.htf_timeframe, self.settings.strategy.candle_limit)
-        )
-        decision_time = feed_decision_time(
-            entry_frame,
-            self.settings.strategy.entry_timeframe,
-            fallback=now,
-        )
+        entry_frame = self.client.candles(instrument.name, self.settings.strategy.entry_timeframe, self.settings.strategy.candle_limit)
+        htf_frame = self.client.candles(instrument.name, self.settings.strategy.htf_timeframe, self.settings.strategy.candle_limit)
+        for frame, timeframe in ((entry_frame, self.settings.strategy.entry_timeframe),
+                                 (htf_frame, self.settings.strategy.htf_timeframe)):
+            if not candles_are_current(frame, timeframe, now, self.settings.runtime.max_price_age_seconds):
+                self._skip(now, instrument.name, "stale_or_invalid_candles", {"timeframe": timeframe})
+                return
+        entry_frame = prepare_indicators(entry_frame)
+        htf_frame = prepare_indicators(htf_frame)
+        decision_time = now
         decision = evaluate_signal_frame(
             entry_frame,
             htf_frame,
@@ -385,6 +395,12 @@ class ForwardTestWorker:
             self._skip(now, instrument.name, "intent_unavailable")
             return
 
+        # Keep order identity stable across scans of the same closed signal bar.
+        # Evaluation uses current UTC so higher-timeframe closure stays accurate.
+        signal_time = (signal_row.name + TIMEFRAME_DELTAS[self.settings.strategy.entry_timeframe]).to_pydatetime()
+        intent = replace(intent, timestamp=signal_time, metadata={**intent.metadata, "execution_cost_price":
+            self.settings.strategy.execution_cost_pips_round_trip * instrument.pip_size})
+
         sniper = None
         if self.settings.sniper.mode != "off":
             window = last_closed_window(entry_frame, self.settings.strategy.entry_timeframe, timestamp=decision_time)
@@ -408,7 +424,7 @@ class ForwardTestWorker:
             if self.settings.sniper.mode == "enforce" and self.settings.sniper.structure_stop and sniper.allowed:
                 intent = replace(intent, metadata={**intent.metadata, "sniper_structure_stop": snapshot["structure_stop"]})
             if self.settings.sniper.mode == "enforce" and self.settings.sniper.slippage_pips_per_side is not None and self.settings.sniper.commission_pips_round_trip is not None:
-                extra_cost = instrument.pip_size * (2 * self.settings.sniper.slippage_pips_per_side + self.settings.sniper.commission_pips_round_trip)
+                extra_cost = max(intent.metadata["execution_cost_price"], instrument.pip_size * (2 * self.settings.sniper.slippage_pips_per_side + self.settings.sniper.commission_pips_round_trip))
                 intent = replace(intent, metadata={**intent.metadata, "execution_cost_price": extra_cost})
 
         risk = self.risk.evaluate_intent(
@@ -630,6 +646,8 @@ class ForwardTestWorker:
         submitted = False
         legs = self._order_legs(intent, risk, instrument)
         for leg_name, units, take_profit in legs:
+            if self.journal.get_state().state != BotRunState.RUNNING.value:
+                return submitted
             client_id = client_order_id(intent, leg_name)
             payload = {
                 "instrument": instrument.name,
@@ -719,11 +737,11 @@ class ForwardTestWorker:
         risk: FxRiskDecision,
         instrument: FxInstrument,
     ) -> list[tuple[str, float, float | None]]:
-        if risk.exit_plan is None or not self.settings.strategy.partial_tp_enabled or risk.metadata.get("remaining_position_slots", 2) < 2:
+        if risk.exit_plan is None or not self.settings.strategy.partial_tp_enabled or not getattr(self, "_hedging_enabled", False) or risk.metadata.get("remaining_position_slots", 2) < 2:
             return [("full", risk.units, risk.exit_plan.take_profit if risk.exit_plan else intent.entry_price)]
         tp1_units = instrument.round_units(risk.units * self.settings.strategy.tp1_units_pct)
         tp2_units = instrument.round_units(risk.units - tp1_units)
-        if tp1_units <= 0 or tp2_units <= 0:
+        if tp1_units < instrument.minimum_trade_size or tp2_units < instrument.minimum_trade_size:
             return [("full", risk.units, risk.exit_plan.take_profit)]
         runner_r = self.settings.strategy.runner_take_profit_r
         tp2 = None
@@ -1062,7 +1080,10 @@ class ForwardTestWorker:
         if risk_distance <= 0 or profit_distance < risk_distance:
             return
         buffer = self.settings.strategy.breakeven_buffer_pips * instrument.pip_size
+        buffer += self.settings.strategy.execution_cost_pips_round_trip * instrument.pip_size
         new_stop = instrument.round_price(entry + buffer * side.sign)
+        if (current_exit - new_stop) * side.sign <= (instrument.minimum_stop_distance or 0.0):
+            return
         if side is Side.LONG and stop_price >= new_stop:
             return
         if side is Side.SHORT and stop_price <= new_stop:
@@ -1104,13 +1125,13 @@ class ForwardTestWorker:
         if risk_distance <= 0 or profit_distance < risk_distance:
             return
         try:
-            frame = prepare_indicators(
-                self.client.candles(
-                    instrument.name,
-                    self.settings.strategy.entry_timeframe,
-                    self.settings.strategy.candle_limit,
-                )
-            )
+            frame = self.client.candles(instrument.name, self.settings.strategy.entry_timeframe,
+                                        self.settings.strategy.candle_limit)
+            if not candles_are_current(frame, self.settings.strategy.entry_timeframe,
+                                       datetime.now(timezone.utc), self.settings.runtime.max_price_age_seconds):
+                self.journal.log_event("trailing_stop_unavailable", "stale_or_invalid_candles", payload={"trade_id": trade_id})
+                return
+            frame = prepare_indicators(frame)
             row = last_closed_row(frame, self.settings.strategy.entry_timeframe)
             atr = _safe_float(row.get("atr")) if row is not None else 0.0
         except (Mt5Error, ValueError, KeyError) as exc:
@@ -1218,7 +1239,10 @@ class ForwardTestWorker:
             if (current_exit - entry) * side.sign <= 0:
                 continue
             buffer = self.settings.strategy.breakeven_buffer_pips * instrument.pip_size
+            buffer += self.settings.strategy.execution_cost_pips_round_trip * instrument.pip_size
             candidate = instrument.round_price(entry + buffer * side.sign)
+            if (current_exit - candidate) * side.sign <= (instrument.minimum_stop_distance or 0.0):
+                continue
             if side is Side.LONG and current_stop >= candidate:
                 continue
             if side is Side.SHORT and current_stop <= candidate:
@@ -1288,26 +1312,25 @@ class ForwardTestWorker:
             await result
 
 
+def candles_are_current(frame: Any, timeframe: str, now: datetime, grace_seconds: float) -> bool:
+    """MT5 pos=1 supplies closed UTC bars; reject stale, future or malformed history."""
+    if frame is None or frame.empty or not isinstance(frame.index, pd.DatetimeIndex):
+        return False
+    index = frame.index
+    if index.tz is None or index.hasnans or not index.is_monotonic_increasing or not index.is_unique:
+        return False
+    delta = TIMEFRAME_DELTAS[timeframe]
+    age = (pd.Timestamp(now) - (index[-1] + delta)).total_seconds()
+    return 0 <= age <= delta.total_seconds() + grace_seconds
+
+
 def feed_decision_time(
     entry_frame: Any,
     timeframe: str,
     *,
     fallback: datetime,
 ) -> datetime:
-    """Return the strategy decision time anchored to the broker data feed.
-
-    MT5 candle timestamps use the broker server's simulated clock, which on the
-    MetaQuotes demo terminal runs ~2.5h ahead of the host system clock. Passing
-    the raw system ``datetime.now(UTC)`` into evaluate_signal_frame /
-    last_closed_row therefore misclassifies every candle as
-    ``future_candle_in_frame`` and blocks signal generation.
-
-    Because the worker fetches candles with ``pos=1``, the last row is the most
-    recent fully-closed candle, so its open time plus one timeframe is exactly
-    the moment that candle completed -- a correct, feed-consistent "now" that is
-    never in the future of the data and is identical to the system clock on
-    non-skewed feeds.
-    """
+    """Historical replay helper; live entry decisions use actual UTC time."""
     if entry_frame is None or len(entry_frame) == 0:
         return fallback
     try:

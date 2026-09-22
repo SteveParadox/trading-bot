@@ -103,6 +103,9 @@ class FxRiskManager:
         extra_cost = float(intent.metadata.get("execution_cost_price", 0.0))
         if not math.isfinite(extra_cost) or extra_cost < 0:
             return FxRiskDecision(False, "invalid_execution_cost", exit_plan=exit_plan)
+        extra_cost = max(extra_cost, self.strategy.execution_cost_pips_round_trip * instrument.pip_size)
+        if extra_cost >= exit_plan.reward_distance:
+            return FxRiskDecision(False, "reward_below_execution_cost", exit_plan=exit_plan)
         risk_per_unit = (exit_plan.risk_distance + extra_cost) * quote_factor
         if risk_per_unit <= 0 or not math.isfinite(risk_per_unit):
             return FxRiskDecision(False, "invalid_risk_per_unit", exit_plan=exit_plan)
@@ -123,18 +126,24 @@ class FxRiskManager:
         pair_remaining = max(0.0, portfolio.equity * self.risk.max_pair_exposure_pct - abs(pair_current))
         margin_budget = max(0.0, portfolio.free_margin - portfolio.equity * self.risk.min_free_margin_pct)
 
-        max_units = min(
-            self.risk.max_units_per_trade,
-            instrument.maximum_order_units,
-            risk_budget / risk_per_unit,
-            gross_remaining / position_value_per_unit if position_value_per_unit > 0 else 0.0,
-            pair_remaining / position_value_per_unit if position_value_per_unit > 0 else 0.0,
-            margin_budget / margin_per_unit if margin_per_unit > 0 else 0.0,
-        )
-        max_units = min(max_units, self._currency_limited_units(intent, instrument, portfolio, position_value_per_unit))
+        limits = {
+            "configured_units": self.risk.max_units_per_trade,
+            "broker_maximum": instrument.maximum_order_units,
+            "risk_budget": risk_budget / risk_per_unit,
+            "gross_exposure": gross_remaining / position_value_per_unit if position_value_per_unit > 0 else 0.0,
+            "pair_exposure": pair_remaining / position_value_per_unit if position_value_per_unit > 0 else 0.0,
+            "free_margin": margin_budget / margin_per_unit if margin_per_unit > 0 else 0.0,
+            "currency_exposure": self._currency_limited_units(intent, instrument, portfolio, position_value_per_unit),
+        }
+        max_units = min(limits.values())
         units = instrument.round_units(max_units)
         if units < instrument.minimum_trade_size:
-            return FxRiskDecision(False, "units_below_minimum", exit_plan=exit_plan, metadata={"raw_units": max_units})
+            return FxRiskDecision(False, "units_below_minimum", exit_plan=exit_plan, metadata={
+                "raw_units": max_units, "minimum_units": instrument.minimum_trade_size,
+                "binding_constraint": min(limits, key=limits.get), "unit_limits": limits,
+                "minimum_lot_risk_home": instrument.minimum_trade_size * risk_per_unit,
+                "minimum_lot_notional_home": instrument.minimum_trade_size * position_value_per_unit,
+            })
 
         position_value = position_value_home(
             instrument,
@@ -214,9 +223,8 @@ class FxRiskManager:
         atr = float(row.get("atr") or 0.0)
         stop_atr_multiple = risk_distance / atr if atr > 0 else None
         legacy_stop_filter = (
-            self.strategy.min_stop_pips is not None
-            and self.strategy.max_stop_pips is not None
-            and (stop_pips < self.strategy.min_stop_pips or stop_pips > self.strategy.max_stop_pips)
+            (self.strategy.min_stop_pips is not None and stop_pips < self.strategy.min_stop_pips)
+            or (self.strategy.max_stop_pips is not None and stop_pips > self.strategy.max_stop_pips)
         )
         if (
             (

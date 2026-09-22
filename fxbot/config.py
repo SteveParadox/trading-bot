@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -298,6 +299,7 @@ class StrategySettings:
     trailing_atr_multiplier: float = 1.4
     runner_take_profit_r: float | None = None
     breakeven_buffer_pips: float = 0.2
+    execution_cost_pips_round_trip: float = 0.0
     partial_tp_enabled: bool = True
     tp1_units_pct: float = 0.50
     max_spread_pips: float = 3.0
@@ -377,6 +379,10 @@ class StrategySettings:
             raise ValueError("strategy stop ATR bounds are invalid")
         if self.runner_take_profit_r is not None and self.runner_take_profit_r <= 0:
             raise ValueError("strategy.runner_take_profit_r must be positive when set")
+        for name in ("execution_cost_pips_round_trip", "breakeven_buffer_pips"):
+            value = getattr(self, name)
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"strategy.{name} must be finite and nonnegative")
         if self.max_entry_extension_atr is not None and self.max_entry_extension_atr <= 0:
             raise ValueError("strategy.max_entry_extension_atr must be positive when set")
         if not 0 < self.tp1_units_pct < 1:
@@ -438,9 +444,9 @@ class RiskSettings:
     max_drawdown_pct: float = 0.10
     max_open_positions: int = 3
     max_portfolio_risk_pct: float = 0.03
-    max_pair_exposure_pct: float = 1.50
-    max_gross_exposure_pct: float = 4.00
-    max_currency_exposure_pct: float = 2.00
+    max_pair_exposure_pct: float = 0.35
+    max_gross_exposure_pct: float = 1.20
+    max_currency_exposure_pct: float = 0.70
     min_free_margin_pct: float = 0.20
     max_units_per_trade: float = 100_000.0
     emergency_close_on_protection_failure: bool = True
@@ -631,6 +637,7 @@ def settings_from_env() -> FxBotSettings:
             trailing_atr_multiplier=_get_float("FX_TRAILING_ATR_MULTIPLIER", 1.4),
             runner_take_profit_r=_get_optional_float("FX_RUNNER_TAKE_PROFIT_R"),
             breakeven_buffer_pips=_get_float("FX_BREAKEVEN_BUFFER_PIPS", 0.2),
+            execution_cost_pips_round_trip=_get_float("FX_EXECUTION_COST_PIPS_ROUND_TRIP", 0.0),
             partial_tp_enabled=_get_bool("FX_PARTIAL_TP_ENABLED", True),
             tp1_units_pct=_get_float("FX_TP1_UNITS_PCT", 0.50),
             max_spread_pips=_get_float("FX_MAX_SPREAD_PIPS", 3.0),
@@ -707,7 +714,7 @@ def settings_from_env() -> FxBotSettings:
             api_key=_get_str("FX_API_KEY", ""),
             log_jsonl_path=_get_str("FX_JSONL_JOURNAL", "") or None,
             frontend_origin=_get_str("FX_FRONTEND_ORIGIN", "http://127.0.0.1:5173"),
-            cors_origins=tuple(_get_csv("FX_CORS_ORIGINS", [])),
+            cors_origins=tuple(item.strip() for item in _get_str("FX_CORS_ORIGINS", "").split(",") if item.strip()),
             start_worker_with_api=_get_bool("FX_START_WORKER_WITH_API", True),
             bind_host=_get_str("FX_API_HOST", "127.0.0.1"),
             api_port=_get_int("FX_API_PORT", 8000),
