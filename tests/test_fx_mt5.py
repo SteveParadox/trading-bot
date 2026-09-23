@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 from fxbot.config import BrokerSettings
@@ -163,6 +164,44 @@ class Mt5ConfigAndInstrumentTests(unittest.TestCase):
         instrument = FxInstrument.from_mt5("EUR_USD", SimpleNamespace(name="EURUSD", digits=5, point=0.00001, trade_contract_size=100000, volume_min=0.01, volume_max=50, volume_step=0.01, trade_stops_level=20), account_leverage=30, broker_symbol="EURUSD")
         response = client.create_market_order(instrument=instrument, signed_units=1000, stop_loss=1.099, take_profit=1.102, client_order_id="position-id-test", comment="test")
         self.assertEqual(response["orderFillTransaction"]["tradeOpened"]["tradeID"], "9001")
+
+    def test_mt5_recovers_closed_position_from_legacy_order_ticket(self) -> None:
+        class FakeMt5:
+            DEAL_ENTRY_IN = 0
+            DEAL_ENTRY_OUT = 1
+            DEAL_ENTRY_INOUT = 2
+            DEAL_ENTRY_OUT_BY = 3
+            DEAL_TYPE_BUY = 0
+            DEAL_TYPE_SELL = 1
+
+            def initialize(self, *args, **kwargs): return True
+            def account_info(self): return SimpleNamespace(currency="USD", trade_mode=0)
+            def history_orders_get(self, *, ticket):
+                return [SimpleNamespace(position_id=9001)] if ticket == 42 else []
+            def history_deals_get(self, *args, **kwargs):
+                if "ticket" in kwargs:
+                    return []
+                if kwargs.get("position") == 9001:
+                    return [
+                        SimpleNamespace(position_id=9001, entry=0, symbol="EURUSD", type=0, volume=0.01, time=1767708000, price=1.1, profit=0, commission=-0.1, fee=0, swap=0),
+                        SimpleNamespace(position_id=9001, entry=1, symbol="EURUSD", type=1, volume=0.01, time=1767708300, price=1.101, profit=10, commission=-0.1, fee=0, swap=-0.2),
+                    ]
+                return []
+            def symbol_info(self, symbol): return SimpleNamespace(trade_contract_size=100000)
+            def last_error(self): return "ok"
+
+        client = Mt5Client(BrokerSettings(), module=FakeMt5())
+        event = client.closed_trade_for_references(
+            ["42"],
+            datetime.fromtimestamp(1767707000, tz=timezone.utc),
+            datetime.fromtimestamp(1767709000, tz=timezone.utc),
+        )
+
+        self.assertIsNotNone(event)
+        self.assertEqual(event["broker_trade_id"], "9001")
+        self.assertEqual(event["side"], "LONG")
+        self.assertEqual(event["units"], 1000)
+        self.assertAlmostEqual(event["realized_pl"], 9.9)
 
     def test_mt5_accepts_order_check_retcodes_for_valid_demo_fill_mode(self) -> None:
         class FakeMt5:

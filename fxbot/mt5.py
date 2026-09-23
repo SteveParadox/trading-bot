@@ -211,6 +211,76 @@ class Mt5Client:
             raise Mt5Error(f"MT5 history_deals_get failed: {mt5.last_error()}")
         return self._closed_trade_events(deals)
 
+    def closed_trade_for_references(
+        self,
+        references: list[str],
+        since: datetime,
+        until: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        """Recover one closed position from legacy order/deal identifiers.
+
+        Worker versions prior to the position-ID fix sometimes persisted an
+        opening order ticket as ``broker_trade_id``.  MT5 close deals are keyed
+        by ``position_id``, so a normal time-window scan cannot relate those
+        rows when the close-history window is missing or has moved on.  Resolve
+        each known order/deal reference to its position, then ask MT5 directly
+        for every deal belonging to that position.
+        """
+        self._ensure_connected()
+        mt5 = self._module()
+        position_ids: set[str] = set()
+        for raw_reference in references:
+            try:
+                reference = int(str(raw_reference))
+            except (TypeError, ValueError):
+                continue
+            orders_get = getattr(mt5, "history_orders_get", None)
+            if orders_get is not None:
+                try:
+                    orders = orders_get(ticket=reference)
+                except (TypeError, ValueError, AttributeError):
+                    orders = ()
+                for order in orders or ():
+                    payload = _as_dict(order)
+                    position_id = payload.get("position_id") or payload.get("position")
+                    if position_id:
+                        position_ids.add(str(position_id))
+            deals_get = getattr(mt5, "history_deals_get", None)
+            if deals_get is not None:
+                try:
+                    referenced_deals = deals_get(ticket=reference)
+                except (TypeError, ValueError, AttributeError):
+                    referenced_deals = ()
+                for deal in referenced_deals or ():
+                    position_id = _as_dict(deal).get("position_id")
+                    if position_id:
+                        position_ids.add(str(position_id))
+
+        deals_get = getattr(mt5, "history_deals_get", None)
+        if deals_get is None:
+            return None
+        end = until or datetime.now(timezone.utc)
+        for position_id in position_ids:
+            try:
+                deals = deals_get(position=int(position_id))
+            except (TypeError, ValueError, AttributeError):
+                deals = None
+            if deals is None:
+                # Some terminal builds do not expose the named ``position``
+                # selector. Retain a bounded date-range fallback.
+                deals = deals_get(_naive_utc(since), _naive_utc(end))
+                if deals is not None:
+                    deals = tuple(
+                        deal for deal in deals
+                        if str(_as_dict(deal).get("position_id") or "") == position_id
+                    )
+            if deals is None:
+                continue
+            for event in self._closed_trade_events(tuple(deals)):
+                if str(event.get("broker_trade_id") or "") == position_id:
+                    return event
+        return None
+
     def order_by_client_id(self, client_order_id: str) -> dict[str, Any] | None:
         self._ensure_connected()
         mt5 = self._module()

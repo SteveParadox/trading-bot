@@ -74,6 +74,44 @@ class StructuredJournalTests(unittest.TestCase):
                 self.assertEqual(alias, "opening-order-42")
                 self.assertEqual(journal.find_trade("opening-order-42").state, "reconciled_alias")
                 self.assertEqual([row.broker_trade_id for row in journal.filtered_trades()], ["position-9001"])
+
+    def test_forward_targeted_recovery_repairs_legacy_open_row(self) -> None:
+        class LegacyHistoryClient:
+            def __init__(self):
+                self.references = None
+
+            def closed_trades_since(self, since, until):
+                return []
+
+            def closed_trade_for_references(self, references, since, until):
+                self.references = references
+                return {
+                    "broker_trade_id": "9001", "instrument": "EUR_USD", "side": "LONG",
+                    "units": 500, "exit_time": datetime(2026, 1, 6, 14, 5, tzinfo=timezone.utc),
+                    "exit_price": 1.103, "realized_pl": 2.75, "financing": -0.1,
+                    "exit_reason": "mt5_history_deal",
+                }
+
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = FxBotSettings(
+                broker=BrokerSettings(),
+                runtime=RuntimeSettings(database_url=f"sqlite:///{Path(tmp) / 'journal.db'}", log_jsonl_path=None),
+            )
+            with closing(StructuredJournal(settings.runtime.database_url)) as journal:
+                journal.upsert_trade(
+                    broker_trade_id="42", instrument="EUR_USD", side="LONG", units=1000,
+                    state="open", entry_time=datetime(2026, 1, 6, 14, tzinfo=timezone.utc),
+                    payload={"mt5": {"order": 42, "deal": 84}},
+                )
+                client = LegacyHistoryClient()
+                worker = ForwardTestWorker(settings, client=client, journal=journal)
+                worker._sync_trade_history(datetime(2026, 1, 6, 14, 10, tzinfo=timezone.utc))
+
+                self.assertEqual(client.references, ["42", "84"])
+                self.assertEqual(journal.find_trade("42").state, "reconciled_alias")
+                self.assertEqual(journal.find_trade("9001").state, "closed")
+                self.assertEqual([row.broker_trade_id for row in journal.filtered_trades()], ["9001"])
+                worker.close()
     def test_order_reservation_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with closing(StructuredJournal(f"sqlite:///{Path(tmp) / 'journal.db'}")) as journal:

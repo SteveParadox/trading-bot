@@ -937,31 +937,68 @@ class ForwardTestWorker:
             self.journal.log_event("trade_history_sync_failed", str(exc), level="warning")
             return
         for trade in closed_trades:
-            trade_id = str(trade.get("broker_trade_id") or "")
-            if not trade_id:
-                continue
-            self.journal.upsert_trade(
-                broker_trade_id=trade_id,
-                instrument=str(trade.get("instrument") or ""),
-                side=str(trade.get("side") or ""),
-                units=_safe_float(trade.get("units")),
-                state="closed",
-                exit_time=_parse_broker_time(trade.get("exit_time")),
-                exit_price=_safe_float(trade.get("exit_price")),
-                realized_pl=_safe_float(trade.get("realized_pl")),
-                financing=_safe_float(trade.get("financing")),
-                exit_reason=str(trade.get("exit_reason") or "mt5_history_deal"),
-                payload=trade,
-            )
-            self.journal.reconcile_duplicate_open_trade(
-                canonical_trade_id=trade_id,
-                instrument=str(trade.get("instrument") or ""),
-                units=_safe_float(trade.get("units")),
-                exit_time=_parse_broker_time(trade.get("exit_time")),
-                exit_price=_safe_float(trade.get("exit_price")),
-            )
-            self.journal.mark_trade_orders_closed(trade_id)
+            self._record_closed_trade(trade)
+
+        # Repair journals written by older releases that used an MT5 opening
+        # order/deal ticket instead of the position ticket. A direct position
+        # query also recovers closes omitted by a terminal's date-window scan.
+        targeted_lookup = getattr(self.client, "closed_trade_for_references", None)
+        if callable(targeted_lookup):
+            for open_trade in open_trades:
+                current = self.journal.find_trade(open_trade.broker_trade_id)
+                if current is None or current.state != "open":
+                    continue
+                references = _trade_recovery_references(open_trade)
+                entry_time = _parse_broker_time(open_trade.entry_time) or since
+                try:
+                    recovered = targeted_lookup(references, entry_time, now)
+                except Mt5Error as exc:
+                    self.journal.log_event(
+                        "legacy_trade_recovery_failed",
+                        str(exc),
+                        level="warning",
+                        payload={"broker_trade_id": open_trade.broker_trade_id},
+                    )
+                    continue
+                if recovered is None:
+                    continue
+                self._record_closed_trade(recovered, alias_trade_id=open_trade.broker_trade_id)
+                self.journal.log_event(
+                    "legacy_trade_recovered",
+                    f"reconciled legacy MT5 trade {open_trade.broker_trade_id}",
+                    payload={
+                        "legacy_trade_id": open_trade.broker_trade_id,
+                        "position_id": str(recovered.get("broker_trade_id") or ""),
+                    },
+                )
         self.journal.set_last_transaction_id(now.isoformat())
+
+    def _record_closed_trade(self, trade: dict[str, Any], *, alias_trade_id: str | None = None) -> None:
+        trade_id = str(trade.get("broker_trade_id") or "")
+        if not trade_id:
+            return
+        self.journal.upsert_trade(
+            broker_trade_id=trade_id,
+            instrument=str(trade.get("instrument") or ""),
+            side=str(trade.get("side") or ""),
+            units=_safe_float(trade.get("units")),
+            state="closed",
+            exit_time=_parse_broker_time(trade.get("exit_time")),
+            exit_price=_safe_float(trade.get("exit_price")),
+            realized_pl=_safe_float(trade.get("realized_pl")),
+            financing=_safe_float(trade.get("financing")),
+            exit_reason=str(trade.get("exit_reason") or "mt5_history_deal"),
+            payload=trade,
+        )
+        self.journal.reconcile_duplicate_open_trade(
+            canonical_trade_id=trade_id,
+            instrument=str(trade.get("instrument") or ""),
+            units=_safe_float(trade.get("units")),
+            exit_time=_parse_broker_time(trade.get("exit_time")),
+            exit_price=_safe_float(trade.get("exit_price")),
+            alias_trade_id=alias_trade_id,
+        )
+        self.journal.mark_trade_orders_closed(trade_id)
 
     def _record_fill_trade(
         self,
@@ -1481,6 +1518,36 @@ def instrument_price_round(intent: FxSignalIntent, price: float) -> float:
     if intent.instrument.endswith("_JPY"):
         return round(price, 3)
     return round(price, 5)
+
+
+def _trade_recovery_references(trade: Any) -> list[str]:
+    """Collect stable MT5 order/deal/position IDs stored on a journal row."""
+    references: list[str] = []
+
+    def add(value: Any) -> None:
+        text = str(value or "").strip()
+        if text and text not in references:
+            references.append(text)
+
+    add(getattr(trade, "broker_trade_id", None))
+    payload = getattr(trade, "payload", None)
+    if not isinstance(payload, dict):
+        return references
+    mt5 = payload.get("mt5")
+    if isinstance(mt5, dict):
+        for key in ("position", "position_id", "order", "deal"):
+            add(mt5.get(key))
+    fill = payload.get("orderFillTransaction")
+    if isinstance(fill, dict):
+        for key in ("positionID", "orderID", "id"):
+            add(fill.get(key))
+        opened = fill.get("tradeOpened")
+        if isinstance(opened, dict):
+            add(opened.get("tradeID"))
+    created = payload.get("orderCreateTransaction")
+    if isinstance(created, dict):
+        add(created.get("id"))
+    return references
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
