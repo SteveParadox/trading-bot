@@ -142,6 +142,28 @@ class Mt5ConfigAndInstrumentTests(unittest.TestCase):
         self.assertEqual(client._module().checked[1]["type_filling"], client._module().ORDER_FILLING_IOC)
         self.assertEqual(client._module().sent[0]["type_filling"], client._module().ORDER_FILLING_IOC)
 
+    def test_mt5_journals_position_ticket_not_opening_order_ticket(self) -> None:
+        class FakeMt5:
+            ORDER_FILLING_RETURN = 2
+            ORDER_TYPE_BUY = 0
+            ORDER_TIME_GTC = 0
+            TRADE_ACTION_DEAL = 1
+            TRADE_RETCODE_DONE = 10009
+
+            def initialize(self, *args, **kwargs): return True
+            def account_info(self): return SimpleNamespace(currency="USD", trade_mode=0)
+            def symbol_info(self, symbol): return SimpleNamespace(name=symbol, visible=True, digits=5, point=0.00001, trade_contract_size=100000, volume_min=0.01, volume_max=50, volume_step=0.01, trade_stops_level=20)
+            def symbol_info_tick(self, symbol): return SimpleNamespace(bid=1.1, ask=1.1001, time=1700000000)
+            def order_check(self, request): return {"retcode": self.TRADE_RETCODE_DONE}
+            def order_send(self, request): return {"retcode": self.TRADE_RETCODE_DONE, "order": 42, "deal": 84, "price": 1.1001}
+            def history_deals_get(self, *, ticket): return [SimpleNamespace(position_id=9001)]
+            def last_error(self): return "ok"
+
+        client = Mt5Client(BrokerSettings(), module=FakeMt5())
+        instrument = FxInstrument.from_mt5("EUR_USD", SimpleNamespace(name="EURUSD", digits=5, point=0.00001, trade_contract_size=100000, volume_min=0.01, volume_max=50, volume_step=0.01, trade_stops_level=20), account_leverage=30, broker_symbol="EURUSD")
+        response = client.create_market_order(instrument=instrument, signed_units=1000, stop_loss=1.099, take_profit=1.102, client_order_id="position-id-test", comment="test")
+        self.assertEqual(response["orderFillTransaction"]["tradeOpened"]["tradeID"], "9001")
+
     def test_mt5_accepts_order_check_retcodes_for_valid_demo_fill_mode(self) -> None:
         class FakeMt5:
             ORDER_FILLING_RETURN = 2

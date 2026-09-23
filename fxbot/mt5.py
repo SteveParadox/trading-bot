@@ -279,6 +279,7 @@ class Mt5Client:
         request["type_filling"] = self._validated_order_filling(request)
         result = mt5.order_send(request)
         result_payload = self._checked_result(result, "order_send")
+        position_id = self._position_id_from_fill(mt5, result_payload)
         return _market_order_response(
             client_order_id=client_order_id,
             instrument=instrument.name,
@@ -286,8 +287,34 @@ class Mt5Client:
             price=_safe_float(result_payload.get("price"), price),
             order_id=str(result_payload.get("order") or ""),
             deal_id=str(result_payload.get("deal") or ""),
+            position_id=position_id,
             result=result_payload,
         )
+
+    def _position_id_from_fill(self, mt5: Any, result: dict[str, Any]) -> str:
+        """Resolve the MT5 position ticket for a just-filled market order.
+
+        ``MqlTradeResult.order`` is an order ticket, not a position ticket.
+        Close history is keyed by ``DEAL_POSITION_ID``/``position_id``. Using
+        the order ticket here creates a second open journal row that can never
+        be closed by history reconciliation.
+        """
+        direct = result.get("position") or result.get("position_id")
+        if direct:
+            return str(direct)
+        deal_id = result.get("deal")
+        history = getattr(mt5, "history_deals_get", None)
+        if not deal_id or history is None:
+            return ""
+        try:
+            deals = history(ticket=int(deal_id))
+        except (TypeError, ValueError, AttributeError):
+            return ""
+        for deal in deals or ():
+            position_id = _as_dict(deal).get("position_id")
+            if position_id:
+                return str(position_id)
+        return ""
 
     def set_trade_dependent_orders(
         self,
@@ -626,9 +653,10 @@ def _market_order_response(
     price: float,
     order_id: str,
     deal_id: str,
+    position_id: str = "",
     result: dict[str, Any],
 ) -> dict[str, Any]:
-    trade_id = order_id or deal_id
+    trade_id = position_id or order_id or deal_id
     now = datetime.now(timezone.utc).isoformat()
     return {
         "orderCreateTransaction": {
@@ -638,6 +666,7 @@ def _market_order_response(
         "orderFillTransaction": {
             "orderID": order_id,
             "id": deal_id,
+            "positionID": position_id,
             "instrument": instrument,
             "units": signed_units,
             "price": price,

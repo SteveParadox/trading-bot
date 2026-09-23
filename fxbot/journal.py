@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import threading
 from dataclasses import asdict, is_dataclass
@@ -464,6 +465,47 @@ class StructuredJournal:
             if row is not None:
                 session.expunge(row)
             return row
+
+    def reconcile_duplicate_open_trade(
+        self,
+        *,
+        canonical_trade_id: str,
+        instrument: str,
+        units: float,
+        exit_time: datetime | None,
+        exit_price: float | None,
+    ) -> str | None:
+        """Archive an old order-ticket row after MT5 position-ID recovery.
+
+        Older worker versions journaled ``order`` as the trade ID, while MT5
+        close history uses ``position_id``. If both rows exist, marking both
+        closed would double-count P&L. Only an unambiguous same-symbol,
+        same-volume open row is archived as a reconciliation alias.
+        """
+        name = instrument.upper()
+        with self.sessions.begin() as session:
+            rows = list(session.scalars(
+                select(TradeJournalRow).where(
+                    TradeJournalRow.state == "open",
+                    TradeJournalRow.instrument == name,
+                    TradeJournalRow.broker_trade_id != str(canonical_trade_id),
+                )
+            ))
+            candidates = [row for row in rows if math.isclose(
+                float(row.units or 0.0), float(units or 0.0), rel_tol=1e-6, abs_tol=0.01
+            )]
+            if len(candidates) != 1:
+                return None
+            row = candidates[0]
+            row.state = "reconciled_alias"
+            row.exit_time = _aware(exit_time) if exit_time else row.exit_time
+            row.exit_price = exit_price if exit_price is not None else row.exit_price
+            row.exit_reason = "mt5_position_id_reconciliation"
+            row.payload = _jsonable({
+                **(row.payload or {}),
+                "canonical_broker_trade_id": str(canonical_trade_id),
+            })
+            return row.broker_trade_id
 
     def update_trade_payload(self, broker_trade_id: str, payload: dict[str, Any]) -> None:
         with self.sessions.begin() as session:
