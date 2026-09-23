@@ -624,6 +624,41 @@ class StructuredJournal:
                 session.expunge(row)
             return list(reversed(rows))
 
+    def equity_history(
+        self,
+        *,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        limit: int = 1000,
+    ) -> list[EquitySnapshotRow]:
+        """Return chronologically ordered equity history, downsampled safely.
+
+        The worker records a snapshot every loop, so returning the latest 500
+        rows does not represent a seven-day chart. Query the requested window
+        first, then keep evenly distributed points plus the first/last point.
+        This keeps date ranges correct without sending tens of thousands of
+        ten-second snapshots to the browser.
+        """
+        limit = max(2, int(limit))
+        statement = select(EquitySnapshotRow)
+        if start is not None:
+            statement = statement.where(EquitySnapshotRow.timestamp >= _aware(start))
+        if end is not None:
+            statement = statement.where(EquitySnapshotRow.timestamp <= _aware(end))
+        statement = statement.order_by(EquitySnapshotRow.timestamp, EquitySnapshotRow.id)
+        with self.sessions() as session:
+            rows = list(session.scalars(statement))
+            for row in rows:
+                session.expunge(row)
+        if len(rows) <= limit:
+            return rows
+        # Include endpoints and select deterministic positions in between.
+        indices = {0, len(rows) - 1}
+        span = len(rows) - 1
+        for position in range(1, limit - 1):
+            indices.add(round(position * span / (limit - 1)))
+        return [rows[index] for index in sorted(indices)]
+
     def current_positions(self) -> list[CurrentPositionRow]:
         with self.sessions() as session:
             rows = list(
@@ -788,7 +823,11 @@ def _jsonable(value: Any) -> Any:
     if hasattr(value, "__table__"):
         return row_to_dict(value)
     if isinstance(value, datetime):
-        return value.isoformat()
+        # SQLite returns DateTime columns without tzinfo even when the model
+        # column is timezone-aware. Always emit an explicit UTC offset so the
+        # frontend does not reinterpret journal dates in the browser's local
+        # timezone at midnight or during chart range filtering.
+        return _aware(value).isoformat()
     if isinstance(value, Enum):
         return value.value
     if isinstance(value, dict):

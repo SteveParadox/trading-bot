@@ -57,6 +57,7 @@ log = logging.getLogger(__name__)
 # the sync cursor has already advanced past their close deals. Kept larger than
 # the broker-feed clock skew (~2.5h on MetaQuotes demo) plus the loop interval.
 TRADE_HISTORY_RECONCILE_HOURS = 72
+TRADE_HISTORY_INITIAL_LOOKBACK_HOURS = 24 * 30
 
 Publisher = Callable[[dict[str, Any]], Awaitable[None] | None]
 
@@ -905,12 +906,31 @@ class ForwardTestWorker:
     def _sync_trade_history(self, now: datetime) -> None:
         state = self.journal.get_state()
         cursor = _parse_broker_time(state.last_transaction_id) if state.last_transaction_id else None
-        floor = now - timedelta(hours=TRADE_HISTORY_RECONCILE_HOURS)
+        # A fresh journal may be recovering a position that closed while the
+        # process was offline. Use a longer bounded bootstrap window then.
+        lookback_hours = (
+            TRADE_HISTORY_INITIAL_LOOKBACK_HOURS if cursor is None
+            else TRADE_HISTORY_RECONCILE_HOURS
+        )
+        floor = now - timedelta(hours=lookback_hours)
         # Use the earlier of the sync cursor and a fixed reconcile floor so that
         # trades which closed between scans (whose close deals fall before the
         # cursor) are still re-fetched and flipped to `closed`. The upsert is
         # keyed on broker_trade_id, so re-processing is idempotent.
         since = min(cursor, floor) if cursor else floor
+        # MT5 can emit several OUT deals for a partially closed position. Keep
+        # all close deals from the journaled entry time so the final upsert is
+        # cumulative even when the position was held longer than the normal
+        # reconciliation window.
+        open_trades = self.journal.filtered_trades(state="open", limit=10_000)
+        entry_times = [
+            parsed for trade in open_trades
+            if trade.entry_time is not None
+            for parsed in [_parse_broker_time(trade.entry_time)]
+            if parsed is not None
+        ]
+        if entry_times:
+            since = min(since, *entry_times)
         try:
             closed_trades = self.client.closed_trades_since(since, now)
         except Mt5Error as exc:

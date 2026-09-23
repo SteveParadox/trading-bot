@@ -6,7 +6,7 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 from dataclasses import asdict
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -250,8 +250,17 @@ def create_app(settings: FxBotSettings | None = None) -> FastAPI:
         return [row_to_dict(row) for row in rows]
 
     @app.get("/api/equity", dependencies=[Depends(require_api_key)])
-    def equity(limit: int = Query(default=500, ge=1, le=5000)) -> list[dict[str, Any]]:
-        return [row_to_dict(row) for row in journal.latest_equity(limit=limit)]
+    def equity(
+        window: str = Query(default="all", pattern="^(all|24h|7d)$"),
+        limit: int = Query(default=1000, ge=2, le=5000),
+    ) -> list[dict[str, Any]]:
+        now = datetime.now(timezone.utc)
+        start = now - ({"24h": timedelta(hours=24), "7d": timedelta(days=7)}[window] if window != "all" else timedelta(0))
+        return [row_to_dict(row) for row in journal.equity_history(
+            start=start if window != "all" else None,
+            end=now if window != "all" else None,
+            limit=limit,
+        )]
 
     @app.get("/api/signals", dependencies=[Depends(require_api_key)])
     def signals(limit: int = Query(default=200, ge=1, le=1000)) -> list[dict[str, Any]]:
