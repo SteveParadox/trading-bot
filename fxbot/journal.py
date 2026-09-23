@@ -474,6 +474,7 @@ class StructuredJournal:
         units: float,
         exit_time: datetime | None,
         exit_price: float | None,
+        alias_trade_id: str | None = None,
     ) -> str | None:
         """Archive an old order-ticket row after MT5 position-ID recovery.
 
@@ -484,14 +485,19 @@ class StructuredJournal:
         """
         name = instrument.upper()
         with self.sessions.begin() as session:
-            rows = list(session.scalars(
-                select(TradeJournalRow).where(
-                    TradeJournalRow.state == "open",
-                    TradeJournalRow.instrument == name,
-                    TradeJournalRow.broker_trade_id != str(canonical_trade_id),
-                )
-            ))
-            candidates = [row for row in rows if math.isclose(
+            query = select(TradeJournalRow).where(
+                TradeJournalRow.state == "open",
+                TradeJournalRow.instrument == name,
+                TradeJournalRow.broker_trade_id != str(canonical_trade_id),
+            )
+            if alias_trade_id is not None:
+                query = query.where(TradeJournalRow.broker_trade_id == str(alias_trade_id))
+            rows = list(session.scalars(query))
+            # An explicit alias was resolved through MT5's order/deal ->
+            # position relationship, so it is authoritative even if partial
+            # closes make the aggregate closed volume differ. The fallback
+            # heuristic remains deliberately strict.
+            candidates = rows if alias_trade_id is not None else [row for row in rows if math.isclose(
                 float(row.units or 0.0), float(units or 0.0), rel_tol=1e-6, abs_tol=0.01
             )]
             if len(candidates) != 1:
