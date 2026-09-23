@@ -47,6 +47,28 @@ class Mt5ConfigAndInstrumentTests(unittest.TestCase):
         self.assertEqual(snapshot.instrument, "USD_JPY")
         self.assertEqual(snapshot.mid, 150.125)
 
+    def test_mt5_timestamp_offset_normalizes_quotes_and_candles(self) -> None:
+        class FakeMt5:
+            TIMEFRAME_M15 = 15
+
+            def initialize(self, *args, **kwargs): return True
+            def account_info(self): return SimpleNamespace(currency="USD", trade_mode=0)
+            def symbol_info(self, symbol): return SimpleNamespace(name=symbol, visible=True)
+            def symbol_info_tick(self, symbol):
+                return SimpleNamespace(bid=1.1, ask=1.1001, time=1_700_010_800, time_msc=1_700_010_800_000)
+            def copy_rates_from_pos(self, symbol, timeframe, start, count):
+                return [{"time": 1_700_010_800, "open": 1.1, "high": 1.2, "low": 1.0, "close": 1.15, "tick_volume": 10}]
+            def last_error(self): return "ok"
+
+        client = Mt5Client(BrokerSettings(time_offset_seconds=-10_800), module=FakeMt5())
+
+        quote = client.pricing(["EUR_USD"]).prices["EUR_USD"]
+        candles = client.candles("EUR_USD", "15m", 1)
+
+        expected = datetime.fromtimestamp(1_700_000_000, tz=timezone.utc)
+        self.assertEqual(quote.time, expected)
+        self.assertEqual(candles.index[0].to_pydatetime(), expected)
+
     def test_normalize_rejects_malformed_fx_symbol(self) -> None:
         with self.assertRaises(ValueError):
             normalize_instrument_name("EUR")

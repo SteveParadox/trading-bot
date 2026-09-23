@@ -39,6 +39,8 @@ MT5_TERMINAL_PATH=C:\Program Files\MetaTrader 5\terminal64.exe
 MT5_DEMO_ONLY=true
 MT5_DEVIATION_POINTS=20
 MT5_MAGIC_NUMBER=260828
+# Signed correction for measured broker-server timestamps; UTC+3 requires -10800.
+FX_MT5_TIME_OFFSET_SECONDS=0
 FX_API_KEY=change-this-demo-control-key
 FX_INSTRUMENTS=EUR_USD,GBP_USD,USD_JPY,AUD_USD
 MT5_SYMBOL_MAP=EUR_USD=EURUSD,GBP_USD=GBPUSD,USD_JPY=USDJPY,AUD_USD=AUDUSD
@@ -47,6 +49,13 @@ MT5_SYMBOL_MAP=EUR_USD=EURUSD,GBP_USD=GBPUSD,USD_JPY=USDJPY,AUD_USD=AUDUSD
 If your broker uses suffixed symbols such as `EURUSD.a`, set
 `MT5_SYMBOL_MAP=EUR_USD=EURUSD.a,...`. The strategy keeps underscore pair
 names internally and sends the mapped symbol to MT5.
+
+MT5 timestamps should normally be UTC, so leave `FX_MT5_TIME_OFFSET_SECONDS=0`.
+If a direct host-versus-quote measurement proves that every broker timestamp
+has the same whole-hour offset, configure the inverse correction. For example,
+quotes consistently three hours ahead of synchronized UTC require
+`FX_MT5_TIME_OFFSET_SECONDS=-10800`. The correction applies to quotes, candles,
+position open times, and closed-deal times while preserving freshness checks.
 
 Optional high-impact news blackout events can be loaded from a JSON file:
 

@@ -43,6 +43,7 @@ def test_root_config_rejects_invalid_float_env(monkeypatch: pytest.MonkeyPatch) 
 def test_fxbot_settings_strip_and_validate_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("FX_API_KEY", "  demo-key  ")
     monkeypatch.setenv("MT5_ORDER_FILLING", " return ")
+    monkeypatch.setenv("FX_MT5_TIME_OFFSET_SECONDS", "-10800")
     monkeypatch.setenv("FX_ENTRY_TIMEFRAME", " 30m ")
     monkeypatch.setenv("FX_STOP_MODE", " ATR ")
     monkeypatch.setenv("FX_ACCOUNT_CURRENCY", " usd ")
@@ -53,6 +54,7 @@ def test_fxbot_settings_strip_and_validate_env(monkeypatch: pytest.MonkeyPatch) 
 
     assert settings.runtime.api_key == "demo-key"
     assert settings.broker.order_filling == "RETURN"
+    assert settings.broker.time_offset_seconds == -10800
     assert settings.strategy.entry_timeframe == "30m"
     assert settings.strategy.stop_mode == "atr"
     assert settings.risk.account_currency == "USD"
