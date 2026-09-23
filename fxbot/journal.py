@@ -738,6 +738,12 @@ class StructuredJournal:
             statement = statement.where(TradeJournalRow.instrument == instrument.upper())
         if state:
             statement = statement.where(TradeJournalRow.state == state.lower())
+        else:
+            # Old MT5 versions could leave an opening-order-ticket duplicate
+            # after the canonical position-ticket row was reconciled. Keep the
+            # audit row in SQLite, but hide it from normal dashboard/analytics
+            # queries so it cannot look like a second live trade.
+            statement = statement.where(TradeJournalRow.state != "reconciled_alias")
         if start:
             statement = statement.where(TradeJournalRow.entry_time >= _aware(start))
         if end:
