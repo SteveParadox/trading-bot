@@ -64,6 +64,16 @@ class StructuredJournalTests(unittest.TestCase):
                 self.assertEqual(closed.payload["strategy_context"]["signal_score"], 71)
                 self.assertEqual(client.since, datetime(2025, 12, 7, 14, 10, tzinfo=timezone.utc))
                 worker.close()
+
+    def test_old_order_ticket_row_is_archived_when_position_ticket_closes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with closing(StructuredJournal(f"sqlite:///{Path(tmp) / 'journal.db'}")) as journal:
+                journal.upsert_trade(broker_trade_id="opening-order-42", instrument="EUR_USD", side="LONG", units=1000, state="open")
+                journal.upsert_trade(broker_trade_id="position-9001", instrument="EUR_USD", side="LONG", units=1000, state="closed", exit_time=datetime(2026, 1, 6, tzinfo=timezone.utc), realized_pl=3.0)
+                alias = journal.reconcile_duplicate_open_trade(canonical_trade_id="position-9001", instrument="EUR_USD", units=1000, exit_time=datetime(2026, 1, 6, tzinfo=timezone.utc), exit_price=1.103)
+                self.assertEqual(alias, "opening-order-42")
+                self.assertEqual(journal.find_trade("opening-order-42").state, "reconciled_alias")
+                self.assertEqual([row.broker_trade_id for row in journal.filtered_trades()], ["position-9001"])
     def test_order_reservation_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with closing(StructuredJournal(f"sqlite:///{Path(tmp) / 'journal.db'}")) as journal:

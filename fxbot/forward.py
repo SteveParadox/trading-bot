@@ -953,6 +953,13 @@ class ForwardTestWorker:
                 exit_reason=str(trade.get("exit_reason") or "mt5_history_deal"),
                 payload=trade,
             )
+            self.journal.reconcile_duplicate_open_trade(
+                canonical_trade_id=trade_id,
+                instrument=str(trade.get("instrument") or ""),
+                units=_safe_float(trade.get("units")),
+                exit_time=_parse_broker_time(trade.get("exit_time")),
+                exit_price=_safe_float(trade.get("exit_price")),
+            )
             self.journal.mark_trade_orders_closed(trade_id)
         self.journal.set_last_transaction_id(now.isoformat())
 
