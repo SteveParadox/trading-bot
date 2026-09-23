@@ -250,6 +250,10 @@ class BrokerSettings:
     deviation_points: int = 20
     magic_number: int = 260828
     order_filling: str = "RETURN"
+    # Signed correction applied to timestamps returned by MT5. Some brokers
+    # expose server-local epoch values instead of UTC (for example UTC+3).
+    # Keep this explicit so stale-data protection is never silently weakened.
+    time_offset_seconds: int = 0
     symbol_map: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
@@ -259,6 +263,8 @@ class BrokerSettings:
             raise ValueError("broker.deviation_points cannot be negative")
         if self.magic_number < 0:
             raise ValueError("broker.magic_number cannot be negative")
+        if abs(self.time_offset_seconds) > 14 * 60 * 60:
+            raise ValueError("broker.time_offset_seconds must be within +/- 14 hours")
         filling = self.order_filling.upper()
         if filling not in {"RETURN", "IOC", "FOK"}:
             raise ValueError("broker.order_filling must be RETURN, IOC, or FOK")
@@ -623,6 +629,7 @@ def settings_from_env() -> FxBotSettings:
             deviation_points=_get_int("MT5_DEVIATION_POINTS", 20),
             magic_number=_get_int("MT5_MAGIC_NUMBER", 260828),
             order_filling=_get_str("MT5_ORDER_FILLING", "RETURN"),
+            time_offset_seconds=_get_int("FX_MT5_TIME_OFFSET_SECONDS", 0),
             symbol_map=_get_symbol_map("MT5_SYMBOL_MAP"),
         ),
         strategy=StrategySettings(

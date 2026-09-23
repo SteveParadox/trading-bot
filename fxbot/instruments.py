@@ -143,6 +143,7 @@ class PriceSnapshot:
         tick: Any,
         *,
         quote_to_home_factor: float | None = None,
+        time_offset_seconds: int = 0,
     ) -> "PriceSnapshot":
         payload = _as_dict(tick)
         bid = _positive_float(payload.get("bid"), 0.0)
@@ -153,7 +154,7 @@ class PriceSnapshot:
             instrument=normalize_instrument_name(instrument),
             bid=bid,
             ask=ask,
-            time=_parse_mt5_time(payload),
+            time=_parse_mt5_time(payload, time_offset_seconds=time_offset_seconds),
             quote_to_home_factor=quote_to_home_factor,
         )
 
@@ -325,15 +326,18 @@ def _margin_rate(payload: dict[str, Any], account_leverage: float | None) -> flo
     return 0.0333333333
 
 
-def _parse_mt5_time(payload: dict[str, Any]) -> datetime:
+def _parse_mt5_time(payload: dict[str, Any], *, time_offset_seconds: int = 0) -> datetime:
     timestamp_msc = payload.get("time_msc")
     try:
         if timestamp_msc not in (None, "", 0):
-            return datetime.fromtimestamp(float(timestamp_msc) / 1000.0, tz=timezone.utc)
+            return datetime.fromtimestamp(
+                (float(timestamp_msc) / 1000.0) + time_offset_seconds,
+                tz=timezone.utc,
+            )
     except (TypeError, ValueError, OSError):
         pass
     timestamp = payload.get("time") or 0
     try:
-        return datetime.fromtimestamp(float(timestamp), tz=timezone.utc)
+        return datetime.fromtimestamp(float(timestamp) + time_offset_seconds, tz=timezone.utc)
     except (TypeError, ValueError, OSError):
         return datetime.now(timezone.utc)

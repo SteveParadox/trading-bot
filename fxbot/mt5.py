@@ -126,7 +126,11 @@ class Mt5Client:
         frame = pd.DataFrame(rates)
         if frame.empty:
             return pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
-        frame["timestamp"] = pd.to_datetime(frame["time"], unit="s", utc=True)
+        frame["timestamp"] = pd.to_datetime(
+            frame["time"] + self.settings.time_offset_seconds,
+            unit="s",
+            utc=True,
+        )
         volume_column = "tick_volume" if "tick_volume" in frame.columns else "real_volume"
         frame["volume"] = pd.to_numeric(frame.get(volume_column, 0), errors="coerce")
         for column in ["open", "high", "low", "close"]:
@@ -189,7 +193,9 @@ class Mt5Client:
                     "broker_symbol": symbol,
                     "currentUnits": signed_units,
                     "initialUnits": signed_units,
-                    "openTime": _mt5_time_to_datetime(raw.get("time")),
+                    "openTime": _mt5_time_to_datetime(
+                        raw.get("time"), self.settings.time_offset_seconds
+                    ),
                     "price": _safe_float(raw.get("price_open")),
                     "realizedPL": 0.0,
                     "financing": _safe_float(raw.get("swap")),
@@ -514,7 +520,11 @@ class Mt5Client:
         if tick is None:
             self._mark_disconnected()
             raise Mt5Error(f"MT5 symbol_info_tick failed for {symbol}: {mt5.last_error()}")
-        return PriceSnapshot.from_mt5(instrument, tick)
+        return PriceSnapshot.from_mt5(
+            instrument,
+            tick,
+            time_offset_seconds=self.settings.time_offset_seconds,
+        )
 
     def _conversion_rates(self, prices: dict[str, PriceSnapshot]) -> dict[str, float]:
         account = self._account_currency()
@@ -675,7 +685,9 @@ class Mt5Client:
                     "instrument": name,
                     "side": Side.SHORT.value if _safe_int(payload.get("type"), buy_deal) == buy_deal else Side.LONG.value,
                     "units": 0.0,
-                    "exit_time": _mt5_time_to_datetime(payload.get("time")),
+                    "exit_time": _mt5_time_to_datetime(
+                        payload.get("time"), self.settings.time_offset_seconds
+                    ),
                     "exit_price": _safe_float(payload.get("price")),
                     "realized_pl": 0.0,
                     "financing": 0.0,
@@ -690,7 +702,9 @@ class Mt5Client:
                 + _safe_float(payload.get("fee"))
             )
             event["financing"] += _safe_float(payload.get("swap"))
-            deal_time = _mt5_time_to_datetime(payload.get("time"))
+            deal_time = _mt5_time_to_datetime(
+                payload.get("time"), self.settings.time_offset_seconds
+            )
             if deal_time and (event["exit_time"] is None or deal_time > event["exit_time"]):
                 event["exit_time"] = deal_time
                 event["exit_price"] = _safe_float(payload.get("price"), event["exit_price"])
@@ -820,11 +834,11 @@ def _safe_int(value: Any, default: int = 0) -> int:
         return default
 
 
-def _mt5_time_to_datetime(value: Any) -> datetime | None:
+def _mt5_time_to_datetime(value: Any, offset_seconds: int = 0) -> datetime | None:
     if value in (None, ""):
         return None
     try:
-        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        return datetime.fromtimestamp(float(value) + offset_seconds, tz=timezone.utc)
     except (TypeError, ValueError, OSError):
         return None
 
