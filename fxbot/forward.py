@@ -683,6 +683,14 @@ class ForwardTestWorker:
         submitted = False
         legs = self._order_legs(intent, risk, instrument)
         for leg_name, units, take_profit in legs:
+            if not self._tp_candle_still_current(intent, instrument):
+                self.journal.log_event(
+                    "tp_candle_expired",
+                    "TP reference candle expired before order submission",
+                    level="warning",
+                    payload={"instrument": instrument.name, "leg": leg_name},
+                )
+                return submitted
             if self.journal.get_state().state != BotRunState.RUNNING.value:
                 return submitted
             client_id = client_order_id(intent, leg_name)

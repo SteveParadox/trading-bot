@@ -33,6 +33,7 @@ class ExecutableEntryPriceTests(unittest.TestCase):
         price = PriceSnapshot("EUR_USD", bid=1.1000, ask=1.1003, time=FIXED_NOW)
 
         self.assertEqual(executable_entry_price(price, Side.LONG), 1.1003)
+        self.assertEqual(executable_entry_price(price, Side.SHORT), 1.1000)
 
     def test_tp_reference_requires_same_closed_five_minute_bar(self) -> None:
         frame = trending_frame(1.08, 0.0001)
@@ -53,9 +54,32 @@ class ExecutableEntryPriceTests(unittest.TestCase):
             rolled.index += pd.Timedelta(minutes=5)
             worker.client.candles = lambda *args: rolled
             self.assertFalse(ForwardTestWorker._tp_candle_still_current(worker, intent, FxInstrument("EUR_USD")))
-        self.assertEqual(executable_entry_price(price, Side.SHORT), 1.1000)
 
+    def test_split_order_stops_when_tp_candle_rolls_over_between_legs(self) -> None:
+        settings = FxBotSettings(strategy=StrategySettings(tp_timeframe="5m"))
+        response = {"orderCreateTransaction": {"id": "42"},
+                    "orderFillTransaction": {"tradeOpened": {"tradeID": "99"}}}
+        client = Mock()
+        client.create_market_order.return_value = response
+        journal = Mock()
+        journal.get_state.return_value.state = BotRunState.RUNNING.value
+        journal.reserve_order.return_value = (Mock(), True)
+        worker = ForwardTestWorker(settings, client=client, journal=journal)
+        worker._order_legs = Mock(return_value=[("tp1", 1000, 1.102), ("tp2", 1000, None)])
+        worker._tp_candle_still_current = Mock(side_effect=[True, False])
+        worker._broker_order_if_exists = Mock(return_value=None)
+        worker._record_fill_trade = Mock()
+        intent = FxSignalIntent(instrument="EUR_USD", side=Side.LONG, timestamp=FIXED_NOW,
+                                entry_price=1.1, signal_row={"atr": 0.001})
+        risk = FxRiskDecision(allowed=True, reason="accepted", units=2000, risk_amount=20,
+                              exit_plan=FxExitPlan(1.099, 1.102, 0.001, 0.002, 2, 10, 20))
 
+        self.assertTrue(worker._submit_idempotent(intent, FxInstrument("EUR_USD"), risk))
+        self.assertEqual(client.create_market_order.call_count, 1)
+        journal.log_event.assert_any_call("tp_candle_expired",
+                                          "TP reference candle expired before order submission",
+                                          level="warning", payload={"instrument": "EUR_USD", "leg": "tp2"})
+        worker.close()
 def trending_frame(start: float, step: float, rows: int = 120) -> pd.DataFrame:
     index = pd.date_range("2026-01-05T08:00:00Z", periods=rows, freq="15min")
     closes = [start + i * step for i in range(rows)]

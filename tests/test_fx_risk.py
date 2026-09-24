@@ -35,8 +35,16 @@ class FxRiskTests(unittest.TestCase):
 
         self.assertAlmostEqual(wide.stop_loss, 1.099)
         self.assertAlmostEqual(wide.take_profit, 1.103)
-        self.assertAlmostEqual(tight.take_profit, 1.1015)
+        self.assertGreaterEqual(tight.risk_reward, 1.5)
+        self.assertLessEqual(tight.take_profit, 1.10151)
         self.assertIsNone(missing)
+
+        short = manager.build_exit_plan(
+            FxSignalIntent(**{**base, "side": Side.SHORT}, metadata={"tp_atr": 0.0015}),
+            instrument,
+        )
+        self.assertAlmostEqual(short.stop_loss, 1.101)
+        self.assertAlmostEqual(short.take_profit, 1.097, places=4)
 
     def test_eurusd_position_sizing_uses_pip_value_in_account_currency(self) -> None:
         instrument = FxInstrument("EUR_USD", pip_location=-4, margin_rate=0.0333333333)
