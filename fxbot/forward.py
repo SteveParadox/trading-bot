@@ -402,6 +402,23 @@ class ForwardTestWorker:
         intent = replace(intent, timestamp=signal_time, metadata={**intent.metadata, "execution_cost_price":
             self.settings.strategy.execution_cost_pips_round_trip * instrument.pip_size})
 
+        tp_timeframe = self.settings.strategy.tp_timeframe
+        if tp_timeframe is not None:
+            tp_frame = entry_frame if tp_timeframe == self.settings.strategy.entry_timeframe else self.client.candles(
+                instrument.name, tp_timeframe, self.settings.strategy.candle_limit
+            )
+            if not candles_are_current(tp_frame, tp_timeframe, now, self.settings.runtime.max_price_age_seconds):
+                self._skip(now, instrument.name, "stale_or_invalid_tp_candles", {"timeframe": tp_timeframe})
+                return
+            tp_row = last_closed_row(prepare_indicators(tp_frame), tp_timeframe, timestamp=now)
+            tp_atr = float(tp_row.get("atr") or 0.0) if tp_row is not None else 0.0
+            if not math.isfinite(tp_atr) or tp_atr <= 0:
+                self._skip(now, instrument.name, "tp_atr_unavailable", {"timeframe": tp_timeframe})
+                return
+            intent = replace(intent, metadata={**intent.metadata, "tp_atr": tp_atr,
+                                              "tp_timeframe": tp_timeframe,
+                                              "tp_candle_time": tp_row.name.isoformat()})
+
         sniper = None
         if self.settings.sniper.mode != "off":
             window = last_closed_window(entry_frame, self.settings.strategy.entry_timeframe, timestamp=decision_time)
@@ -598,7 +615,24 @@ class ForwardTestWorker:
         if self.settings.sniper.mode == "enforce" and not self._revalidate_sniper_execution(intent, instrument, risk):
             self.journal.update_signal(signal_row.id, status="rejected", reason="SNIPER_REJECT_REVALIDATION")
             return
+        if self.settings.strategy.tp_timeframe is not None and not self._tp_candle_still_current(intent, instrument):
+            self.journal.update_signal(signal_row.id, status="rejected", reason="tp_candle_expired")
+            return
         return self._submit_idempotent(intent, instrument, risk)
+
+    def _tp_candle_still_current(self, intent: FxSignalIntent, instrument: FxInstrument) -> bool:
+        timeframe = self.settings.strategy.tp_timeframe
+        if timeframe is None:
+            return True
+        now = datetime.now(timezone.utc)
+        try:
+            frame = self.client.candles(instrument.name, timeframe, self.settings.strategy.candle_limit)
+            if not candles_are_current(frame, timeframe, now, self.settings.runtime.max_price_age_seconds):
+                return False
+            row = last_closed_row(frame, timeframe, timestamp=now)
+            return row is not None and row.name.isoformat() == intent.metadata.get("tp_candle_time")
+        except (Mt5Error, ValueError, KeyError):
+            return False
 
     def _revalidate_sniper_execution(self, intent: FxSignalIntent, instrument: FxInstrument, risk: FxRiskDecision) -> bool:
         """Never let an AI delay grandfather expired deterministic approval."""
@@ -633,6 +667,8 @@ class ForwardTestWorker:
                                              snapshot_quote_factor=price.quote_to_home_factor, now=now)
         if not fresh_risk.allowed or fresh_risk.units < risk.units:
             return False
+        if not self._tp_candle_still_current(intent, instrument):
+            return False
         spread = price.ask - price.bid
         if price.spread_pips(instrument) > self.settings.strategy.max_spread_pips or spread / intent.signal_row["atr"] > self.settings.strategy.max_spread_atr_ratio:
             return False
@@ -647,6 +683,14 @@ class ForwardTestWorker:
         submitted = False
         legs = self._order_legs(intent, risk, instrument)
         for leg_name, units, take_profit in legs:
+            if not self._tp_candle_still_current(intent, instrument):
+                self.journal.log_event(
+                    "tp_candle_expired",
+                    "TP reference candle expired before order submission",
+                    level="warning",
+                    payload={"instrument": instrument.name, "leg": leg_name},
+                )
+                return submitted
             if self.journal.get_state().state != BotRunState.RUNNING.value:
                 return submitted
             client_id = client_order_id(intent, leg_name)
