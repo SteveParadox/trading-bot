@@ -33,6 +33,26 @@ class ExecutableEntryPriceTests(unittest.TestCase):
         price = PriceSnapshot("EUR_USD", bid=1.1000, ask=1.1003, time=FIXED_NOW)
 
         self.assertEqual(executable_entry_price(price, Side.LONG), 1.1003)
+
+    def test_tp_reference_requires_same_closed_five_minute_bar(self) -> None:
+        frame = trending_frame(1.08, 0.0001)
+        frame.index = pd.date_range(end=pd.Timestamp(FIXED_NOW) - pd.Timedelta(minutes=5),
+                                    periods=len(frame), freq="5min")
+        tp_bar = frame.index[-1].isoformat()
+        worker = SimpleNamespace(
+            settings=FxBotSettings(strategy=StrategySettings(tp_timeframe="5m")),
+            client=SimpleNamespace(candles=lambda *args: frame),
+        )
+        intent = FxSignalIntent(instrument="EUR_USD", side=Side.LONG,
+                                timestamp=FIXED_NOW, entry_price=1.1,
+                                signal_row={"atr": 0.001}, metadata={"tp_candle_time": tp_bar})
+
+        with patch("fxbot.forward.datetime", FixedDatetime):
+            self.assertTrue(ForwardTestWorker._tp_candle_still_current(worker, intent, FxInstrument("EUR_USD")))
+            rolled = frame.copy()
+            rolled.index += pd.Timedelta(minutes=5)
+            worker.client.candles = lambda *args: rolled
+            self.assertFalse(ForwardTestWorker._tp_candle_still_current(worker, intent, FxInstrument("EUR_USD")))
         self.assertEqual(executable_entry_price(price, Side.SHORT), 1.1000)
 
 

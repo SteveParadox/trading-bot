@@ -44,11 +44,26 @@ FX_MT5_TIME_OFFSET_SECONDS=0
 FX_API_KEY=change-this-demo-control-key
 FX_INSTRUMENTS=EUR_USD,GBP_USD,USD_JPY,AUD_USD
 MT5_SYMBOL_MAP=EUR_USD=EURUSD,GBP_USD=GBPUSD,USD_JPY=USDJPY,AUD_USD=AUDUSD
+# Optional: keep M15 entries and H1 trend confirmation, derive TP from M5 ATR.
+FX_ENTRY_TIMEFRAME=15m
+FX_HTF_TIMEFRAME=1h
+FX_TP_TIMEFRAME=5m
+FX_TP_ATR_MULTIPLIER=1.5
 ```
 
 If your broker uses suffixed symbols such as `EURUSD.a`, set
 `MT5_SYMBOL_MAP=EUR_USD=EURUSD.a,...`. The strategy keeps underscore pair
 names internally and sends the mapped symbol to MT5.
+
+With `FX_TP_TIMEFRAME=5m`, the entry setup and protective stop still use
+the 15-minute candles. The first target uses the latest completed 5-minute
+ATR times `FX_TP_ATR_MULTIPLIER`, subject to the existing minimum 1.5R
+risk/reward floor. The larger distance wins, so a low M5 ATR will not by
+itself create a closer TP. The bot skips entry when the M5 candle is stale or
+missing and verifies it has not rolled over before submitting the order.
+Remove or leave `FX_TP_TIMEFRAME` empty to retain the previous target logic.
+Changing settings affects only new positions; existing broker TP orders are
+not updated. Test the configuration on demo before interpreting results.
 
 MT5 timestamps should normally be UTC, so leave `FX_MT5_TIME_OFFSET_SECONDS=0`.
 If a direct host-versus-quote measurement proves that every broker timestamp

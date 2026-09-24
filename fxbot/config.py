@@ -304,6 +304,10 @@ class StrategySettings:
     atr_sl_multiplier: float = 1.8
     trailing_atr_multiplier: float = 1.4
     runner_take_profit_r: float | None = None
+    # Optional faster volatility reference for TP1; entry and stop stay on
+    # entry_timeframe. None preserves the existing risk/reward target.
+    tp_timeframe: str | None = None
+    tp_atr_multiplier: float = 1.5
     breakeven_buffer_pips: float = 0.2
     execution_cost_pips_round_trip: float = 0.0
     partial_tp_enabled: bool = True
@@ -371,6 +375,10 @@ class StrategySettings:
             raise ValueError("unsupported FX entry timeframe")
         if self.htf_timeframe not in {"1h", "4h", "1d"}:
             raise ValueError("unsupported FX HTF timeframe")
+        if self.tp_timeframe is not None and self.tp_timeframe not in {"5m", "15m", "30m", "1h"}:
+            raise ValueError("unsupported FX TP timeframe")
+        if not math.isfinite(self.tp_atr_multiplier) or self.tp_atr_multiplier <= 0:
+            raise ValueError("strategy.tp_atr_multiplier must be finite and positive")
         if self.min_stop_pips is not None and self.max_stop_pips is not None and self.min_stop_pips > self.max_stop_pips:
             raise ValueError("strategy.min_stop_pips cannot exceed max_stop_pips")
         if self.min_atr_pips is not None and self.max_atr_pips is not None and self.min_atr_pips > self.max_atr_pips:
@@ -643,6 +651,8 @@ def settings_from_env() -> FxBotSettings:
             atr_sl_multiplier=_get_float("FX_ATR_SL_MULTIPLIER", 1.8),
             trailing_atr_multiplier=_get_float("FX_TRAILING_ATR_MULTIPLIER", 1.4),
             runner_take_profit_r=_get_optional_float("FX_RUNNER_TAKE_PROFIT_R"),
+            tp_timeframe=_get_str("FX_TP_TIMEFRAME", "").lower() or None,
+            tp_atr_multiplier=_get_float("FX_TP_ATR_MULTIPLIER", 1.5),
             breakeven_buffer_pips=_get_float("FX_BREAKEVEN_BUFFER_PIPS", 0.2),
             execution_cost_pips_round_trip=_get_float("FX_EXECUTION_COST_PIPS_ROUND_TRIP", 0.0),
             partial_tp_enabled=_get_bool("FX_PARTIAL_TP_ENABLED", True),

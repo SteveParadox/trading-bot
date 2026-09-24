@@ -209,14 +209,14 @@ class FxRiskManager:
             if stop_loss >= entry:
                 return None
             risk_distance = entry - stop_loss
-            take_profit = self._target_price(intent.side, entry, risk_distance, instrument)
+            take_profit = self._target_price(intent.side, entry, risk_distance, instrument, intent)
             reward_distance = take_profit - entry
         else:
             stop_loss = instrument.round_price(raw_stop)
             if stop_loss <= entry:
                 return None
             risk_distance = stop_loss - entry
-            take_profit = self._target_price(intent.side, entry, risk_distance, instrument)
+            take_profit = self._target_price(intent.side, entry, risk_distance, instrument, intent)
             reward_distance = entry - take_profit
 
         stop_pips = pips_between(instrument, entry, stop_loss)
@@ -262,11 +262,20 @@ class FxRiskManager:
         entry_price: float,
         risk_distance: float,
         instrument: FxInstrument,
+        intent: FxSignalIntent,
     ) -> float:
+        target_distance = risk_distance * self.strategy.min_risk_reward
+        if self.strategy.tp_timeframe is not None:
+            # Refuse missing/invalid M5 data rather than reverting silently to
+            # an unconfigured target when the TP timeframe was requested.
+            tp_atr = float(intent.metadata.get("tp_atr") or 0.0)
+            if not math.isfinite(tp_atr) or tp_atr <= 0:
+                return entry_price
+            target_distance = max(target_distance, tp_atr * self.strategy.tp_atr_multiplier)
         raw = (
-            entry_price + risk_distance * self.strategy.min_risk_reward
+            entry_price + target_distance
             if side is Side.LONG
-            else entry_price - risk_distance * self.strategy.min_risk_reward
+            else entry_price - target_distance
         )
         tick = 10.0 ** (-instrument.display_precision)
         for _ in range(20):
