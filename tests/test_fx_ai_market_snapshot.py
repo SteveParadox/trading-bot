@@ -67,6 +67,7 @@ def test_market_snapshot_contains_causal_candidate_state() -> None:
         currency_exposures={"EUR": 1_100, "USD": -1_100},
     )
     snapshot = build_market_snapshot(
+        candidate_id="fxsig-EURUSD-test",
         intent=intent,
         instrument=instrument,
         price=PriceSnapshot("EUR_USD", bid=1.1000, ask=1.1002, time=NOW),
@@ -88,6 +89,7 @@ def test_market_snapshot_contains_causal_candidate_state() -> None:
 
     payload = snapshot.to_dict()
     assert payload["version"] == MARKET_SNAPSHOT_VERSION
+    assert payload["candidate_id"] == "fxsig-EURUSD-test"
     assert payload["symbol"] == "EUR_USD"
     assert payload["direction"] == "LONG"
     assert payload["bid"] == 1.1000
@@ -118,6 +120,7 @@ def test_market_snapshot_excludes_forming_candle() -> None:
     forming_index = frame.index[-1]
     frame.loc[forming_index, ["open", "high", "low", "close"]] = [9.0, 10.0, 0.1, 9.5]
     snapshot = build_market_snapshot(
+        candidate_id="fxsig-EURUSD-forming",
         intent=FxSignalIntent(
             instrument="EUR_USD",
             side=Side.LONG,
