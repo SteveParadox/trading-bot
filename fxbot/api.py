@@ -714,6 +714,13 @@ def _config_payload(settings: FxBotSettings) -> dict[str, Any]:
     ai_payload["api_key_configured"] = bool(settings.ai.api_key)
     ai_payload["endpoint_configured"] = bool(settings.ai.endpoint)
     payload["ai"] = ai_payload
+    payload["ml_prediction"] = {
+        "mode": settings.ml_prediction.mode,
+        "target": settings.ml_prediction.target,
+        "verify_hash": settings.ml_prediction.verify_hash,
+        "model_path_configured": bool(settings.ml_prediction.model_path),
+        "metadata_path_configured": bool(settings.ml_prediction.metadata_path),
+    }
     payload["broker"] = {
         "provider": settings.broker.provider,
         "server": redact(settings.broker.server),
