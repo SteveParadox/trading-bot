@@ -47,7 +47,7 @@ from fxbot.ai_deliberation import (
     validate_ai_audit_response,
 )
 from fxbot.ai_contract import AiTradeDecision
-from fxbot.market_snapshot import build_market_snapshot
+from fxbot.market_snapshot import build_market_snapshot, build_news_context
 from fxbot.operations import clock_health
 from fxbot.security import code_version, data_hash, experiment_manifest, strategy_config_hash
 from fxbot.sniper import qualify_entry, qualify_execution, exit_reason
@@ -367,24 +367,11 @@ class ForwardTestWorker:
         last_close = float(signal_row["close"])
         atr_price = float(signal_row.get("atr") or 0.0)
         spread_price = price.ask - price.bid
-        if atr_price <= 0 or spread_price <= 0:
-            self._skip(now, instrument.name, "volatility_or_spread_unavailable")
-            return
-        spread_atr_ratio = spread_price / atr_price
-        if spread_atr_ratio > self.settings.strategy.max_spread_atr_ratio:
-            self._skip(
-                now,
-                instrument.name,
-                "spread_to_atr_filter",
-                {"spread_atr_ratio": spread_atr_ratio, "max": self.settings.strategy.max_spread_atr_ratio},
-            )
-            return
         executable_entry = executable_entry_price(price, decision.signal)
-        deviation_pips = abs(executable_entry - last_close) / instrument.pip_size
-        if deviation_pips > self.settings.strategy.max_entry_deviation_pips:
-            self._skip(now, instrument.name, "entry_deviation_filter", {"deviation_pips": deviation_pips})
-            return
 
+        # A candidate exists once the strategy has proposed a direction. Build
+        # its durable identity and first-observation record before later
+        # spread/risk/AI filters can reject it.
         intent = build_signal_intent(
             entry_frame,
             htf_frame,
@@ -399,10 +386,128 @@ class ForwardTestWorker:
             return
 
         # Keep order identity stable across scans of the same closed signal bar.
-        # Evaluation uses current UTC so higher-timeframe closure stays accurate.
         signal_time = (signal_row.name + TIMEFRAME_DELTAS[self.settings.strategy.entry_timeframe]).to_pydatetime()
-        intent = replace(intent, timestamp=signal_time, metadata={**intent.metadata, "execution_cost_price":
-            self.settings.strategy.execution_cost_pips_round_trip * instrument.pip_size})
+        intent = replace(
+            intent,
+            timestamp=signal_time,
+            metadata={
+                **intent.metadata,
+                "execution_cost_price": self.settings.strategy.execution_cost_pips_round_trip * instrument.pip_size,
+            },
+        )
+        candidate_id = parent_signal_id_for(intent)
+        ai_decision_space = [candidate_decision.value for candidate_decision in AiTradeDecision]
+        provisional_exit_plan = self.risk.build_exit_plan(intent, instrument)
+        news_context_payload = build_news_context(
+            symbol=instrument.name,
+            events=news_snapshot.events,
+            observed_at=now,
+            stale=news_snapshot.stale,
+            age_seconds=news_snapshot.age_seconds,
+            last_updated=news_snapshot.last_updated,
+            source=news_snapshot.source,
+            before_minutes=self.settings.strategy.news_blackout_before_minutes,
+            after_minutes=self.settings.strategy.news_blackout_after_minutes,
+        ).to_dict()
+        market_snapshot_payload: dict[str, Any] | None = None
+        try:
+            market_snapshot_payload = build_market_snapshot(
+                candidate_id=candidate_id,
+                intent=intent,
+                instrument=instrument,
+                price=price,
+                entry_frame=entry_frame,
+                timeframe=self.settings.strategy.entry_timeframe,
+                portfolio=portfolio,
+                exit_plan=provisional_exit_plan,
+                observed_at=now,
+                sessions=active_sessions(now),
+                news_events=news_snapshot.events,
+                news_stale=news_snapshot.stale,
+                news_age_seconds=news_snapshot.age_seconds,
+                news_last_updated=news_snapshot.last_updated,
+                news_source=news_snapshot.source,
+                news_before_minutes=self.settings.strategy.news_blackout_before_minutes,
+                news_after_minutes=self.settings.strategy.news_blackout_after_minutes,
+            ).to_dict()
+            self.journal.log_event(
+                "candidate_market_snapshot",
+                f"{instrument.name} {intent.side.value} candidate snapshot captured",
+                payload={
+                    "candidate_id": candidate_id,
+                    "market_snapshot": market_snapshot_payload,
+                    "ai_decision_space": ai_decision_space,
+                },
+            )
+        except Exception as exc:
+            self.journal.log_event(
+                "candidate_market_snapshot_failed",
+                f"{instrument.name} candidate snapshot failed: {type(exc).__name__}",
+                level="warning",
+                payload={"candidate_id": candidate_id},
+            )
+        intent = replace(
+            intent,
+            metadata={
+                **intent.metadata,
+                "candidate_id": candidate_id,
+                "market_snapshot": market_snapshot_payload,
+                "news_context": news_context_payload,
+                "ai_decision_space": ai_decision_space,
+            },
+        )
+        self.journal.record_candidate(
+            candidate_id=candidate_id,
+            timestamp=now,
+            symbol=instrument.name,
+            direction=intent.side.value,
+            entry=executable_entry,
+            stop_loss=provisional_exit_plan.stop_loss if provisional_exit_plan else None,
+            take_profit=provisional_exit_plan.take_profit if provisional_exit_plan else None,
+            spread=spread_price,
+            atr=market_snapshot_payload.get("atr") if market_snapshot_payload else atr_price,
+            momentum=market_snapshot_payload.get("momentum") if market_snapshot_payload else None,
+            trend_strength=market_snapshot_payload.get("trend_strength") if market_snapshot_payload else float(signal_row.get("adx") or 0.0),
+            news_risk=news_context_payload,
+            strategy_signal=str(intent.metadata.get("decision") or decision.reason),
+            status="generated",
+            payload={
+                "market_snapshot": market_snapshot_payload,
+                "ai_decision_space": ai_decision_space,
+                "hard_news_gate": "passed",
+                "signal_score": intent.score,
+                "signal_time": intent.timestamp.isoformat(),
+            },
+            strategy_hash=self.strategy_hash,
+            code_version=self.code_version,
+            data_hash=data_hash({"instrument": instrument.name, "decision_time": decision_time.isoformat(), "signal": intent.signal_row}),
+            experiment_manifest_hash=self.journal.experiment_manifest_hash,
+        )
+
+        if atr_price <= 0 or spread_price <= 0:
+            self.journal.update_candidate(candidate_id, status="rejected", rejection_reason="volatility_or_spread_unavailable")
+            self._skip(now, instrument.name, "volatility_or_spread_unavailable", {"candidate_id": candidate_id})
+            return
+        spread_atr_ratio = spread_price / atr_price
+        if spread_atr_ratio > self.settings.strategy.max_spread_atr_ratio:
+            self.journal.update_candidate(candidate_id, status="rejected", rejection_reason="spread_to_atr_filter")
+            self._skip(
+                now,
+                instrument.name,
+                "spread_to_atr_filter",
+                {"candidate_id": candidate_id, "spread_atr_ratio": spread_atr_ratio, "max": self.settings.strategy.max_spread_atr_ratio},
+            )
+            return
+        deviation_pips = abs(executable_entry - last_close) / instrument.pip_size
+        if deviation_pips > self.settings.strategy.max_entry_deviation_pips:
+            self.journal.update_candidate(candidate_id, status="rejected", rejection_reason="entry_deviation_filter")
+            self._skip(
+                now,
+                instrument.name,
+                "entry_deviation_filter",
+                {"candidate_id": candidate_id, "deviation_pips": deviation_pips},
+            )
+            return
 
         tp_timeframe = self.settings.strategy.tp_timeframe
         if tp_timeframe is not None:
@@ -446,55 +551,6 @@ class ForwardTestWorker:
             if self.settings.sniper.mode == "enforce" and self.settings.sniper.slippage_pips_per_side is not None and self.settings.sniper.commission_pips_round_trip is not None:
                 extra_cost = max(intent.metadata["execution_cost_price"], instrument.pip_size * (2 * self.settings.sniper.slippage_pips_per_side + self.settings.sniper.commission_pips_round_trip))
                 intent = replace(intent, metadata={**intent.metadata, "execution_cost_price": extra_cost})
-
-        # Capture the complete candidate state before risk/AI can affect the
-        # execution path. This is observation-only: the strategy still creates
-        # candidates and deterministic risk remains authoritative.
-        provisional_exit_plan = self.risk.build_exit_plan(intent, instrument)
-        candidate_id = parent_signal_id_for(intent)
-        ai_decision_space = [decision.value for decision in AiTradeDecision]
-        market_snapshot_payload: dict[str, Any] | None = None
-        try:
-            market_snapshot_payload = build_market_snapshot(
-                candidate_id=candidate_id,
-                intent=intent,
-                instrument=instrument,
-                price=price,
-                entry_frame=entry_frame,
-                timeframe=self.settings.strategy.entry_timeframe,
-                portfolio=portfolio,
-                exit_plan=provisional_exit_plan,
-                observed_at=now,
-                sessions=active_sessions(now),
-            ).to_dict()
-            self.journal.log_event(
-                "candidate_market_snapshot",
-                f"{instrument.name} {intent.side.value} candidate snapshot captured",
-                payload={
-                    "candidate_id": candidate_id,
-                    "market_snapshot": market_snapshot_payload,
-                    "ai_decision_space": ai_decision_space,
-                },
-            )
-        except Exception as exc:
-            # The snapshot layer is observation-only in this phase. A feature
-            # extraction defect must be visible, but it must not silently alter
-            # the existing deterministic strategy/risk/execution behavior.
-            self.journal.log_event(
-                "candidate_market_snapshot_failed",
-                f"{instrument.name} candidate snapshot failed: {type(exc).__name__}",
-                level="warning",
-                payload={"candidate_id": candidate_id},
-            )
-        intent = replace(
-            intent,
-            metadata={
-                **intent.metadata,
-                "candidate_id": candidate_id,
-                "market_snapshot": market_snapshot_payload,
-                "ai_decision_space": ai_decision_space,
-            },
-        )
 
         risk = self.risk.evaluate_intent(
             intent,
