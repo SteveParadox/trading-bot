@@ -6,7 +6,7 @@ It never feeds future observations back into live candidate features.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import math
 from typing import Any, Mapping
 
@@ -47,6 +47,7 @@ class CandidateOutcomeTracker:
         self.journal = journal
         self.observation_lag_tolerance_seconds = float(observation_lag_tolerance_seconds)
         self.candidate_scan_limit = max(100, int(candidate_scan_limit))
+        self._reconciled_history = False
 
     def seed(
         self,
@@ -93,7 +94,19 @@ class CandidateOutcomeTracker:
         """Update all recent candidates with currently observed executable quotes."""
 
         now = _utc(observed_at)
-        candidates = self.journal.recent_candidates(limit=self.candidate_scan_limit)
+        if not self._reconciled_history:
+            # One startup pass repairs rows left incomplete by a restart. Later
+            # scans stay bounded to the active 30-minute labeling horizon.
+            candidates = self.journal.recent_candidates(limit=self.candidate_scan_limit)
+            self._reconciled_history = True
+        else:
+            candidates = self.journal.candidates_since(
+                now - timedelta(
+                    seconds=MAX_OUTCOME_HORIZON_SECONDS
+                    + self.observation_lag_tolerance_seconds
+                ),
+                limit=self.candidate_scan_limit,
+            )
         for candidate in candidates:
             started = _utc(candidate.timestamp)
             age = (now - started).total_seconds()
