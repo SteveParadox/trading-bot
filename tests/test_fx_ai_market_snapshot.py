@@ -6,6 +6,7 @@ import pandas as pd
 import pytest
 
 from fxbot.ai_contract import AiCandidateEvaluator, AiTradeDecision, validate_ai_trade_recommendation
+from fxbot.config import NewsEvent
 from fxbot.instruments import FxInstrument, PriceSnapshot
 from fxbot.market_snapshot import MARKET_SNAPSHOT_VERSION, build_market_snapshot
 from fxbot.models import FxPortfolioState, FxSignalIntent, Side
@@ -103,6 +104,30 @@ def test_market_snapshot_contains_causal_candidate_state() -> None:
         ),
         observed_at=NOW,
         sessions={"london", "new_york"},
+        news_events=[
+            NewsEvent(
+                "US CPI",
+                "USD",
+                "high",
+                NOW + timedelta(minutes=12),
+                NOW + timedelta(minutes=27),
+                impact_score=95,
+            ),
+            NewsEvent(
+                "ECB Remarks",
+                "EUR",
+                "medium",
+                NOW - timedelta(minutes=10),
+                NOW,
+                impact_score=55,
+            ),
+        ],
+        news_stale=False,
+        news_age_seconds=42.0,
+        news_last_updated=NOW - timedelta(seconds=42),
+        news_source="forexfactory",
+        news_before_minutes=30,
+        news_after_minutes=30,
     )
 
     payload = snapshot.to_dict()
@@ -131,6 +156,18 @@ def test_market_snapshot_contains_causal_candidate_state() -> None:
     assert payload["current_exposure"]["portfolio_risk"] == 120
     assert payload["current_exposure"]["gross_exposure"] == 3_500
     assert payload["current_exposure"]["pair_exposure"] == 1_100
+    news = payload["news_context"]
+    assert news["upcoming_event"]["name"] == "US CPI"
+    assert news["upcoming_event"]["impact_level"] == "HIGH"
+    assert news["upcoming_event"]["currency"] == "USD"
+    assert news["upcoming_event"]["minutes_until_event"] == pytest.approx(12.0)
+    assert news["recent_event"]["name"] == "ECB Remarks"
+    assert news["event_just_occurred"] is True
+    assert news["freshness"]["state"] == "FRESH"
+    assert news["freshness"]["stale"] is False
+    assert news["freshness"]["age_seconds"] == 42.0
+    assert news["freshness"]["source"] == "forexfactory"
+    assert news["risk_level"] == "HIGH"
 
 
 def test_market_snapshot_excludes_forming_candle() -> None:
@@ -154,9 +191,46 @@ def test_market_snapshot_excludes_forming_candle() -> None:
         exit_plan=None,
         observed_at=NOW,
         sessions=set(),
+        news_events=[],
+        news_stale=False,
+        news_age_seconds=5.0,
+        news_last_updated=NOW - timedelta(seconds=5),
+        news_source="forexfactory",
+        news_before_minutes=30,
+        news_after_minutes=30,
     )
     assert all(candle.timestamp < forming_index.to_pydatetime() for candle in snapshot.recent_candles)
     assert max(candle.high for candle in snapshot.recent_candles) < 2.0
+
+
+def test_stale_news_is_explicitly_unknown_to_ai_context() -> None:
+    from fxbot.market_snapshot import build_news_context
+
+    context = build_news_context(
+        symbol="EUR_USD",
+        events=[
+            NewsEvent(
+                "US Payrolls",
+                "USD",
+                "high",
+                NOW + timedelta(minutes=20),
+                NOW + timedelta(minutes=35),
+                impact_score=100,
+            )
+        ],
+        observed_at=NOW,
+        stale=True,
+        age_seconds=4000,
+        last_updated=NOW - timedelta(seconds=4000),
+        source="forexfactory",
+        before_minutes=30,
+        after_minutes=30,
+    ).to_dict()
+    assert context["upcoming_event"]["currency"] == "USD"
+    assert context["upcoming_event"]["minutes_until_event"] == pytest.approx(20.0)
+    assert context["freshness"]["state"] == "UNKNOWN"
+    assert context["freshness"]["stale"] is True
+    assert context["risk_level"] == "UNKNOWN"
 
 
 def _frame() -> pd.DataFrame:
