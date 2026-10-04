@@ -6,6 +6,8 @@ from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pandas as pd
+
 from fxbot.journal import StructuredJournal, row_to_dict
 from fxbot.models import BotRunState
 from fxbot.config import BrokerSettings, FxBotSettings, RuntimeSettings
