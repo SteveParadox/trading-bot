@@ -468,6 +468,14 @@ def validate_ai_audit_response(raw: dict[str, Any]) -> AiAuditResponse:
     }
     if set(raw) == legacy_required:
         legacy = _enum(raw["decision"], {"CONFIRM", "FLAG", "REJECT"}, "decision")
+        legacy_action = _enum(raw["recommended_action"], {"ALLOW", "FLAG", "REJECT"}, "recommended_action")
+        expected_actions = {
+            "CONFIRM": {"ALLOW"},
+            "FLAG": {"ALLOW", "FLAG"},
+            "REJECT": {"REJECT"},
+        }
+        if legacy_action not in expected_actions[legacy]:
+            raise AiResponseValidationError("legacy decision and recommended_action are inconsistent")
         mapping = {
             "CONFIRM": ("TAKE", ["legacy_confirm"]),
             "FLAG": ("WAIT", ["legacy_flag"]),
