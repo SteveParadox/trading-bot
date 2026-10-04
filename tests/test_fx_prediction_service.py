@@ -1,0 +1,212 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import joblib
+import pandas as pd
+import pytest
+
+from fxbot.ai.feature_builder import FEATURE_BUILDER_VERSION, build_prediction_features
+from fxbot.ai.model_loader import ModelLoadError, VersionedModelLoader
+from fxbot.ai.predictor import PredictionService
+from fxbot.ai.schemas import PredictionRequest
+from fxbot.config import MlPredictionSettings
+from fxbot.training_dataset import FEATURE_COLUMNS
+
+
+class _ProbModel:
+    def __init__(self, probability: float = 0.83) -> None:
+        self.probability = probability
+
+    def predict_proba(self, frame):
+        assert list(frame.columns) == FEATURE_COLUMNS
+        return [[1.0 - self.probability, self.probability]]
+
+
+class _FakeLoader:
+    def __init__(self, probability: float = 0.83) -> None:
+        self.calls = 0
+        self.artifact = SimpleNamespace(
+            model=_ProbModel(probability),
+            metadata={},
+            model_name="XGBoost",
+            model_version="xgb_tp_before_sl_v1",
+            model_hash="abc123",
+            target="TP_BEFORE_SL",
+        )
+
+    def load(self):
+        self.calls += 1
+        return self.artifact
+
+
+def _request() -> PredictionRequest:
+    snapshot = {
+        "version": "v1",
+        "candidate_id": "fxsig-1",
+        "symbol": "EUR_USD",
+        "timestamp": "2026-10-04T14:30:00+00:00",
+        "direction": "LONG",
+        "bid": 1.1000,
+        "ask": 1.1002,
+        "spread": 0.0002,
+        "spread_pips": 2.0,
+        "atr": 0.0010,
+        "rsi": 58.0,
+        "momentum": 0.7,
+        "trend_strength": 27.0,
+        "support_distance_pips": 8.0,
+        "resistance_distance_pips": 16.0,
+        "session": ["london", "overlap"],
+        "volatility": 1.1,
+        "proposed_entry": 1.1002,
+        "stop_loss": 1.0982,
+        "take_profit": 1.1032,
+        "risk_reward": 1.5,
+        "current_exposure": {
+            "account_currency": "USD",
+            "open_positions": 1,
+            "portfolio_risk": 20.0,
+            "gross_exposure": 1200.0,
+            "pair_exposure": 900.0,
+            "free_margin": 9800.0,
+        },
+        "news_context": {
+            "risk_level": "LOW",
+            "upcoming_event": {
+                "currency": "USD",
+                "impact_level": "LOW",
+                "minutes_until_event": 48.0,
+            },
+            "recent_event": {
+                "currency": "EUR",
+                "minutes_since_event": 120.0,
+            },
+            "event_just_occurred": False,
+            "freshness": {
+                "state": "FRESH",
+                "stale": False,
+                "age_seconds": 20.0,
+            },
+        },
+    }
+    return PredictionRequest(
+        candidate_id="fxsig-1",
+        candidate_trade={
+            "symbol": "EUR_USD",
+            "direction": "LONG",
+            "entry": 1.1002,
+            "executed": True,  # Audit-only junk must not become a model feature.
+            "rejection_reason": "future_information",
+        },
+        market_snapshot=snapshot,
+        strategy_signal="signal_confirmed",
+        strategy_score=74.0,
+        execution_cost_pips_round_trip=0.4,
+        pip_size=0.0001,
+    )
+
+
+def test_feature_builder_matches_training_feature_manifest_exactly() -> None:
+    features = build_prediction_features(_request())
+    assert list(features) == FEATURE_COLUMNS
+    assert set(features) == set(FEATURE_COLUMNS)
+    assert "executed" not in features
+    assert "rejection_reason" not in features
+    assert features["symbol"] == "EUR_USD"
+    assert features["direction"] == "LONG"
+    assert features["session"] == "london+overlap"
+    assert features["hour_utc"] == 14
+    assert features["day_of_week"] == 6
+    assert features["atr_pips"] == pytest.approx(10.0)
+    assert features["spread_relative_to_atr"] == pytest.approx(0.2)
+    assert features["execution_cost_pips_round_trip"] == pytest.approx(0.4)
+
+
+def test_prediction_service_returns_versioned_probability_without_execution_dependency() -> None:
+    loader = _FakeLoader(0.83)
+    service = PredictionService(
+        MlPredictionSettings(
+            mode="shadow",
+            model_path="ignored.joblib",
+            metadata_path="ignored.json",
+        ),
+        loader=loader,
+    )
+    result = service.predict(_request())
+    assert result.successful is True
+    assert result.tp_before_sl_probability == pytest.approx(0.83)
+    assert result.model_name == "XGBoost"
+    assert result.model_version == "xgb_tp_before_sl_v1"
+    assert result.model_hash == "abc123"
+    assert result.feature_version == FEATURE_BUILDER_VERSION
+    assert result.feature_hash
+    assert loader.calls == 1
+
+
+def test_prediction_service_off_mode_does_not_load_model() -> None:
+    loader = _FakeLoader()
+    result = PredictionService(
+        MlPredictionSettings(mode="off"),
+        loader=loader,
+    ).predict(_request())
+    assert result.status == "off"
+    assert result.successful is False
+    assert loader.calls == 0
+
+
+def test_required_prediction_configuration_needs_artifact_paths() -> None:
+    with pytest.raises(ValueError, match="model_path"):
+        MlPredictionSettings(mode="required")
+
+
+def test_model_loader_verifies_hash_target_and_feature_manifest(tmp_path: Path) -> None:
+    model_path = tmp_path / "model.joblib"
+    metadata_path = tmp_path / "model.metadata.json"
+    joblib.dump(_ProbModel(0.77), model_path)
+    digest = hashlib.sha256(model_path.read_bytes()).hexdigest()
+    metadata_path.write_text(json.dumps({
+        "model_name": "XGBoost",
+        "model_version": "xgb_tp_before_sl_v1",
+        "target": "TP_BEFORE_SL",
+        "problem_type": "binary_classification",
+        "feature_columns": FEATURE_COLUMNS,
+        "model_sha256": digest,
+    }))
+
+    loaded = VersionedModelLoader(
+        model_path=model_path,
+        metadata_path=metadata_path,
+    ).load()
+    assert loaded.model_name == "XGBoost"
+    assert loaded.model_hash == digest
+    assert loaded.model.predict_proba(pd.DataFrame([build_prediction_features(_request())]))[0][1] == pytest.approx(0.77)
+
+    model_path.write_bytes(model_path.read_bytes() + b"tampered")
+    with pytest.raises(ModelLoadError, match="SHA-256"):
+        VersionedModelLoader(
+            model_path=model_path,
+            metadata_path=metadata_path,
+        ).load()
+
+
+def test_model_loader_rejects_training_serving_feature_mismatch(tmp_path: Path) -> None:
+    model_path = tmp_path / "model.joblib"
+    metadata_path = tmp_path / "model.metadata.json"
+    joblib.dump(_ProbModel(), model_path)
+    digest = hashlib.sha256(model_path.read_bytes()).hexdigest()
+    metadata_path.write_text(json.dumps({
+        "model_name": "XGBoost",
+        "model_version": "bad",
+        "target": "TP_BEFORE_SL",
+        "feature_columns": FEATURE_COLUMNS[:-1],
+        "model_sha256": digest,
+    }))
+    with pytest.raises(ModelLoadError, match="feature manifest"):
+        VersionedModelLoader(
+            model_path=model_path,
+            metadata_path=metadata_path,
+        ).load()
