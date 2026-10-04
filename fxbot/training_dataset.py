@@ -198,7 +198,7 @@ def export_training_dataset(
         "expected_return_definition": "30-minute executable liquidation return in pips minus configured non-spread commission/slippage allowance",
         "profitability_label_definition": "executable liquidation return at horizon minus configured non-spread commission/slippage allowance > 0",
         "entry_quality_label_definitions": {
-            "IMMEDIATE_ADVERSE_MOVEMENT": "1 when loss begins within configured immediate window and 30m MAE reaches the configured minimum adverse pips",
+            "IMMEDIATE_ADVERSE_MOVEMENT": "1 when the 1m executable return is materially adverse, or loss begins and MAE is reached within the configured immediate window",
             "EXPECTED_PULLBACK": "maximum positive executable entry improvement observed at 30s, 1m, or 3m",
             "BEST_ENTRY_DELAY_SECONDS": "0/30/60/180 from ENTRY_ACTION_LABEL; null for SKIP",
             "CONTINUATION": "1 when cost-adjusted 15m return is positive, MFE exceeds MAE, and reliable TP-before-SL is not false",
@@ -456,12 +456,21 @@ def _immediate_adverse_label(
     config: ActionLabelConfig,
 ) -> int:
     time_to_loss = _finite_or_none(outcome.time_to_loss_seconds)
+    time_to_mae = _finite_or_none(outcome.time_to_mae_seconds)
     mae = _finite_or_none(outcome.mae_pips) or 0.0
-    return int(
+    return_1m = _finite_or_none(outcome.return_1m_pips)
+    adverse_at_one_minute = (
+        return_1m is not None
+        and return_1m <= -config.immediate_adverse_min_pips
+    )
+    adverse_excursion_inside_window = (
         time_to_loss is not None
         and time_to_loss <= config.immediate_adverse_window_seconds
+        and time_to_mae is not None
+        and time_to_mae <= config.immediate_adverse_window_seconds
         and mae >= config.immediate_adverse_min_pips
     )
+    return int(adverse_at_one_minute or adverse_excursion_inside_window)
 
 
 def _expected_pullback_pips(outcome: CandidateOutcomeRow) -> float:
