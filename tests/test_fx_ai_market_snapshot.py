@@ -23,7 +23,6 @@ def test_ai_job_is_strictly_take_wait_skip() -> None:
             "decision": "WAIT",
             "confidence": 0.72,
             "reason_codes": ["pullback_risk"],
-            "warnings": ["spread_elevated"],
         }
     )
     assert recommendation.decision is AiTradeDecision.WAIT
@@ -39,7 +38,6 @@ def test_candidate_evaluator_only_returns_structured_recommendation() -> None:
                 "decision": "TAKE",
                 "confidence": 0.81,
                 "reason_codes": ["trend_alignment"],
-                "warnings": [],
             }
         )
     )
@@ -51,7 +49,7 @@ def test_candidate_evaluator_only_returns_structured_recommendation() -> None:
 def test_ai_contract_rejects_trade_generation_or_risk_fields() -> None:
     with pytest.raises(ValueError, match="TAKE, WAIT, or SKIP"):
         validate_ai_trade_recommendation(
-            {"decision": "BUY", "confidence": 0.9, "reason_codes": [], "warnings": []}
+            {"decision": "BUY", "confidence": 0.9, "reason_codes": []}
         )
     with pytest.raises(ValueError, match="unsupported fields"):
         validate_ai_trade_recommendation(
@@ -59,7 +57,6 @@ def test_ai_contract_rejects_trade_generation_or_risk_fields() -> None:
                 "decision": "TAKE",
                 "confidence": 0.9,
                 "reason_codes": [],
-                "warnings": [],
                 "position_size": 2000,
             }
         )
