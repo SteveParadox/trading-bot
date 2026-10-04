@@ -41,7 +41,7 @@ from fxbot.chronological_split import ChronologicalSplitConfig, chronological_sp
 from fxbot.training_dataset import FEATURE_COLUMNS
 
 
-BASELINE_MODEL_VERSION = "xgb_tp_before_sl_v1"
+BASELINE_MODEL_FAMILY_VERSION = "v1"
 SUPPORTED_BINARY_TARGETS = {
     "TP_BEFORE_SL",
     "PROFITABLE_WITHIN_5_MIN",
@@ -107,7 +107,7 @@ def train_xgboost_baseline(
     train = _target_ready(splits.train, cfg.target)
     validation = _target_ready(splits.validation, cfg.target)
     test = _target_ready(splits.test, cfg.target)
-    forward = _target_ready(splits.forward, cfg.target)
+    forward = splits.forward.copy()
 
     _require_training_periods(train, validation, test, cfg.target)
 
@@ -134,14 +134,15 @@ def train_xgboost_baseline(
     )
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    model_path = output_dir / f"{BASELINE_MODEL_VERSION}.joblib"
+    model_version = _model_version(cfg.target)
+    model_path = output_dir / f"{model_version}.joblib"
     joblib.dump(pipeline, model_path)
     model_hash = hashlib.sha256(model_path.read_bytes()).hexdigest()
 
-    metadata_path = output_dir / f"{BASELINE_MODEL_VERSION}.metadata.json"
+    metadata_path = output_dir / f"{model_version}.metadata.json"
     metadata = {
         "model_name": "XGBoost",
-        "model_version": BASELINE_MODEL_VERSION,
+        "model_version": model_version,
         "model_role": "candidate",
         "target": cfg.target,
         "problem_type": "binary_classification",
@@ -179,6 +180,11 @@ def train_xgboost_baseline(
         validation_metrics=validation_metrics,
         test_metrics=test_metrics,
     )
+
+
+def _model_version(target: str) -> str:
+    slug = target.lower()
+    return f"xgb_{slug}_{BASELINE_MODEL_FAMILY_VERSION}"
 
 
 def _pipeline(config: XGBoostBaselineConfig) -> Pipeline:
