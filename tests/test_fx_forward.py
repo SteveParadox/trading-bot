@@ -296,6 +296,10 @@ class ForwardWorkerTests(unittest.TestCase):
                 self.assertTrue(candidate.executed)
                 self.assertEqual(candidate.status, "executed")
                 self.assertIsNone(candidate.rejection_reason)
+                outcome = journal.find_candidate_outcome(metadata["candidate_id"])
+                self.assertIsNotNone(outcome)
+                self.assertEqual(outcome.status, "tracking")
+                self.assertEqual(outcome.observation_count, 1)
 
                 # Rescanning the same closed-candle setup must not create a
                 # duplicate trade or downgrade an already executed candidate.
@@ -413,6 +417,10 @@ class ForwardWorkerTests(unittest.TestCase):
                 self.assertEqual(candidate.rejection_reason, "spread_to_atr_filter")
                 self.assertEqual(candidate.strategy_signal, "signal_confirmed")
                 self.assertIn("freshness", candidate.news_risk)
+                outcome = journal.find_candidate_outcome(candidate.candidate_id)
+                self.assertIsNotNone(outcome)
+                self.assertEqual(outcome.status, "tracking")
+                self.assertEqual(outcome.observation_count, 1)
 
     def test_idempotent_submit_does_not_duplicate_reserved_order(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
