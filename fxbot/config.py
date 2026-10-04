@@ -519,6 +519,8 @@ class MlPredictionSettings:
     model_path: str = ""
     metadata_path: str = ""
     target: str = "TP_BEFORE_SL"
+    entry_model_path: str = ""
+    entry_metadata_path: str = ""
     verify_hash: bool = True
 
     def __post_init__(self) -> None:
@@ -771,6 +773,8 @@ def settings_from_env() -> FxBotSettings:
             model_path=_get_str("FX_ML_MODEL_PATH", ""),
             metadata_path=_get_str("FX_ML_MODEL_METADATA_PATH", ""),
             target=_get_str("FX_ML_TARGET", "TP_BEFORE_SL").upper(),
+            entry_model_path=_get_str("FX_ML_ENTRY_MODEL_PATH", ""),
+            entry_metadata_path=_get_str("FX_ML_ENTRY_MODEL_METADATA_PATH", ""),
             verify_hash=_get_bool("FX_ML_VERIFY_MODEL_HASH", True),
         ),
         ai=AiDeliberationSettings(
