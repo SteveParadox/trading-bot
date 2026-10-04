@@ -7,7 +7,7 @@ import math
 from typing import Any
 
 
-PREDICTION_SCHEMA_VERSION = "v1"
+PREDICTION_SCHEMA_VERSION = "v2"
 PREDICTION_STATUSES = {"ok", "off", "unavailable", "error"}
 
 
@@ -51,11 +51,21 @@ class NumericalPrediction:
     tp_before_sl_probability: float | None = None
     profitable_5m_probability: float | None = None
     profitable_15m_probability: float | None = None
+    immediate_adverse_probability: float | None = None
+    continuation_probability: float | None = None
+    fake_breakout_probability: float | None = None
     expected_mfe_pips: float | None = None
     expected_mae_pips: float | None = None
     expected_return_pips: float | None = None
     pullback_probability: float | None = None
     expected_pullback_pips: float | None = None
+    entry_action: str | None = None
+    entry_action_confidence: float | None = None
+    entry_action_probabilities: dict[str, float] | None = None
+    entry_model_name: str | None = None
+    entry_model_version: str | None = None
+    entry_model_hash: str | None = None
+    entry_action_error: str | None = None
     model_name: str | None = None
     model_version: str | None = None
     model_hash: str | None = None
@@ -72,11 +82,28 @@ class NumericalPrediction:
             "tp_before_sl_probability",
             "profitable_5m_probability",
             "profitable_15m_probability",
+            "immediate_adverse_probability",
+            "continuation_probability",
+            "fake_breakout_probability",
             "pullback_probability",
+            "entry_action_confidence",
         ):
             value = getattr(self, name)
             if value is not None and (not math.isfinite(float(value)) or not 0.0 <= float(value) <= 1.0):
                 raise ValueError(f"{name} must be between 0 and 1")
+        if self.entry_action is not None and self.entry_action not in {
+            "ENTER_NOW", "WAIT_30S", "WAIT_1M", "WAIT_3M", "SKIP"
+        }:
+            raise ValueError("entry_action is not supported")
+        if self.entry_action_probabilities is not None:
+            expected = {"ENTER_NOW", "WAIT_30S", "WAIT_1M", "WAIT_3M", "SKIP"}
+            if set(self.entry_action_probabilities) != expected:
+                raise ValueError("entry_action_probabilities must contain the complete action space")
+            probabilities = [float(value) for value in self.entry_action_probabilities.values()]
+            if any(not math.isfinite(value) or value < 0.0 or value > 1.0 for value in probabilities):
+                raise ValueError("entry_action_probabilities must be valid probabilities")
+            if not math.isclose(sum(probabilities), 1.0, rel_tol=1e-6, abs_tol=1e-6):
+                raise ValueError("entry_action_probabilities must sum to 1")
         for name in (
             "expected_mfe_pips",
             "expected_mae_pips",
@@ -94,11 +121,15 @@ class NumericalPrediction:
                 self.tp_before_sl_probability,
                 self.profitable_5m_probability,
                 self.profitable_15m_probability,
+                self.immediate_adverse_probability,
+                self.continuation_probability,
+                self.fake_breakout_probability,
                 self.expected_mfe_pips,
                 self.expected_mae_pips,
                 self.expected_return_pips,
                 self.pullback_probability,
                 self.expected_pullback_pips,
+                self.entry_action_confidence,
             )
         ):
             raise ValueError("successful prediction requires at least one numerical output")
