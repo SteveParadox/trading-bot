@@ -531,6 +531,9 @@ class MlPredictionSettings:
             "TP_BEFORE_SL",
             "PROFITABLE_WITHIN_5_MIN",
             "PROFITABLE_WITHIN_15_MIN",
+            "IMMEDIATE_ADVERSE_MOVEMENT",
+            "CONTINUATION",
+            "FAKE_BREAKOUT",
         }:
             raise ValueError("ml_prediction.target is not supported")
         if mode == "required" and (not self.model_path or not self.metadata_path):
