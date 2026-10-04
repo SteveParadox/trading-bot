@@ -497,8 +497,17 @@ def _extract_provider_json(payload: Any) -> dict[str, Any]:
     return decoded
 
 
-def validate_ai_audit_response(raw: dict[str, Any]) -> AiAuditResponse:
-    """Validate v2 TAKE/WAIT/SKIP output and migrate stored v1 audit responses."""
+def validate_ai_audit_response(
+    raw: dict[str, Any],
+    *,
+    allow_legacy_stored_response: bool = False,
+) -> AiAuditResponse:
+    """Validate strict TAKE/WAIT/SKIP output.
+
+    Legacy CONFIRM/FLAG/REJECT is accepted only when explicitly reading a
+    previously persisted row. Provider responses never get that compatibility
+    path.
+    """
 
     if not isinstance(raw, dict):
         raise AiResponseValidationError("AI response must be an object")
@@ -508,7 +517,7 @@ def validate_ai_audit_response(raw: dict[str, Any]) -> AiAuditResponse:
         "decision", "confidence", "reasoning_audit", "market_context",
         "contradictions", "recommended_action", "summary",
     }
-    if set(raw) == legacy_required:
+    if allow_legacy_stored_response and set(raw) == legacy_required:
         legacy = _enum(raw["decision"], {"CONFIRM", "FLAG", "REJECT"}, "decision")
         legacy_action = _enum(raw["recommended_action"], {"ALLOW", "FLAG", "REJECT"}, "recommended_action")
         expected_actions = {
