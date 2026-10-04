@@ -456,6 +456,7 @@ class ForwardTestWorker:
         market_snapshot_payload: dict[str, Any] | None = None
         try:
             market_snapshot_payload = build_market_snapshot(
+                candidate_id=candidate_id,
                 intent=intent,
                 instrument=instrument,
                 price=price,
