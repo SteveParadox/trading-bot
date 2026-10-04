@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from fxbot.ai.feature_builder import FEATURE_BUILDER_VERSION
 from fxbot.training_dataset import FEATURE_COLUMNS
 
 
@@ -65,6 +66,11 @@ class VersionedModelLoader:
         feature_columns = metadata.get("feature_columns")
         if feature_columns != FEATURE_COLUMNS:
             raise ModelLoadError("model feature manifest does not match serving feature schema")
+        artifact_feature_version = metadata.get("feature_builder_version")
+        if artifact_feature_version is not None and artifact_feature_version != FEATURE_BUILDER_VERSION:
+            raise ModelLoadError(
+                "model feature-builder version does not match serving feature builder"
+            )
 
         actual_hash = hashlib.sha256(self.model_path.read_bytes()).hexdigest()
         expected_hash = str(metadata.get("model_sha256") or "")
