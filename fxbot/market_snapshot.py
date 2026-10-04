@@ -9,7 +9,8 @@ from typing import Any
 
 import pandas as pd
 
-from fxbot.instruments import FxInstrument, PriceSnapshot
+from fxbot.config import NewsEvent
+from fxbot.instruments import FxInstrument, PriceSnapshot, split_instrument_name
 from fxbot.models import FxPortfolioState, FxSignalIntent
 from fxbot.risk import FxExitPlan
 from fxbot.strategy import last_closed_window
@@ -62,6 +63,58 @@ class ExposureSnapshot:
 
 
 @dataclass(frozen=True)
+class NewsEventSnapshot:
+    name: str
+    currency: str
+    impact_level: str
+    impact_score: int
+    scheduled_at: datetime
+    minutes_until_event: float | None
+    minutes_since_event: float | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "currency": self.currency,
+            "impact_level": self.impact_level,
+            "impact_score": self.impact_score,
+            "scheduled_at": _utc(self.scheduled_at).isoformat(),
+            "minutes_until_event": self.minutes_until_event,
+            "minutes_since_event": self.minutes_since_event,
+        }
+
+
+@dataclass(frozen=True)
+class NewsContextSnapshot:
+    affected_currencies: tuple[str, ...]
+    upcoming_event: NewsEventSnapshot | None
+    recent_event: NewsEventSnapshot | None
+    event_just_occurred: bool
+    freshness_state: str
+    stale: bool
+    age_seconds: float | None
+    last_updated: datetime | None
+    source: str
+    risk_level: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "affected_currencies": list(self.affected_currencies),
+            "upcoming_event": self.upcoming_event.to_dict() if self.upcoming_event else None,
+            "recent_event": self.recent_event.to_dict() if self.recent_event else None,
+            "event_just_occurred": self.event_just_occurred,
+            "freshness": {
+                "state": self.freshness_state,
+                "stale": self.stale,
+                "age_seconds": self.age_seconds,
+                "last_updated": _utc(self.last_updated).isoformat() if self.last_updated else None,
+                "source": self.source,
+            },
+            "risk_level": self.risk_level,
+        }
+
+
+@dataclass(frozen=True)
 class MarketSnapshot:
     """Immutable features known when a strategy candidate is evaluated.
 
@@ -101,6 +154,7 @@ class MarketSnapshot:
     take_profit: float | None
     risk_reward: float | None
     current_exposure: ExposureSnapshot
+    news_context: NewsContextSnapshot
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -128,6 +182,7 @@ class MarketSnapshot:
             "take_profit": self.take_profit,
             "risk_reward": self.risk_reward,
             "current_exposure": self.current_exposure.to_dict(),
+            "news_context": self.news_context.to_dict(),
         }
 
 
@@ -143,6 +198,13 @@ def build_market_snapshot(
     exit_plan: FxExitPlan | None,
     observed_at: datetime,
     sessions: set[str] | tuple[str, ...] | list[str],
+    news_events: list[NewsEvent],
+    news_stale: bool,
+    news_age_seconds: float | None,
+    news_last_updated: datetime | None,
+    news_source: str,
+    news_before_minutes: int,
+    news_after_minutes: int,
     candle_lookback: int = DEFAULT_CANDLE_LOOKBACK,
     momentum_lookback: int = DEFAULT_MOMENTUM_LOOKBACK,
     rsi_period: int = DEFAULT_RSI_PERIOD,
@@ -197,6 +259,17 @@ def build_market_snapshot(
         currency_exposures={str(key): float(value) for key, value in portfolio.currency_exposures.items()},
         free_margin=float(portfolio.free_margin),
     )
+    news_context = build_news_context(
+        symbol=instrument.name,
+        events=news_events,
+        observed_at=observed,
+        stale=news_stale,
+        age_seconds=news_age_seconds,
+        last_updated=news_last_updated,
+        source=news_source,
+        before_minutes=news_before_minutes,
+        after_minutes=news_after_minutes,
+    )
 
     if not candidate_id.strip():
         raise ValueError("candidate_id is required")
@@ -225,7 +298,102 @@ def build_market_snapshot(
         take_profit=float(exit_plan.take_profit) if exit_plan is not None else None,
         risk_reward=float(exit_plan.risk_reward) if exit_plan is not None else None,
         current_exposure=exposure,
+        news_context=news_context,
     )
+
+
+def build_news_context(
+    *,
+    symbol: str,
+    events: list[NewsEvent],
+    observed_at: datetime,
+    stale: bool,
+    age_seconds: float | None,
+    last_updated: datetime | None,
+    source: str,
+    before_minutes: int,
+    after_minutes: int,
+) -> NewsContextSnapshot:
+    observed = _utc(observed_at)
+    base, quote = split_instrument_name(symbol)
+    affected = {base, quote}
+    related = [event for event in events if event.currency.upper() in affected]
+    future = sorted(
+        (event for event in related if _utc(event.starts_at) >= observed),
+        key=lambda event: _utc(event.starts_at),
+    )
+    past = sorted(
+        (event for event in related if _utc(event.starts_at) < observed),
+        key=lambda event: _utc(event.starts_at),
+        reverse=True,
+    )
+    upcoming = _news_event_snapshot(future[0], observed) if future else None
+    recent = _news_event_snapshot(past[0], observed) if past else None
+    just_occurred = bool(
+        recent is not None
+        and recent.minutes_since_event is not None
+        and recent.minutes_since_event <= max(0, after_minutes)
+    )
+
+    nearby: list[NewsEventSnapshot] = []
+    if upcoming is not None and upcoming.minutes_until_event is not None and upcoming.minutes_until_event <= max(0, before_minutes):
+        nearby.append(upcoming)
+    if just_occurred and recent is not None:
+        nearby.append(recent)
+
+    if stale:
+        risk_level = "UNKNOWN"
+        freshness_state = "UNKNOWN"
+    else:
+        risk_level = max(
+            (event.impact_level for event in nearby),
+            key=_impact_rank,
+            default="NONE",
+        )
+        freshness_state = "FRESH" if related else "EMPTY"
+
+    return NewsContextSnapshot(
+        affected_currencies=tuple(sorted(affected)),
+        upcoming_event=upcoming,
+        recent_event=recent,
+        event_just_occurred=just_occurred,
+        freshness_state=freshness_state,
+        stale=bool(stale),
+        age_seconds=_finite_or_none(age_seconds),
+        last_updated=_utc(last_updated) if last_updated is not None else None,
+        source=str(source or "unknown"),
+        risk_level=risk_level,
+    )
+
+
+def _news_event_snapshot(event: NewsEvent, observed_at: datetime) -> NewsEventSnapshot:
+    scheduled = _utc(event.starts_at)
+    delta_minutes = (scheduled - observed_at).total_seconds() / 60.0
+    return NewsEventSnapshot(
+        name=event.name,
+        currency=event.currency.upper(),
+        impact_level=_event_impact_level(event),
+        impact_score=int(event.impact_score or 0),
+        scheduled_at=scheduled,
+        minutes_until_event=delta_minutes if delta_minutes >= 0 else None,
+        minutes_since_event=abs(delta_minutes) if delta_minutes < 0 else None,
+    )
+
+
+def _event_impact_level(event: NewsEvent) -> str:
+    score = int(event.impact_score or 0)
+    if score >= 71:
+        return "HIGH"
+    if score >= 31:
+        return "MEDIUM"
+    label = str(event.impact or "").upper()
+    if label in {"HIGH", "MEDIUM", "LOW"}:
+        return label
+    return "LOW"
+
+
+def _impact_rank(level: str) -> int:
+    return {"NONE": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3, "UNKNOWN": 4}.get(level, 0)
 
 
 def _candle_snapshot(index: Any, row: pd.Series) -> CandleSnapshot:
