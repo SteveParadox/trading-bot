@@ -291,6 +291,52 @@ class ForwardWorkerTests(unittest.TestCase):
                 self.assertEqual(trade.instrument, "EUR_USD")
                 self.assertEqual(trade.side, Side.LONG.value)
 
+    def test_candidate_snapshot_failure_does_not_change_deterministic_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = FxBotSettings(
+                instruments=["EUR_USD"],
+                broker=BrokerSettings(),
+                strategy=StrategySettings(
+                    partial_tp_enabled=False,
+                    trade_sessions_utc=(),
+                    avoid_rollover_minutes=0,
+                    require_volume_confirmation=False,
+                    min_atr_pips=0.1,
+                    max_atr_pips=30,
+                    adx_min=10,
+                    htf_adx_min=10,
+                ),
+                risk=RiskSettings(
+                    risk_per_trade_pct=0.01,
+                    max_units_per_trade=1_000_000,
+                    max_pair_exposure_pct=10.0,
+                    max_gross_exposure_pct=10.0,
+                    max_currency_exposure_pct=10.0,
+                ),
+                runtime=RuntimeSettings(database_url=f"sqlite:///{Path(tmp) / 'journal.db'}"),
+            )
+            with closing(StructuredJournal(settings.runtime.database_url)) as journal:
+                client = FakeMt5Client(
+                    entry_frame=trending_frame(1.08, 0.00025),
+                    htf_frame=trending_frame(1.06, 0.0005),
+                )
+                worker = ForwardTestWorker(settings, client=client, journal=journal)
+                journal.set_state(BotRunState.RUNNING, "snapshot failure test")
+                with (
+                    patch("fxbot.forward.datetime", FixedDatetime),
+                    patch("fxbot.forward.build_market_snapshot", side_effect=RuntimeError("boom")),
+                ):
+                    worker.scan_once()
+
+                self.assertEqual(len(client.created_orders), 1)
+                signal = journal.recent_signals(limit=1)[0]
+                self.assertIsNone(signal.payload["intent"]["metadata"]["market_snapshot"])
+                failures = [
+                    event for event in journal.recent_events(limit=100)
+                    if event.event_type == "candidate_market_snapshot_failed"
+                ]
+                self.assertEqual(len(failures), 1)
+
     def test_idempotent_submit_does_not_duplicate_reserved_order(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             settings = FxBotSettings(
