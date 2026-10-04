@@ -237,6 +237,8 @@ class StructuredJournalTests(unittest.TestCase):
                 self.assertTrue(outcome.tp_before_sl)
                 self.assertAlmostEqual(outcome.time_to_tp_seconds, 90.0)
                 self.assertIsNone(outcome.time_to_sl_seconds)
+                self.assertAlmostEqual(outcome.time_to_profit_seconds, 60.0)
+                self.assertAlmostEqual(outcome.time_to_loss_seconds, 0.0)
                 self.assertAlmostEqual(outcome.mfe_pips, 11.0)
                 self.assertAlmostEqual(outcome.mae_pips, 5.0)
                 self.assertAlmostEqual(outcome.return_1m_pips, 4.0)
@@ -420,7 +422,11 @@ class StructuredJournalTests(unittest.TestCase):
                             "freshness": {"state": "FRESH", "stale": False, "age_seconds": 20.0},
                         },
                         strategy_signal="signal_confirmed",
-                        payload={"market_snapshot": snapshot, "signal_score": 73.0},
+                        payload={
+                            "market_snapshot": snapshot,
+                            "signal_score": 73.0,
+                            "execution_cost_pips_round_trip": 0.0,
+                        },
                     )
                     journal.ensure_candidate_outcome(
                         candidate_id=candidate.candidate_id,
@@ -480,6 +486,7 @@ class StructuredJournalTests(unittest.TestCase):
                 self.assertAlmostEqual(frame.iloc[0]["trend_strength"], 28.2)
                 self.assertEqual(frame.iloc[0]["news_risk"], "LOW")
                 self.assertAlmostEqual(frame.iloc[0]["risk_reward"], 1.8)
+                self.assertAlmostEqual(frame.iloc[0]["execution_cost_pips_round_trip"], 0.0)
                 self.assertAlmostEqual(frame.iloc[0]["EXPECTED_MFE"], 8.0)
                 self.assertAlmostEqual(frame.iloc[0]["EXPECTED_MAE"], 2.0)
                 self.assertAlmostEqual(frame.iloc[0]["EXPECTED_RETURN"], 4.0)
