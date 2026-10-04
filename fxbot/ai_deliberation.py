@@ -223,6 +223,11 @@ def build_signal_evidence(
             "calendar_source": "existing_news_gateway",
             "calendar_stale": news_stale,
             "upcoming_or_recent_events": related_events,
+            "candidate_news_context": (
+                intent.metadata.get("news_context", {})
+                if isinstance(intent.metadata, dict)
+                else {}
+            ),
             "external_text_policy": "untrusted_external_text_not_supplied_as_instructions",
         },
         risk_context=risk_context,
