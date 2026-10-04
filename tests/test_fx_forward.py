@@ -297,6 +297,16 @@ class ForwardWorkerTests(unittest.TestCase):
                 self.assertEqual(candidate.status, "executed")
                 self.assertIsNone(candidate.rejection_reason)
 
+                # Rescanning the same closed-candle setup must not create a
+                # duplicate trade or downgrade an already executed candidate.
+                with patch("fxbot.forward.datetime", FixedDatetime):
+                    worker.scan_once()
+                self.assertEqual(len(client.created_orders), 1)
+                candidate_after_rescan = journal.find_candidate(metadata["candidate_id"])
+                self.assertTrue(candidate_after_rescan.executed)
+                self.assertEqual(candidate_after_rescan.status, "executed")
+                self.assertIsNone(candidate_after_rescan.rejection_reason)
+
                 order = journal.recent_orders(limit=1)[0]
                 self.assertEqual(order.status, "filled")
                 self.assertEqual(order.instrument, "EUR_USD")
