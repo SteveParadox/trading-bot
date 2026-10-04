@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import inspect
+import json
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -9,6 +10,8 @@ from pathlib import Path
 from fxbot.ai_deliberation import (
     AiDeliberationService,
     AiDeliberationResult,
+    HttpxAiProvider,
+    strict_ai_response_format,
     apply_ai_execution_policy,
     build_signal_evidence,
     deterministic_reasoning_audit,
@@ -91,6 +94,32 @@ def test_hard_safety_gate_always_wins_over_ai_confirm() -> None:
     assert policy.reason == "hard_safety_gate_blocked"
 
 
+def test_shadow_take_wait_skip_are_all_nonblocking() -> None:
+    settings = AiDeliberationSettings(mode="shadow")
+    for decision, reason_codes in (
+        ("TAKE", ["trend_alignment"]),
+        ("WAIT", ["pullback_risk"]),
+        ("SKIP", ["weak_tp_probability"]),
+    ):
+        service = AiDeliberationService(
+            settings,
+            provider=lambda *_args, decision=decision, reason_codes=reason_codes: {
+                "decision": decision,
+                "confidence": 0.99,
+                "reason_codes": reason_codes,
+            },
+        )
+        result = service.deliberate(_evidence())
+        policy = apply_ai_execution_policy(
+            hard_safety_allowed=True,
+            settings=settings,
+            result=result,
+        )
+        assert result.successful is True
+        assert policy.allowed is True
+        assert policy.reason == "deterministic_execution_authoritative"
+
+
 def test_shadow_provider_failure_is_recordable_and_nonblocking() -> None:
     service = AiDeliberationService(AiDeliberationSettings(mode="shadow"), provider=lambda *_: {"not": "the schema"})
     result = service.deliberate(_evidence())
@@ -130,6 +159,120 @@ def test_advisory_wait_can_only_suppress_when_explicitly_enabled() -> None:
     assert blocking.reason == "ai_advisory_wait"
 
 
+def test_strict_response_format_allows_only_take_wait_skip_confidence_and_reason_codes() -> None:
+    response_format = strict_ai_response_format()
+    assert response_format["type"] == "json_schema"
+    contract = response_format["json_schema"]
+    assert contract["strict"] is True
+    schema = contract["schema"]
+    assert schema["additionalProperties"] is False
+    assert schema["required"] == ["decision", "confidence", "reason_codes"]
+    assert schema["properties"]["decision"]["enum"] == ["TAKE", "WAIT", "SKIP"]
+    assert schema["properties"]["confidence"]["minimum"] == 0.0
+    assert schema["properties"]["confidence"]["maximum"] == 1.0
+    assert schema["properties"]["reason_codes"]["minItems"] == 1
+    assert schema["properties"]["reason_codes"]["uniqueItems"] is True
+
+
+def test_http_provider_requests_strict_json_schema() -> None:
+    settings = AiDeliberationSettings(
+        mode="shadow",
+        endpoint="https://example.test/v1",
+        model="test-model",
+        api_key="secret",
+        max_retries=0,
+    )
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps({
+                                "decision": "TAKE",
+                                "confidence": 0.83,
+                                "reason_codes": ["trend_alignment"],
+                            })
+                        }
+                    }
+                ]
+            }
+
+    class Client:
+        def __init__(self) -> None:
+            self.kwargs = None
+
+        def post(self, *args, **kwargs):
+            self.kwargs = kwargs
+            return Response()
+
+    client = Client()
+    provider = HttpxAiProvider(settings, client=client)
+    result = provider("system", {"candidate": True})
+
+    assert result["decision"] == "TAKE"
+    response_format = client.kwargs["json"]["response_format"]
+    assert response_format["type"] == "json_schema"
+    assert response_format["json_schema"]["strict"] is True
+    assert client.kwargs["json"]["temperature"] == 0
+
+
+def test_free_form_provider_content_is_not_a_decision() -> None:
+    settings = AiDeliberationSettings(
+        mode="shadow",
+        endpoint="https://example.test/v1",
+        model="test-model",
+        max_retries=0,
+    )
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return {
+                "choices": [
+                    {"message": {"content": "Hmm, this trade looks pretty good..."}}
+                ]
+            }
+
+    class Client:
+        def post(self, *args, **kwargs):
+            return Response()
+
+    service = AiDeliberationService(
+        settings,
+        provider=HttpxAiProvider(settings, client=Client()),
+    )
+    result = service.deliberate(_evidence())
+    assert result.successful is False
+    assert result.failure_reason and "AiResponseValidationError" in result.failure_reason
+
+
+def test_extra_response_fields_are_rejected() -> None:
+    malformed = valid_response() | {"commentary": "looks good"}
+    try:
+        validate_ai_audit_response(malformed)
+    except Exception as exc:
+        assert type(exc).__name__ == "AiResponseValidationError"
+    else:
+        raise AssertionError("AI response with extra fields was accepted")
+
+
+def test_duplicate_reason_codes_are_rejected() -> None:
+    malformed = valid_response() | {"reason_codes": ["news_risk", "news_risk"]}
+    try:
+        validate_ai_audit_response(malformed)
+    except Exception as exc:
+        assert type(exc).__name__ == "AiResponseValidationError"
+    else:
+        raise AssertionError("duplicate AI reason codes were accepted")
+
+
 def test_unsupported_reason_code_is_rejected() -> None:
     malformed = valid_response() | {"reason_codes": ["make_money_now"]}
     try:
@@ -140,8 +283,21 @@ def test_unsupported_reason_code_is_rejected() -> None:
         raise AssertionError("unsupported AI reason code was accepted")
 
 
+def test_live_provider_rejects_legacy_response_schema() -> None:
+    service = AiDeliberationService(
+        AiDeliberationSettings(mode="shadow"),
+        provider=lambda *_: legacy_response(),
+    )
+    result = service.deliberate(_evidence())
+    assert result.successful is False
+    assert result.failure_reason and "AiResponseValidationError" in result.failure_reason
+
+
 def test_legacy_stored_response_maps_to_take_wait_skip() -> None:
-    migrated = validate_ai_audit_response(legacy_response())
+    migrated = validate_ai_audit_response(
+        legacy_response(),
+        allow_legacy_stored_response=True,
+    )
     assert migrated.decision == "WAIT"
     assert migrated.reason_codes == ["legacy_flag"]
 
@@ -149,7 +305,10 @@ def test_legacy_stored_response_maps_to_take_wait_skip() -> None:
 def test_inconsistent_legacy_decision_and_action_is_rejected() -> None:
     malformed = legacy_response() | {"decision": "CONFIRM", "recommended_action": "REJECT"}
     try:
-        validate_ai_audit_response(malformed)
+        validate_ai_audit_response(
+            malformed,
+            allow_legacy_stored_response=True,
+        )
     except Exception as exc:
         assert type(exc).__name__ == "AiResponseValidationError"
     else:
