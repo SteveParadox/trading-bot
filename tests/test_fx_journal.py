@@ -257,6 +257,53 @@ class StructuredJournalTests(unittest.TestCase):
                 self.assertEqual(outcome.observation_count, 1)
                 self.assertIsNone(outcome.return_1m_pips)
 
+    def test_candidate_outcomes_record_both_level_touches_in_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with closing(StructuredJournal(f"sqlite:///{Path(tmp) / 'journal.db'}")) as journal:
+                start = datetime(2026, 10, 4, 10, 0, tzinfo=timezone.utc)
+                candidate, _ = journal.record_candidate(
+                    candidate_id="fxsig-both-touches", timestamp=start, symbol="EUR_USD", direction="LONG",
+                    entry=1.1002, stop_loss=1.0992, take_profit=1.1012, spread=0.0002,
+                    strategy_signal="signal_confirmed",
+                )
+                tracker = CandidateOutcomeTracker(journal, observation_lag_tolerance_seconds=300)
+                instrument = FxInstrument("EUR_USD")
+                tracker.seed(candidate=candidate, price=PriceSnapshot("EUR_USD", 1.1000, 1.1002, start),
+                             instrument=instrument, observed_at=start)
+                tp_at = start + timedelta(seconds=60)
+                tracker.observe(candidate=candidate, price=PriceSnapshot("EUR_USD", 1.1013, 1.1015, tp_at),
+                                instrument=instrument, observed_at=tp_at)
+                sl_at = start + timedelta(seconds=120)
+                tracker.observe(candidate=candidate, price=PriceSnapshot("EUR_USD", 1.0990, 1.0992, sl_at),
+                                instrument=instrument, observed_at=sl_at)
+                outcome = journal.find_candidate_outcome(candidate.candidate_id)
+                self.assertTrue(outcome.tp_hit)
+                self.assertTrue(outcome.sl_hit)
+                self.assertTrue(outcome.tp_before_sl)
+                self.assertEqual(outcome.first_touch, "TP")
+                self.assertAlmostEqual(outcome.time_to_tp_seconds, 60.0)
+                self.assertAlmostEqual(outcome.time_to_sl_seconds, 120.0)
+
+    def test_short_outcome_uses_executable_ask_and_wait_bid(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with closing(StructuredJournal(f"sqlite:///{Path(tmp) / 'journal.db'}")) as journal:
+                start = datetime(2026, 10, 4, 10, 0, tzinfo=timezone.utc)
+                candidate, _ = journal.record_candidate(
+                    candidate_id="fxsig-short-outcome", timestamp=start, symbol="EUR_USD", direction="SHORT",
+                    entry=1.1000, stop_loss=1.1010, take_profit=1.0990, spread=0.0002,
+                    strategy_signal="signal_confirmed",
+                )
+                tracker = CandidateOutcomeTracker(journal, observation_lag_tolerance_seconds=90)
+                instrument = FxInstrument("EUR_USD")
+                tracker.seed(candidate=candidate, price=PriceSnapshot("EUR_USD", 1.1000, 1.1002, start),
+                             instrument=instrument, observed_at=start)
+                observed = start + timedelta(seconds=60)
+                tracker.observe(candidate=candidate, price=PriceSnapshot("EUR_USD", 1.1004, 1.1006, observed),
+                                instrument=instrument, observed_at=observed)
+                outcome = journal.find_candidate_outcome(candidate.candidate_id)
+                self.assertAlmostEqual(outcome.return_1m_pips, -6.0)
+                self.assertAlmostEqual(outcome.wait_1m_improvement_pips, 4.0)
+
     def test_candidate_outcomes_do_not_backfill_missed_horizons(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with closing(StructuredJournal(f"sqlite:///{Path(tmp) / 'journal.db'}")) as journal:
