@@ -39,7 +39,7 @@ def legacy_response() -> dict:
         "reasoning_audit": {"status": "CONSISTENT", "issues": [], "supporting_factors": ["ADX is 25"]},
         "market_context": {"status": "MATERIAL_CONTRADICTION", "issues": ["USD event in 12 minutes"], "supporting_factors": []},
         "contradictions": ["USD event in 12 minutes"],
-        "recommended_action": "WAIT",
+        "recommended_action": "FLAG",
         "summary": "The supplied event is imminent.",
     }
 
@@ -107,6 +107,27 @@ def test_advisory_reject_requires_explicit_opt_in_and_confidence() -> None:
     opt_in = apply_ai_execution_policy(hard_safety_allowed=True, settings=AiDeliberationSettings(mode="advisory", reject_blocks=True), result=result)
     assert default.allowed is True
     assert opt_in.allowed is False
+
+
+def test_advisory_wait_can_only_suppress_when_explicitly_enabled() -> None:
+    service = AiDeliberationService(
+        AiDeliberationSettings(mode="advisory"),
+        provider=lambda *_: valid_response(),
+    )
+    result = service.deliberate(_evidence())
+    default = apply_ai_execution_policy(
+        hard_safety_allowed=True,
+        settings=AiDeliberationSettings(mode="advisory"),
+        result=result,
+    )
+    blocking = apply_ai_execution_policy(
+        hard_safety_allowed=True,
+        settings=AiDeliberationSettings(mode="advisory", flag_blocks=True),
+        result=result,
+    )
+    assert default.allowed is True
+    assert blocking.allowed is False
+    assert blocking.reason == "ai_advisory_wait"
 
 
 def test_unsupported_reason_code_is_rejected() -> None:
