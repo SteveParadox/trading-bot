@@ -208,6 +208,7 @@ class ForwardWorkerTests(unittest.TestCase):
                         worker.scan_once()
                     scan.assert_not_called()
                     self.assertEqual(client.created_orders, [])
+                    self.assertEqual(journal.recent_candidates(), [])
                     self.assertTrue(journal.recent_signals(limit=1)[0].reason.startswith(reason))
 
     def test_scan_once_places_market_order_from_confirmed_indicator_signal(self) -> None:
@@ -279,6 +280,23 @@ class ForwardWorkerTests(unittest.TestCase):
                 self.assertEqual(len(candidate_events), 1)
                 self.assertEqual(candidate_events[0].payload["candidate_id"], metadata["candidate_id"])
 
+                candidate = journal.find_candidate(metadata["candidate_id"])
+                self.assertIsNotNone(candidate)
+                self.assertEqual(candidate.symbol, "EUR_USD")
+                self.assertEqual(candidate.direction, Side.LONG.value)
+                self.assertEqual(candidate.entry, signal.entry_price)
+                self.assertEqual(candidate.stop_loss, signal.stop_loss)
+                self.assertEqual(candidate.take_profit, signal.take_profit)
+                self.assertGreater(candidate.spread, 0)
+                self.assertGreater(candidate.atr, 0)
+                self.assertIsNotNone(candidate.momentum)
+                self.assertGreater(candidate.trend_strength, 0)
+                self.assertEqual(candidate.strategy_signal, "signal_confirmed")
+                self.assertEqual(candidate.news_risk["freshness"]["stale"], False)
+                self.assertTrue(candidate.executed)
+                self.assertEqual(candidate.status, "executed")
+                self.assertIsNone(candidate.rejection_reason)
+
                 order = journal.recent_orders(limit=1)[0]
                 self.assertEqual(order.status, "filled")
                 self.assertEqual(order.instrument, "EUR_USD")
@@ -336,6 +354,55 @@ class ForwardWorkerTests(unittest.TestCase):
                     if event.event_type == "candidate_market_snapshot_failed"
                 ]
                 self.assertEqual(len(failures), 1)
+                candidates = journal.recent_candidates()
+                self.assertEqual(len(candidates), 1)
+                self.assertTrue(candidates[0].executed)
+                self.assertIsNone(candidates[0].payload["market_snapshot"])
+
+    def test_rejected_strategy_candidate_is_still_journaled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = FxBotSettings(
+                instruments=["EUR_USD"],
+                broker=BrokerSettings(),
+                strategy=StrategySettings(
+                    partial_tp_enabled=False,
+                    trade_sessions_utc=(),
+                    avoid_rollover_minutes=0,
+                    require_volume_confirmation=False,
+                    min_atr_pips=0.1,
+                    max_atr_pips=30,
+                    adx_min=10,
+                    htf_adx_min=10,
+                    max_spread_atr_ratio=0.00001,
+                ),
+                risk=RiskSettings(
+                    risk_per_trade_pct=0.01,
+                    max_units_per_trade=1_000_000,
+                    max_pair_exposure_pct=10.0,
+                    max_gross_exposure_pct=10.0,
+                    max_currency_exposure_pct=10.0,
+                ),
+                runtime=RuntimeSettings(database_url=f"sqlite:///{Path(tmp) / 'journal.db'}"),
+            )
+            with closing(StructuredJournal(settings.runtime.database_url)) as journal:
+                client = FakeMt5Client(
+                    entry_frame=trending_frame(1.08, 0.00025),
+                    htf_frame=trending_frame(1.06, 0.0005),
+                )
+                worker = ForwardTestWorker(settings, client=client, journal=journal)
+                journal.set_state(BotRunState.RUNNING, "candidate rejection test")
+                with patch("fxbot.forward.datetime", FixedDatetime):
+                    worker.scan_once()
+
+                self.assertEqual(client.created_orders, [])
+                candidates = journal.recent_candidates()
+                self.assertEqual(len(candidates), 1)
+                candidate = candidates[0]
+                self.assertFalse(candidate.executed)
+                self.assertEqual(candidate.status, "rejected")
+                self.assertEqual(candidate.rejection_reason, "spread_to_atr_filter")
+                self.assertEqual(candidate.strategy_signal, "signal_confirmed")
+                self.assertIn("freshness", candidate.news_risk)
 
     def test_idempotent_submit_does_not_duplicate_reserved_order(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
