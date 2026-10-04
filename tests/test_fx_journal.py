@@ -12,7 +12,7 @@ from fxbot.config import BrokerSettings, FxBotSettings, RuntimeSettings
 from fxbot.forward import ForwardTestWorker
 from fxbot.instruments import FxInstrument, PriceSnapshot
 from fxbot.outcome_tracker import CandidateOutcomeTracker
-from fxbot.training_dataset import ActionLabelConfig, build_training_dataset
+from fxbot.training_dataset import ActionLabelConfig, FEATURE_COLUMNS, build_training_dataset
 
 class StructuredJournalTests(unittest.TestCase):
     def test_equity_history_is_chronological_and_keeps_date_range_endpoints(self) -> None:
@@ -490,6 +490,10 @@ class StructuredJournalTests(unittest.TestCase):
                 self.assertAlmostEqual(frame.iloc[0]["EXPECTED_MFE"], 8.0)
                 self.assertAlmostEqual(frame.iloc[0]["EXPECTED_MAE"], 2.0)
                 self.assertAlmostEqual(frame.iloc[0]["EXPECTED_RETURN"], 4.0)
+                self.assertNotIn("audit_executed", FEATURE_COLUMNS)
+                self.assertNotIn("audit_rejection_reason", FEATURE_COLUMNS)
+                self.assertNotIn("final_net_pnl", FEATURE_COLUMNS)
+                self.assertNotIn("EXPECTED_RETURN", FEATURE_COLUMNS)
 
     def test_order_reservation_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
