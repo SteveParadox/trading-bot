@@ -203,20 +203,29 @@ class CapturingPredictor:
 
 
 class CapturingDeliberator:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        decision: str = "TAKE",
+        confidence: float = 0.83,
+        reason_codes: list[str] | None = None,
+    ) -> None:
         self.evidence = None
+        self.decision = decision
+        self.confidence = confidence
+        self.reason_codes = reason_codes or [
+            "trend_alignment",
+            "strong_entry_quality",
+            "high_tp_probability",
+        ]
 
     def deliberate(self, evidence):
         self.evidence = evidence
         return AiDeliberationResult(
             response=AiAuditResponse(
-                decision="TAKE",
-                confidence=0.83,
-                reason_codes=[
-                    "trend_alignment",
-                    "strong_entry_quality",
-                    "high_tp_probability",
-                ],
+                decision=self.decision,
+                confidence=self.confidence,
+                reason_codes=self.reason_codes,
             ),
             latency_ms=3,
         )
@@ -379,6 +388,74 @@ class ForwardWorkerTests(unittest.TestCase):
                 candidate = journal.find_candidate(predictor.requests[0].candidate_id)
                 self.assertEqual(candidate.status, "executed")
                 self.assertEqual(candidate.payload["numerical_prediction"]["status"], "error")
+
+
+    def test_advisory_wait_is_journaled_as_delayed_not_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            entry = trending_frame(1.08, 0.00025)
+            htf = trending_frame(1.06, 0.0005)
+            settings = FxBotSettings(
+                instruments=["EUR_USD"],
+                broker=BrokerSettings(),
+                strategy=StrategySettings(
+                    partial_tp_enabled=False,
+                    trade_sessions_utc=(),
+                    avoid_rollover_minutes=0,
+                    require_volume_confirmation=False,
+                    min_atr_pips=0.1,
+                    max_atr_pips=30,
+                    adx_min=10,
+                    htf_adx_min=10,
+                ),
+                risk=RiskSettings(
+                    risk_per_trade_pct=0.01,
+                    max_units_per_trade=1_000_000,
+                    max_pair_exposure_pct=10.0,
+                    max_gross_exposure_pct=10.0,
+                    max_currency_exposure_pct=10.0,
+                ),
+                runtime=RuntimeSettings(
+                    database_url=f"sqlite:///{Path(tmp) / 'journal.db'}",
+                    log_jsonl_path=str(Path(tmp) / "j.jsonl"),
+                ),
+                ml_prediction=MlPredictionSettings(
+                    mode="shadow",
+                    model_path="ignored.joblib",
+                    metadata_path="ignored.metadata.json",
+                ),
+                ai=AiDeliberationSettings(
+                    mode="advisory",
+                    provider="none",
+                    flag_blocks=True,
+                ),
+            )
+            predictor = CapturingPredictor()
+            deliberator = CapturingDeliberator(
+                decision="WAIT",
+                confidence=0.91,
+                reason_codes=["pullback_risk"],
+            )
+            with closing(StructuredJournal(settings.runtime.database_url, settings.runtime.log_jsonl_path)) as journal:
+                client = FakeMt5Client(entry_frame=entry, htf_frame=htf)
+                worker = ForwardTestWorker(
+                    settings,
+                    client=client,
+                    journal=journal,
+                    predictor=predictor,
+                    deliberator=deliberator,
+                )
+                journal.set_state(BotRunState.RUNNING, "test AI wait")
+                with patch("fxbot.forward.datetime", FixedDatetime):
+                    worker.scan_once()
+
+                self.assertEqual(client.created_orders, [])
+                candidate = journal.find_candidate(predictor.requests[0].candidate_id)
+                self.assertEqual(candidate.status, "delayed")
+                self.assertIsNone(candidate.rejection_reason)
+                self.assertEqual(candidate.payload["ai_delay_reason"], "ai_advisory_wait")
+                signal = journal.recent_signals(limit=1)[0]
+                self.assertEqual(signal.status, "advisory_wait")
+                self.assertEqual(signal.reason, "ai_advisory_wait")
 
 
     def test_prediction_is_passed_to_llm_before_existing_execution_path(self) -> None:
