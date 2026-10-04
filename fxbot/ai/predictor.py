@@ -67,9 +67,10 @@ class PredictionService:
             artifact = self.loader.load()
             frame = pd.DataFrame([features])
             probability = float(artifact.model.predict_proba(frame)[0][1])
+            outputs = _classification_outputs(artifact.target, probability)
             return NumericalPrediction(
                 status="ok",
-                tp_before_sl_probability=probability,
+                **outputs,
                 model_name=artifact.model_name,
                 model_version=artifact.model_version,
                 model_hash=artifact.model_hash,
@@ -89,3 +90,16 @@ class PredictionService:
 
 def _elapsed_ms(started: float) -> int:
     return max(0, int(round((time.perf_counter() - started) * 1000)))
+
+
+def _classification_outputs(target: str, probability: float) -> dict[str, float]:
+    mapping = {
+        "TP_BEFORE_SL": "tp_before_sl_probability",
+        "PROFITABLE_WITHIN_5_MIN": "profitable_5m_probability",
+        "PROFITABLE_WITHIN_15_MIN": "profitable_15m_probability",
+    }
+    try:
+        key = mapping[target]
+    except KeyError as exc:
+        raise ValueError(f"unsupported classification target {target!r}") from exc
+    return {key: probability}
