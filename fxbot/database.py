@@ -114,6 +114,8 @@ class CandidateOutcomeRow(Base):
     mae_pips: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     time_to_mfe_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
     time_to_mae_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    time_to_tp_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    time_to_sl_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
     return_1m_pips: Mapped[float | None] = mapped_column(Float, nullable=True)
     return_3m_pips: Mapped[float | None] = mapped_column(Float, nullable=True)
     return_5m_pips: Mapped[float | None] = mapped_column(Float, nullable=True)
