@@ -347,11 +347,13 @@ class StructuredJournal:
             "first_touch", "first_touch_at", "tp_hit", "sl_hit", "tp_before_sl",
             "mfe_pips", "mae_pips", "time_to_mfe_seconds", "time_to_mae_seconds",
             "time_to_tp_seconds", "time_to_sl_seconds",
+            "time_to_profit_seconds", "time_to_loss_seconds",
             "return_1m_pips", "return_3m_pips", "return_5m_pips",
             "return_15m_pips", "return_30m_pips",
             "wait_30s_improvement_pips", "wait_1m_improvement_pips",
             "wait_3m_improvement_pips", "wait_5m_improvement_pips",
             "max_observation_gap_seconds", "data_quality",
+            "final_net_pnl", "final_net_pnl_currency", "final_net_pnl_at",
         }
         unsupported = set(values).difference(allowed)
         if unsupported:
