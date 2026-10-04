@@ -258,6 +258,25 @@ class ForwardWorkerTests(unittest.TestCase):
                 self.assertEqual(signal.status, "accepted")
                 self.assertEqual(signal.reason, "signal_and_risk_accepted")
                 self.assertEqual(signal.side, Side.LONG.value)
+                metadata = signal.payload["intent"]["metadata"]
+                self.assertTrue(metadata["candidate_id"].startswith("fxsig-"))
+                self.assertEqual(metadata["ai_decision_space"], ["TAKE", "WAIT", "SKIP"])
+                snapshot = metadata["market_snapshot"]
+                self.assertEqual(snapshot["symbol"], "EUR_USD")
+                self.assertEqual(snapshot["direction"], "LONG")
+                self.assertEqual(snapshot["proposed_entry"], signal.entry_price)
+                self.assertEqual(snapshot["stop_loss"], signal.stop_loss)
+                self.assertEqual(snapshot["take_profit"], signal.take_profit)
+                self.assertGreater(len(snapshot["recent_candles"]), 0)
+                self.assertIn("rsi", snapshot)
+                self.assertIn("momentum", snapshot)
+                self.assertIn("current_exposure", snapshot)
+                candidate_events = [
+                    event for event in journal.recent_events(limit=100)
+                    if event.event_type == "candidate_market_snapshot"
+                ]
+                self.assertEqual(len(candidate_events), 1)
+                self.assertEqual(candidate_events[0].payload["candidate_id"], metadata["candidate_id"])
 
                 order = journal.recent_orders(limit=1)[0]
                 self.assertEqual(order.status, "filled")
