@@ -113,6 +113,9 @@ def _classification_outputs(target: str, probability: float) -> dict[str, float]
         "TP_BEFORE_SL": "tp_before_sl_probability",
         "PROFITABLE_WITHIN_5_MIN": "profitable_5m_probability",
         "PROFITABLE_WITHIN_15_MIN": "profitable_15m_probability",
+        "IMMEDIATE_ADVERSE_MOVEMENT": "immediate_adverse_probability",
+        "CONTINUATION": "continuation_probability",
+        "FAKE_BREAKOUT": "fake_breakout_probability",
     }
     try:
         key = mapping[target]
