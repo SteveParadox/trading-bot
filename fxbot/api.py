@@ -737,6 +737,18 @@ def _config_payload(settings: FxBotSettings) -> dict[str, Any]:
         "metadata_path_configured": bool(settings.ml_prediction.metadata_path),
         "entry_model_path_configured": bool(settings.ml_prediction.entry_model_path),
         "entry_metadata_path_configured": bool(settings.ml_prediction.entry_metadata_path),
+        "immediate_adverse_model_configured": bool(
+            settings.ml_prediction.immediate_adverse_model_path
+            and settings.ml_prediction.immediate_adverse_metadata_path
+        ),
+        "continuation_model_configured": bool(
+            settings.ml_prediction.continuation_model_path
+            and settings.ml_prediction.continuation_metadata_path
+        ),
+        "fake_breakout_model_configured": bool(
+            settings.ml_prediction.fake_breakout_model_path
+            and settings.ml_prediction.fake_breakout_metadata_path
+        ),
     }
     payload["broker"] = {
         "provider": settings.broker.provider,
