@@ -12,6 +12,7 @@ from fxbot.config import BrokerSettings, FxBotSettings, RuntimeSettings
 from fxbot.forward import ForwardTestWorker
 from fxbot.instruments import FxInstrument, PriceSnapshot
 from fxbot.outcome_tracker import CandidateOutcomeTracker
+from fxbot.training_dataset import ActionLabelConfig, build_training_dataset
 
 class StructuredJournalTests(unittest.TestCase):
     def test_equity_history_is_chronological_and_keeps_date_range_endpoints(self) -> None:
@@ -50,10 +51,27 @@ class StructuredJournalTests(unittest.TestCase):
                 runtime=RuntimeSettings(database_url=f"sqlite:///{Path(tmp) / 'journal.db'}", log_jsonl_path=None),
             )
             with closing(StructuredJournal(settings.runtime.database_url)) as journal:
+                candidate, _ = journal.record_candidate(
+                    candidate_id="fxsig-closed-pnl",
+                    timestamp=datetime(2026, 1, 6, 14, tzinfo=timezone.utc),
+                    symbol="EUR_USD", direction="LONG", entry=1.1,
+                    stop_loss=1.099, take_profit=1.103, spread=0.0002,
+                    strategy_signal="signal_confirmed", executed=True,
+                )
+                journal.ensure_candidate_outcome(
+                    candidate_id=candidate.candidate_id,
+                    started_at=candidate.timestamp,
+                    payload={"label_version": "v2"},
+                )
                 journal.upsert_trade(
                     broker_trade_id="mt5-closed-1", instrument="EUR_USD", side="LONG", units=1000,
                     state="open", entry_time=datetime(2026, 1, 6, 14, tzinfo=timezone.utc),
-                    entry_price=1.1, payload={"strategy_context": {"signal_score": 71}},
+                    entry_price=1.1,
+                    payload={"strategy_context": {
+                        "signal_score": 71,
+                        "candidate_id": candidate.candidate_id,
+                        "account_currency": "USD",
+                    }},
                 )
                 client = HistoryClient()
                 worker = ForwardTestWorker(settings, client=client, journal=journal)
@@ -64,6 +82,10 @@ class StructuredJournalTests(unittest.TestCase):
                 self.assertAlmostEqual(closed.realized_pl, 2.75)
                 self.assertAlmostEqual(closed.financing, -0.1)
                 self.assertEqual(closed.payload["strategy_context"]["signal_score"], 71)
+                outcome = journal.find_candidate_outcome(candidate.candidate_id)
+                self.assertAlmostEqual(outcome.final_net_pnl, 2.65)
+                self.assertEqual(outcome.final_net_pnl_currency, "USD")
+                self.assertEqual(outcome.payload["final_net_pnl_source"], "mt5_realized_pl_plus_financing")
                 self.assertEqual(client.since, datetime(2025, 12, 7, 14, 10, tzinfo=timezone.utc))
                 worker.close()
 
@@ -343,6 +365,124 @@ class StructuredJournalTests(unittest.TestCase):
                 self.assertEqual(outcome.status, "incomplete")
                 self.assertIsNone(outcome.return_30m_pips)
                 self.assertEqual(outcome.payload["incomplete_reason"], "missed_30m_horizon")
+
+    def test_training_dataset_builds_features_and_entry_wait_skip_labels(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with closing(StructuredJournal(f"sqlite:///{Path(tmp) / 'journal.db'}")) as journal:
+                start = datetime(2026, 10, 4, 10, 0, tzinfo=timezone.utc)
+
+                def add_example(name, minutes, return5, return15, return30, mfe, mae, wait1m):
+                    timestamp = start + timedelta(minutes=minutes)
+                    snapshot = {
+                        "version": "v1",
+                        "bid": 1.1000,
+                        "ask": 1.1002,
+                        "spread_pips": 2.0,
+                        "atr": 0.00058,
+                        "rsi": 57.0,
+                        "momentum": 0.71,
+                        "trend_strength": 28.2,
+                        "volatility": 1.1,
+                        "support_distance_pips": 6.0,
+                        "resistance_distance_pips": 11.0,
+                        "risk_reward": 1.8,
+                        "session": ["london"],
+                        "current_exposure": {
+                            "account_currency": "USD",
+                            "open_positions": 1,
+                            "portfolio_risk": 25.0,
+                            "gross_exposure": 1200.0,
+                            "pair_exposure": 900.0,
+                            "free_margin": 9800.0,
+                        },
+                    }
+                    candidate, _ = journal.record_candidate(
+                        candidate_id=f"fxsig-dataset-{name}",
+                        timestamp=timestamp,
+                        symbol="EUR_USD",
+                        direction="LONG",
+                        entry=1.1002,
+                        stop_loss=1.0992,
+                        take_profit=1.1020,
+                        spread=0.0002,
+                        atr=0.00058,
+                        momentum=0.71,
+                        trend_strength=28.2,
+                        news_risk={
+                            "risk_level": "LOW",
+                            "upcoming_event": {
+                                "currency": "USD",
+                                "impact_level": "LOW",
+                                "minutes_until_event": 45.0,
+                            },
+                            "recent_event": None,
+                            "event_just_occurred": False,
+                            "freshness": {"state": "FRESH", "stale": False, "age_seconds": 20.0},
+                        },
+                        strategy_signal="signal_confirmed",
+                        payload={"market_snapshot": snapshot, "signal_score": 73.0},
+                    )
+                    journal.ensure_candidate_outcome(
+                        candidate_id=candidate.candidate_id,
+                        started_at=timestamp,
+                        payload={
+                            "label_version": "v2",
+                            "pip_size": 0.0001,
+                            "first_touch_reliable": True,
+                        },
+                    )
+                    journal.update_candidate_outcome(
+                        candidate.candidate_id,
+                        values={
+                            "status": "complete",
+                            "completed_at": timestamp + timedelta(minutes=30),
+                            "data_quality": "good",
+                            "tp_hit": return30 > 0,
+                            "sl_hit": return30 <= 0,
+                            "tp_before_sl": return30 > 0,
+                            "mfe_pips": mfe,
+                            "mae_pips": mae,
+                            "return_1m_pips": 0.5,
+                            "return_5m_pips": return5,
+                            "return_15m_pips": return15,
+                            "return_30m_pips": return30,
+                            "wait_30s_improvement_pips": 0.2,
+                            "wait_1m_improvement_pips": wait1m,
+                            "wait_3m_improvement_pips": 0.3,
+                            "wait_5m_improvement_pips": 0.1,
+                            "time_to_profit_seconds": 40.0 if return30 > 0 else None,
+                            "time_to_loss_seconds": 0.0,
+                        },
+                    )
+
+                add_example("entry", 0, 2.0, 3.0, 4.0, 8.0, 2.0, 0.5)
+                add_example("wait", 1, 2.0, 3.0, 4.0, 8.0, 2.0, 1.5)
+                add_example("skip", 2, -1.0, -1.5, -2.0, 2.0, 5.0, 2.0)
+
+                frame = build_training_dataset(
+                    journal,
+                    action_config=ActionLabelConfig(min_wait_improvement_pips=1.0),
+                )
+                self.assertEqual(frame["candidate_id"].tolist(), [
+                    "fxsig-dataset-entry",
+                    "fxsig-dataset-wait",
+                    "fxsig-dataset-skip",
+                ])
+                self.assertEqual(frame["ACTION_LABEL"].tolist(), ["ENTRY_NOW", "WAIT", "SKIP"])
+                self.assertEqual(frame["ENTRY_NOW"].tolist(), [1, 0, 0])
+                self.assertEqual(frame["WAIT"].tolist(), [0, 1, 0])
+                self.assertEqual(frame["SKIP"].tolist(), [0, 0, 1])
+                self.assertEqual(frame["PROFITABLE_WITHIN_5_MIN"].tolist(), [1, 1, 0])
+                self.assertEqual(frame["PROFITABLE_WITHIN_15_MIN"].tolist(), [1, 1, 0])
+                self.assertEqual(frame["TP_BEFORE_SL"].tolist(), [1, 1, 0])
+                self.assertAlmostEqual(frame.iloc[0]["atr_pips"], 5.8)
+                self.assertAlmostEqual(frame.iloc[0]["momentum"], 0.71)
+                self.assertAlmostEqual(frame.iloc[0]["trend_strength"], 28.2)
+                self.assertEqual(frame.iloc[0]["news_risk"], "LOW")
+                self.assertAlmostEqual(frame.iloc[0]["risk_reward"], 1.8)
+                self.assertAlmostEqual(frame.iloc[0]["EXPECTED_MFE"], 8.0)
+                self.assertAlmostEqual(frame.iloc[0]["EXPECTED_MAE"], 2.0)
+                self.assertAlmostEqual(frame.iloc[0]["EXPECTED_RETURN"], 4.0)
 
     def test_order_reservation_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
