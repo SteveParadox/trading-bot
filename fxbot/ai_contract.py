@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import math
-from typing import Any
+from typing import Any, Callable, Mapping
 
 
 class AiTradeDecision(str, Enum):
@@ -78,3 +78,22 @@ def validate_ai_trade_recommendation(payload: dict[str, Any]) -> AiTradeRecommen
         reason_codes=tuple(reason_codes),
         warnings=tuple(warnings),
     )
+
+
+AiCandidateProvider = Callable[[dict[str, Any]], dict[str, Any]]
+
+
+class AiCandidateEvaluator:
+    """Evaluate an existing candidate snapshot without any execution authority.
+
+    The provider sees only a structured snapshot and must return the strict
+    TAKE/WAIT/SKIP schema. This service has no strategy, risk, position-sizing,
+    or broker dependency by design.
+    """
+
+    def __init__(self, provider: AiCandidateProvider) -> None:
+        self.provider = provider
+
+    def evaluate(self, snapshot: Mapping[str, Any]) -> AiTradeRecommendation:
+        payload = self.provider(dict(snapshot))
+        return validate_ai_trade_recommendation(payload)
