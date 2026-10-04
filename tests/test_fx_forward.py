@@ -258,6 +258,7 @@ class ForwardWorkerTests(unittest.TestCase):
                 self.assertEqual(signal.status, "accepted")
                 self.assertEqual(signal.reason, "signal_and_risk_accepted")
                 self.assertEqual(signal.side, Side.LONG.value)
+
                 metadata = signal.payload["intent"]["metadata"]
                 self.assertTrue(metadata["candidate_id"].startswith("fxsig-"))
                 self.assertEqual(metadata["ai_decision_space"], ["TAKE", "WAIT", "SKIP"])
