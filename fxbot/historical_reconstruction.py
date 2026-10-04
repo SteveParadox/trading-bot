@@ -614,7 +614,7 @@ def main() -> None:
     parser.add_argument(
         "--dataset-output",
         type=Path,
-        default=Path("./data/training/candidate_training_v1.csv"),
+        default=Path("./data/training/candidate_training_v2.csv"),
     )
     parser.add_argument(
         "--report-output",
