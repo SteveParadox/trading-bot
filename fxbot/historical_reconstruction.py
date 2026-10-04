@@ -24,7 +24,7 @@ from typing import Any, Protocol
 import pandas as pd
 
 from fxbot.config import FxBotSettings, NewsEvent, load_news_events, settings_from_env
-from fxbot.instruments import FxInstrument, PriceSnapshot, split_instrument_name
+from fxbot.instruments import FxInstrument, PriceSnapshot, normalize_instrument_name, split_instrument_name
 from fxbot.journal import StructuredJournal
 from fxbot.market_hours import active_sessions, can_trade
 from fxbot.market_snapshot import build_market_snapshot
@@ -107,7 +107,7 @@ def reconstruct_historical_candidates(
             "FX_REQUIRE_NEWS_DATA=true unless authoritative historical news is supplied"
         )
 
-    requested = list(symbols or settings.instruments)
+    requested = [normalize_instrument_name(symbol) for symbol in (symbols or settings.instruments)]
     instruments = source.instruments(requested)
     risk = FxRiskManager(settings.risk, settings.strategy)
     tracker = CandidateOutcomeTracker(
@@ -621,7 +621,11 @@ def main() -> None:
     args = parser.parse_args()
 
     settings = settings_from_env()
-    symbols = [item.strip().upper() for item in args.symbols.split(",") if item.strip()] or settings.instruments
+    symbols = [
+        normalize_instrument_name(item)
+        for item in args.symbols.split(",")
+        if item.strip()
+    ] or settings.instruments
     events = load_news_events()
     source = Mt5Client(settings.broker)
     journal = StructuredJournal(args.database_url)
