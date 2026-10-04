@@ -24,8 +24,16 @@ from fxbot.instruments import FxInstrument
 from fxbot.journal import StructuredJournal
 
 
-TRAINING_DATASET_VERSION = "v1"
-ACTION_LABEL_VERSION = "v1"
+TRAINING_DATASET_VERSION = "v2"
+ACTION_LABEL_VERSION = "v2"
+ENTRY_ACTIONS = ("ENTER_NOW", "WAIT_30S", "WAIT_1M", "WAIT_3M", "SKIP")
+ENTRY_DELAY_SECONDS = {
+    "ENTER_NOW": 0,
+    "WAIT_30S": 30,
+    "WAIT_1M": 60,
+    "WAIT_3M": 180,
+    "SKIP": None,
+}
 
 IDENTIFIER_COLUMNS = [
     "dataset_version", "candidate_id", "timestamp", "feature_version",
@@ -51,7 +59,12 @@ FEATURE_COLUMNS = [
 TARGET_COLUMNS = [
     "TP_BEFORE_SL", "PROFITABLE_WITHIN_5_MIN", "PROFITABLE_WITHIN_15_MIN",
     "EXPECTED_MFE", "EXPECTED_MAE", "EXPECTED_RETURN",
-    "ENTRY_NOW", "WAIT", "SKIP", "ACTION_LABEL",
+    "IMMEDIATE_ADVERSE_MOVEMENT", "EXPECTED_PULLBACK",
+    "BEST_ENTRY_DELAY_SECONDS", "CONTINUATION", "FAKE_BREAKOUT",
+    "ENTER_NOW", "WAIT_30S", "WAIT_1M", "WAIT_3M", "SKIP",
+    "ENTRY_ACTION_LABEL",
+    # Compatibility targets retained for older notebooks/reports.
+    "ENTRY_NOW", "WAIT", "ACTION_LABEL",
 ]
 
 AUXILIARY_OUTCOME_COLUMNS = [
@@ -59,6 +72,8 @@ AUXILIARY_OUTCOME_COLUMNS = [
     "return_15m_pips", "return_30m_pips",
     "net_return_5m_pips", "net_return_15m_pips", "net_return_30m_pips",
     "mfe_pips", "mae_pips",
+    "wait_30s_improvement_pips", "wait_1m_improvement_pips",
+    "wait_3m_improvement_pips", "wait_5m_improvement_pips",
     "time_to_profit_seconds", "time_to_loss_seconds",
     "time_to_tp_seconds", "time_to_sl_seconds",
     "final_net_pnl", "final_net_pnl_currency",
@@ -70,15 +85,28 @@ AUDIT_COLUMNS = ["audit_executed", "audit_rejection_reason"]
 
 @dataclass(frozen=True)
 class ActionLabelConfig:
-    """Conservative v1 research label for ENTRY_NOW / WAIT / SKIP.
+    """Conservative v2 research labels for entry quality and timing.
 
-    This label is not an execution policy. It is a supervised-learning target
-    derived from future outcomes and must never be computed in the live path.
+    All values are targets derived from observations after candidate creation.
+    They must never be computed in the live feature path.
     """
 
     min_expected_return_pips: float = 0.0
     min_wait_improvement_pips: float = 1.0
+    immediate_adverse_window_seconds: float = 60.0
+    immediate_adverse_min_pips: float = 1.0
     require_mfe_gt_mae: bool = True
+    breakout_lookback: int = 3
+
+    def __post_init__(self) -> None:
+        if self.min_wait_improvement_pips < 0:
+            raise ValueError("min_wait_improvement_pips cannot be negative")
+        if self.immediate_adverse_window_seconds <= 0:
+            raise ValueError("immediate_adverse_window_seconds must be positive")
+        if self.immediate_adverse_min_pips < 0:
+            raise ValueError("immediate_adverse_min_pips cannot be negative")
+        if self.breakout_lookback < 2:
+            raise ValueError("breakout_lookback must be at least 2")
 
 
 def build_training_dataset(
@@ -108,8 +136,9 @@ def build_training_dataset(
     for candidate, outcome in pairs:
         feature_row = _feature_row(candidate, outcome)
         target_row = _target_row(
+            candidate,
             outcome,
-            execution_cost_pips=_feature_execution_cost_pips(candidate, outcome),
+            execution_cost_pips=candidate_execution_cost_pips(candidate, outcome),
             config=config,
         )
         if target_row is None:
@@ -157,6 +186,7 @@ def export_training_dataset(
     metadata = {
         "dataset_version": TRAINING_DATASET_VERSION,
         "action_label_version": ACTION_LABEL_VERSION,
+        "entry_action_space": list(ENTRY_ACTIONS),
         "action_label_config": asdict(config),
         "include_degraded": include_degraded,
         "rows": int(len(frame)),
@@ -270,6 +300,7 @@ def _feature_row(candidate: TradeCandidateRow, outcome: CandidateOutcomeRow) -> 
 
 
 def _target_row(
+    candidate: TradeCandidateRow,
     outcome: CandidateOutcomeRow,
     *,
     execution_cost_pips: float | None,
@@ -287,10 +318,41 @@ def _target_row(
     tp_before_sl = outcome.tp_before_sl if first_touch_reliable else None
     if execution_cost_pips is None or not math.isfinite(float(execution_cost_pips)):
         return None
+
     net_return_5m = float(outcome.return_5m_pips) - float(execution_cost_pips)
     net_return_15m = float(outcome.return_15m_pips) - float(execution_cost_pips)
     expected_return = float(outcome.return_30m_pips) - float(execution_cost_pips)
-    action = _action_label(outcome, expected_return=expected_return, config=config)
+    immediate_adverse = _immediate_adverse_label(outcome, config=config)
+    expected_pullback = _expected_pullback_pips(outcome)
+    continuation = _continuation_label(
+        outcome,
+        net_return_15m=net_return_15m,
+        tp_before_sl=tp_before_sl,
+    )
+    breakout_candidate = _snapshot_breakout_candidate(candidate, lookback=config.breakout_lookback)
+    fake_breakout = (
+        int(
+            continuation == 0
+            and (
+                immediate_adverse == 1
+                or net_return_15m <= 0.0
+            )
+        )
+        if breakout_candidate
+        else None
+    )
+    entry_action = _entry_action_label(
+        outcome,
+        expected_return=expected_return,
+        config=config,
+    )
+    compatibility_action = (
+        "SKIP"
+        if entry_action == "SKIP"
+        else "WAIT"
+        if entry_action.startswith("WAIT_")
+        else "ENTRY_NOW"
+    )
 
     return {
         "label_version": str((outcome.payload or {}).get("label_version") or "unknown"),
@@ -300,10 +362,21 @@ def _target_row(
         "EXPECTED_MFE": float(outcome.mfe_pips),
         "EXPECTED_MAE": float(outcome.mae_pips),
         "EXPECTED_RETURN": expected_return,
-        "ENTRY_NOW": int(action == "ENTRY_NOW"),
-        "WAIT": int(action == "WAIT"),
-        "SKIP": int(action == "SKIP"),
-        "ACTION_LABEL": action,
+        "IMMEDIATE_ADVERSE_MOVEMENT": immediate_adverse,
+        "EXPECTED_PULLBACK": expected_pullback,
+        "BEST_ENTRY_DELAY_SECONDS": ENTRY_DELAY_SECONDS[entry_action],
+        "CONTINUATION": continuation,
+        "FAKE_BREAKOUT": fake_breakout,
+        "ENTER_NOW": int(entry_action == "ENTER_NOW"),
+        "WAIT_30S": int(entry_action == "WAIT_30S"),
+        "WAIT_1M": int(entry_action == "WAIT_1M"),
+        "WAIT_3M": int(entry_action == "WAIT_3M"),
+        "SKIP": int(entry_action == "SKIP"),
+        "ENTRY_ACTION_LABEL": entry_action,
+        # v1 compatibility.
+        "ENTRY_NOW": int(compatibility_action == "ENTRY_NOW"),
+        "WAIT": int(compatibility_action == "WAIT"),
+        "ACTION_LABEL": compatibility_action,
         "tp_hit": int(bool(outcome.tp_hit)),
         "sl_hit": int(bool(outcome.sl_hit)),
         "return_1m_pips": _finite_or_none(outcome.return_1m_pips),
@@ -315,6 +388,10 @@ def _target_row(
         "net_return_30m_pips": expected_return,
         "mfe_pips": float(outcome.mfe_pips),
         "mae_pips": float(outcome.mae_pips),
+        "wait_30s_improvement_pips": _finite_or_none(outcome.wait_30s_improvement_pips),
+        "wait_1m_improvement_pips": _finite_or_none(outcome.wait_1m_improvement_pips),
+        "wait_3m_improvement_pips": _finite_or_none(outcome.wait_3m_improvement_pips),
+        "wait_5m_improvement_pips": _finite_or_none(outcome.wait_5m_improvement_pips),
         "time_to_profit_seconds": _finite_or_none(outcome.time_to_profit_seconds),
         "time_to_loss_seconds": _finite_or_none(outcome.time_to_loss_seconds),
         "time_to_tp_seconds": _finite_or_none(outcome.time_to_tp_seconds),
@@ -326,7 +403,7 @@ def _target_row(
     }
 
 
-def _action_label(
+def _entry_action_label(
     outcome: CandidateOutcomeRow,
     *,
     expected_return: float,
@@ -340,19 +417,89 @@ def _action_label(
     if not positive_setup:
         return "SKIP"
 
-    wait_values = [
-        outcome.wait_30s_improvement_pips,
-        outcome.wait_1m_improvement_pips,
-        outcome.wait_3m_improvement_pips,
-        outcome.wait_5m_improvement_pips,
+    candidates = [
+        ("WAIT_30S", 30, outcome.wait_30s_improvement_pips),
+        ("WAIT_1M", 60, outcome.wait_1m_improvement_pips),
+        ("WAIT_3M", 180, outcome.wait_3m_improvement_pips),
     ]
-    valid_waits = [float(value) for value in wait_values if value is not None and math.isfinite(float(value))]
-    if valid_waits and max(valid_waits) >= config.min_wait_improvement_pips:
-        return "WAIT"
-    return "ENTRY_NOW"
+    feasible: list[tuple[str, float]] = []
+    tp_time = _finite_or_none(outcome.time_to_tp_seconds)
+    for action, delay, value in candidates:
+        improvement = _finite_or_none(value)
+        if improvement is None:
+            continue
+        # Do not label a wait that begins after the original setup already
+        # reached its target. That would teach the model to miss the trade.
+        if tp_time is not None and tp_time <= delay:
+            continue
+        feasible.append((action, improvement))
+
+    if not feasible:
+        return "ENTER_NOW"
+    best_action, best_improvement = max(feasible, key=lambda item: item[1])
+    if best_improvement >= config.min_wait_improvement_pips:
+        return best_action
+    return "ENTER_NOW"
 
 
-def _feature_execution_cost_pips(
+def _immediate_adverse_label(
+    outcome: CandidateOutcomeRow,
+    *,
+    config: ActionLabelConfig,
+) -> int:
+    time_to_loss = _finite_or_none(outcome.time_to_loss_seconds)
+    mae = _finite_or_none(outcome.mae_pips) or 0.0
+    return int(
+        time_to_loss is not None
+        and time_to_loss <= config.immediate_adverse_window_seconds
+        and mae >= config.immediate_adverse_min_pips
+    )
+
+
+def _expected_pullback_pips(outcome: CandidateOutcomeRow) -> float:
+    values = [
+        _finite_or_none(outcome.wait_30s_improvement_pips),
+        _finite_or_none(outcome.wait_1m_improvement_pips),
+        _finite_or_none(outcome.wait_3m_improvement_pips),
+    ]
+    valid = [value for value in values if value is not None]
+    return max(0.0, max(valid)) if valid else 0.0
+
+
+def _continuation_label(
+    outcome: CandidateOutcomeRow,
+    *,
+    net_return_15m: float,
+    tp_before_sl: bool | None,
+) -> int:
+    mfe = float(outcome.mfe_pips or 0.0)
+    mae = float(outcome.mae_pips or 0.0)
+    return int(
+        net_return_15m > 0.0
+        and mfe > mae
+        and tp_before_sl is not False
+    )
+
+
+def _snapshot_breakout_candidate(candidate: TradeCandidateRow, *, lookback: int) -> bool:
+    snapshot = (candidate.payload or {}).get("market_snapshot") or {}
+    candles = snapshot.get("recent_candles") or []
+    if len(candles) < lookback + 1:
+        return False
+    current = candles[-1]
+    prior = candles[-1 - lookback:-1]
+    try:
+        close = float(current["close"])
+        if candidate.direction == "LONG":
+            return close > max(float(row["high"]) for row in prior)
+        if candidate.direction == "SHORT":
+            return close < min(float(row["low"]) for row in prior)
+    except (KeyError, TypeError, ValueError):
+        return False
+    return False
+
+
+def candidate_execution_cost_pips(
     candidate: TradeCandidateRow,
     outcome: CandidateOutcomeRow,
 ) -> float | None:
@@ -421,11 +568,15 @@ def main() -> None:
     parser.add_argument("--include-degraded", action="store_true")
     parser.add_argument("--min-wait-improvement-pips", type=float, default=1.0)
     parser.add_argument("--min-expected-return-pips", type=float, default=0.0)
+    parser.add_argument("--immediate-adverse-window-seconds", type=float, default=60.0)
+    parser.add_argument("--immediate-adverse-min-pips", type=float, default=1.0)
     args = parser.parse_args()
 
     config = ActionLabelConfig(
         min_expected_return_pips=args.min_expected_return_pips,
         min_wait_improvement_pips=args.min_wait_improvement_pips,
+        immediate_adverse_window_seconds=args.immediate_adverse_window_seconds,
+        immediate_adverse_min_pips=args.immediate_adverse_min_pips,
     )
     journal = StructuredJournal(args.database_url)
     try:
