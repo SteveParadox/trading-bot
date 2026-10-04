@@ -521,6 +521,12 @@ class MlPredictionSettings:
     target: str = "TP_BEFORE_SL"
     entry_model_path: str = ""
     entry_metadata_path: str = ""
+    immediate_adverse_model_path: str = ""
+    immediate_adverse_metadata_path: str = ""
+    continuation_model_path: str = ""
+    continuation_metadata_path: str = ""
+    fake_breakout_model_path: str = ""
+    fake_breakout_metadata_path: str = ""
     verify_hash: bool = True
 
     def __post_init__(self) -> None:
@@ -778,6 +784,12 @@ def settings_from_env() -> FxBotSettings:
             target=_get_str("FX_ML_TARGET", "TP_BEFORE_SL").upper(),
             entry_model_path=_get_str("FX_ML_ENTRY_MODEL_PATH", ""),
             entry_metadata_path=_get_str("FX_ML_ENTRY_MODEL_METADATA_PATH", ""),
+            immediate_adverse_model_path=_get_str("FX_ML_IMMEDIATE_ADVERSE_MODEL_PATH", ""),
+            immediate_adverse_metadata_path=_get_str("FX_ML_IMMEDIATE_ADVERSE_MODEL_METADATA_PATH", ""),
+            continuation_model_path=_get_str("FX_ML_CONTINUATION_MODEL_PATH", ""),
+            continuation_metadata_path=_get_str("FX_ML_CONTINUATION_MODEL_METADATA_PATH", ""),
+            fake_breakout_model_path=_get_str("FX_ML_FAKE_BREAKOUT_MODEL_PATH", ""),
+            fake_breakout_metadata_path=_get_str("FX_ML_FAKE_BREAKOUT_MODEL_METADATA_PATH", ""),
             verify_hash=_get_bool("FX_ML_VERIFY_MODEL_HASH", True),
         ),
         ai=AiDeliberationSettings(
