@@ -332,6 +332,7 @@ class StructuredJournal:
             "last_observed_at", "completed_at", "status", "observation_count",
             "first_touch", "first_touch_at", "tp_hit", "sl_hit", "tp_before_sl",
             "mfe_pips", "mae_pips", "time_to_mfe_seconds", "time_to_mae_seconds",
+            "time_to_tp_seconds", "time_to_sl_seconds",
             "return_1m_pips", "return_3m_pips", "return_5m_pips",
             "return_15m_pips", "return_30m_pips",
             "wait_30s_improvement_pips", "wait_1m_improvement_pips",
