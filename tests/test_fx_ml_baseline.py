@@ -1,13 +1,20 @@
 from __future__ import annotations
 
 import json
+from contextlib import closing
+from datetime import datetime, timedelta, timezone
 
+import numpy as np
 import pandas as pd
 import pytest
 
 from fxbot.baseline_model import XGBoostBaselineConfig, train_xgboost_baseline
 from fxbot.chronological_split import ChronologicalSplitConfig, chronological_split
-from fxbot.training_dataset import FEATURE_COLUMNS
+from fxbot.config import BrokerSettings, FxBotSettings, RiskSettings, StrategySettings
+from fxbot.historical_reconstruction import HistoricalReconstructionConfig, reconstruct_historical_candidates
+from fxbot.instruments import FxInstrument
+from fxbot.journal import StructuredJournal
+from fxbot.training_dataset import FEATURE_COLUMNS, build_training_dataset
 
 
 def _row(timestamp: str, candidate_id: str, target: int, value: float = 1.0) -> dict:
@@ -38,6 +45,147 @@ def _row(timestamp: str, candidate_id: str, target: int, value: float = 1.0) -> 
         else:
             row[column] = value
     return row
+
+
+def _trending_history(
+    start: str,
+    *,
+    rows: int,
+    freq: str,
+    price: float,
+    step: float,
+) -> pd.DataFrame:
+    index = pd.date_range(start, periods=rows, freq=freq)
+    close = price + np.arange(rows) * step
+    open_ = close - step * 0.5
+    return pd.DataFrame(
+        {
+            "open": open_,
+            "high": np.maximum(open_, close) + abs(step) * 2,
+            "low": np.minimum(open_, close) - abs(step) * 2,
+            "close": close,
+            "volume": np.linspace(100, 150, rows),
+            "spread_points": 10,
+        },
+        index=index,
+    )
+
+
+class _HistoricalSource:
+    def __init__(self) -> None:
+        self.entry = _trending_history(
+            "2023-12-25T00:00:00Z",
+            rows=900,
+            freq="15min",
+            price=1.0800,
+            step=0.00005,
+        )
+        self.htf = _trending_history(
+            "2023-12-20T00:00:00Z",
+            rows=400,
+            freq="1h",
+            price=1.0600,
+            step=0.00010,
+        )
+
+    def instruments(self, names):
+        return {name: FxInstrument(name) for name in names}
+
+    def historical_candles(self, instrument, timeframe, start, end):
+        frame = self.entry if timeframe == "15m" else self.htf
+        start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
+        return frame.loc[(frame.index >= start_ts) & (frame.index <= end_ts)].copy()
+
+    def historical_ticks(self, instrument, start, end):
+        start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
+        closed = self.entry.loc[self.entry.index + pd.Timedelta(minutes=15) <= start_ts]
+        if closed.empty:
+            return pd.DataFrame(columns=["timestamp", "instrument", "bid", "ask"])
+        base = float(closed.iloc[-1]["close"])
+        index = pd.date_range(start_ts, end_ts, freq="10s")
+        bid = base + np.arange(len(index)) * 0.00003
+        return pd.DataFrame({
+            "timestamp": index,
+            "instrument": instrument,
+            "bid": bid,
+            "ask": bid + 0.00010,
+        })
+
+
+def test_historical_reconstruction_builds_2024_candidate_outcome_and_training_row(tmp_path) -> None:
+    settings = FxBotSettings(
+        instruments=["EUR_USD"],
+        broker=BrokerSettings(),
+        strategy=StrategySettings(
+            require_volume_confirmation=False,
+            min_atr_pips=0.1,
+            max_atr_pips=100.0,
+            adx_min=10.0,
+            htf_adx_min=10.0,
+            trade_sessions_utc=(),
+            avoid_rollover_minutes=0,
+            close_before_weekend_minutes=0,
+            partial_tp_enabled=False,
+        ),
+        risk=RiskSettings(),
+    )
+    start = datetime(2024, 1, 2, 12, 0, tzinfo=timezone.utc)
+    with closing(StructuredJournal(f"sqlite:///{tmp_path / 'historical.db'}")) as journal:
+        report = reconstruct_historical_candidates(
+            source=_HistoricalSource(),
+            settings=settings,
+            journal=journal,
+            config=HistoricalReconstructionConfig(
+                start=start,
+                end=start + timedelta(minutes=1),
+                outcome_lag_tolerance_seconds=30,
+            ),
+            news_authoritative=False,
+        )
+
+        assert report["totals"]["decision_points"] == 1
+        assert report["totals"]["strategy_candidates"] == 1
+        assert report["totals"]["candidates_with_entry_quotes"] == 1
+        assert report["totals"]["complete_outcomes"] == 1
+
+        candidates = journal.recent_candidates()
+        assert len(candidates) == 1
+        candidate = candidates[0]
+        assert candidate.timestamp.replace(tzinfo=timezone.utc).year == 2024
+        assert candidate.payload["historical_reconstruction"] is True
+        assert candidate.executed is False
+
+        outcome = journal.find_candidate_outcome(candidate.candidate_id)
+        assert outcome.status == "complete"
+        assert outcome.observation_count > 100
+        assert outcome.tp_hit is True
+        assert outcome.tp_before_sl is True
+
+        dataset = build_training_dataset(journal)
+        assert len(dataset) == 1
+        assert dataset.iloc[0]["candidate_id"] == candidate.candidate_id
+        assert pd.Timestamp(dataset.iloc[0]["timestamp"]).year == 2024
+        assert dataset.iloc[0]["TP_BEFORE_SL"] == 1
+
+
+def test_historical_reconstruction_requires_authoritative_news_when_production_requires_it(tmp_path) -> None:
+    settings = FxBotSettings(
+        instruments=["EUR_USD"],
+        strategy=StrategySettings(require_news_data=True),
+    )
+    with closing(StructuredJournal(f"sqlite:///{tmp_path / 'historical.db'}")) as journal:
+        with pytest.raises(ValueError, match="authoritative historical news"):
+            reconstruct_historical_candidates(
+                source=_HistoricalSource(),
+                settings=settings,
+                journal=journal,
+                config=HistoricalReconstructionConfig(
+                    start=datetime(2024, 1, 2, tzinfo=timezone.utc),
+                    end=datetime(2024, 1, 3, tzinfo=timezone.utc),
+                ),
+                news_events=[],
+                news_authoritative=False,
+            )
 
 
 def test_chronological_split_uses_explicit_half_open_boundaries() -> None:
