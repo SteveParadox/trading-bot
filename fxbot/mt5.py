@@ -139,6 +139,98 @@ class Mt5Client:
             ["open", "high", "low", "close", "volume"]
         ].sort_index()
 
+    def historical_candles(
+        self,
+        instrument: str,
+        timeframe: str,
+        start: datetime,
+        end: datetime,
+    ) -> pd.DataFrame:
+        """Fetch historical MT5 bars for a corrected UTC interval.
+
+        Returned timestamps use the same explicit broker time correction as the
+        live candle path. Spread points are preserved for audit, but historical
+        candidate execution should prefer bid/ask ticks when available.
+        """
+
+        self._ensure_connected()
+        mt5 = self._module()
+        timeframe_value = self._timeframe(timeframe)
+        name = normalize_instrument_name(instrument)
+        symbol = self.settings.broker_symbol_for(name)
+        self._select_symbol(symbol)
+        start_utc = _coerce_utc(start)
+        end_utc = _coerce_utc(end)
+        if end_utc <= start_utc:
+            raise ValueError("historical candle end must be after start")
+        offset = timedelta(seconds=self.settings.time_offset_seconds)
+        rates = mt5.copy_rates_range(symbol, timeframe_value, start_utc - offset, end_utc - offset)
+        if rates is None:
+            self._mark_disconnected()
+            raise Mt5Error(f"MT5 copy_rates_range failed for {symbol}: {mt5.last_error()}")
+        frame = pd.DataFrame(rates)
+        if frame.empty:
+            return pd.DataFrame(columns=["open", "high", "low", "close", "volume", "spread_points"])
+        frame["timestamp"] = pd.to_datetime(
+            frame["time"] + self.settings.time_offset_seconds,
+            unit="s",
+            utc=True,
+        )
+        volume_column = "tick_volume" if "tick_volume" in frame.columns else "real_volume"
+        frame["volume"] = pd.to_numeric(frame.get(volume_column, 0), errors="coerce")
+        frame["spread_points"] = pd.to_numeric(frame.get("spread", 0), errors="coerce")
+        for column in ["open", "high", "low", "close"]:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        result = frame.dropna(subset=["open", "high", "low", "close"]).set_index("timestamp")[
+            ["open", "high", "low", "close", "volume", "spread_points"]
+        ].sort_index()
+        return result.loc[(result.index >= pd.Timestamp(start_utc)) & (result.index <= pd.Timestamp(end_utc))]
+
+    def historical_ticks(
+        self,
+        instrument: str,
+        start: datetime,
+        end: datetime,
+    ) -> pd.DataFrame:
+        """Fetch historical executable bid/ask ticks for one corrected UTC interval."""
+
+        self._ensure_connected()
+        mt5 = self._module()
+        name = normalize_instrument_name(instrument)
+        symbol = self.settings.broker_symbol_for(name)
+        self._select_symbol(symbol)
+        start_utc = _coerce_utc(start)
+        end_utc = _coerce_utc(end)
+        if end_utc <= start_utc:
+            raise ValueError("historical tick end must be after start")
+        offset = timedelta(seconds=self.settings.time_offset_seconds)
+        flags = _constant(mt5, "COPY_TICKS_INFO", _constant(mt5, "COPY_TICKS_ALL", 0))
+        ticks = mt5.copy_ticks_range(symbol, start_utc - offset, end_utc - offset, flags)
+        if ticks is None:
+            self._mark_disconnected()
+            raise Mt5Error(f"MT5 copy_ticks_range failed for {symbol}: {mt5.last_error()}")
+        frame = pd.DataFrame(ticks)
+        if frame.empty:
+            return pd.DataFrame(columns=["timestamp", "instrument", "bid", "ask"])
+        if "time_msc" in frame.columns:
+            raw_time = pd.to_numeric(frame["time_msc"], errors="coerce") + self.settings.time_offset_seconds * 1000
+            frame["timestamp"] = pd.to_datetime(raw_time, unit="ms", utc=True)
+        else:
+            raw_time = pd.to_numeric(frame["time"], errors="coerce") + self.settings.time_offset_seconds
+            frame["timestamp"] = pd.to_datetime(raw_time, unit="s", utc=True)
+        frame["bid"] = pd.to_numeric(frame.get("bid"), errors="coerce")
+        frame["ask"] = pd.to_numeric(frame.get("ask"), errors="coerce")
+        frame["instrument"] = name
+        result = frame.dropna(subset=["timestamp", "bid", "ask"])[
+            ["timestamp", "instrument", "bid", "ask"]
+        ]
+        result = result[(result["bid"] > 0) & (result["ask"] > result["bid"])]
+        result = result.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
+        return result.loc[
+            (result["timestamp"] >= pd.Timestamp(start_utc))
+            & (result["timestamp"] <= pd.Timestamp(end_utc))
+        ].reset_index(drop=True)
+
     def open_positions(self) -> list[dict[str, Any]]:
         self._ensure_connected()
         grouped: dict[str, dict[str, Any]] = {}
@@ -847,3 +939,9 @@ def _naive_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value
     return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _coerce_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
