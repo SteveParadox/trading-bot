@@ -147,3 +147,22 @@ def test_config_endpoint_does_not_expose_news_provider_key() -> None:
     assert payload["strategy"]["news_api_key_configured"] is True
     assert "calendar-secret" not in str(payload)
     assert "news_api_key" not in payload["strategy"]
+
+
+def test_config_endpoint_does_not_expose_ml_artifact_paths() -> None:
+    payload = _config_payload(
+        FxBotSettings(
+            ml_prediction=MlPredictionSettings(
+                mode="shadow",
+                model_path="/private/models/xgb.joblib",
+                metadata_path="/private/models/xgb.metadata.json",
+            )
+        )
+    )
+
+    assert payload["ml_prediction"]["mode"] == "shadow"
+    assert payload["ml_prediction"]["model_path_configured"] is True
+    assert payload["ml_prediction"]["metadata_path_configured"] is True
+    assert "/private/models" not in str(payload)
+    assert "model_path" not in payload["ml_prediction"]
+    assert "metadata_path" not in payload["ml_prediction"]
