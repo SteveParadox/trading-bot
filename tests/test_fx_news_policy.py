@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from fxbot.api import _config_payload
-from fxbot.config import FxBotSettings, NewsEvent, StrategySettings
+from fxbot.config import FxBotSettings, MlPredictionSettings, NewsEvent, StrategySettings
 from fxbot.market_hours import can_trade
 from fxbot.news import NewsSnapshot, deduplicate_events
 
@@ -156,6 +156,8 @@ def test_config_endpoint_does_not_expose_ml_artifact_paths() -> None:
                 mode="shadow",
                 model_path="/private/models/xgb.joblib",
                 metadata_path="/private/models/xgb.metadata.json",
+                entry_model_path="/private/models/entry.joblib",
+                entry_metadata_path="/private/models/entry.metadata.json",
             )
         )
     )
@@ -163,6 +165,10 @@ def test_config_endpoint_does_not_expose_ml_artifact_paths() -> None:
     assert payload["ml_prediction"]["mode"] == "shadow"
     assert payload["ml_prediction"]["model_path_configured"] is True
     assert payload["ml_prediction"]["metadata_path_configured"] is True
+    assert payload["ml_prediction"]["entry_model_path_configured"] is True
+    assert payload["ml_prediction"]["entry_metadata_path_configured"] is True
     assert "/private/models" not in str(payload)
     assert "model_path" not in payload["ml_prediction"]
     assert "metadata_path" not in payload["ml_prediction"]
+    assert "entry_model_path" not in payload["ml_prediction"]
+    assert "entry_metadata_path" not in payload["ml_prediction"]
