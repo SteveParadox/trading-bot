@@ -287,6 +287,20 @@ class StructuredJournal:
                 session.expunge(row)
             return rows
 
+    def candidates_since(self, start: datetime, limit: int = 500) -> list[TradeCandidateRow]:
+        with self.sessions() as session:
+            rows = list(
+                session.scalars(
+                    select(TradeCandidateRow)
+                    .where(TradeCandidateRow.timestamp >= _aware(start))
+                    .order_by(desc(TradeCandidateRow.timestamp))
+                    .limit(limit)
+                )
+            )
+            for row in rows:
+                session.expunge(row)
+            return rows
+
     def ensure_candidate_outcome(
         self,
         *,
