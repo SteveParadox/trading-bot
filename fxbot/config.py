@@ -512,6 +512,31 @@ class RuntimeSettings:
 
 
 @dataclass(frozen=True)
+class MlPredictionSettings:
+    """Configuration for the local numerical trade-quality predictor."""
+
+    mode: str = "off"
+    model_path: str = ""
+    metadata_path: str = ""
+    target: str = "TP_BEFORE_SL"
+    verify_hash: bool = True
+
+    def __post_init__(self) -> None:
+        mode = self.mode.lower().strip()
+        if mode not in {"off", "shadow", "required"}:
+            raise ValueError("ml_prediction.mode must be off, shadow, or required")
+        if self.target not in {
+            "TP_BEFORE_SL",
+            "PROFITABLE_WITHIN_5_MIN",
+            "PROFITABLE_WITHIN_15_MIN",
+        }:
+            raise ValueError("ml_prediction.target is not supported")
+        if mode == "required" and (not self.model_path or not self.metadata_path):
+            raise ValueError("required ML prediction needs model_path and metadata_path")
+        object.__setattr__(self, "mode", mode)
+
+
+@dataclass(frozen=True)
 class AiDeliberationSettings:
     """Configuration for the isolated, optional signal-audit service.
 
@@ -603,6 +628,7 @@ class FxBotSettings:
     risk: RiskSettings = field(default_factory=RiskSettings)
     runtime: RuntimeSettings = field(default_factory=RuntimeSettings)
     ai: AiDeliberationSettings = field(default_factory=AiDeliberationSettings)
+    ml_prediction: MlPredictionSettings = field(default_factory=MlPredictionSettings)
     news_events: list[NewsEvent] = field(default_factory=list)
     sniper: SniperSettings = field(default_factory=SniperSettings)
 
@@ -739,6 +765,13 @@ def settings_from_env() -> FxBotSettings:
             live_trading_enabled=_get_bool("FX_LIVE_TRADING_ENABLED", False),
             live_release_ack=_get_str("FX_LIVE_RELEASE_ACK", ""),
             max_price_age_seconds=_get_int("FX_MAX_PRICE_AGE_SECONDS", 120),
+        ),
+        ml_prediction=MlPredictionSettings(
+            mode=_get_str("FX_ML_PREDICTION_MODE", "off"),
+            model_path=_get_str("FX_ML_MODEL_PATH", ""),
+            metadata_path=_get_str("FX_ML_MODEL_METADATA_PATH", ""),
+            target=_get_str("FX_ML_TARGET", "TP_BEFORE_SL").upper(),
+            verify_hash=_get_bool("FX_ML_VERIFY_MODEL_HASH", True),
         ),
         ai=AiDeliberationSettings(
             mode=_get_str("FX_AI_DELIBERATION", "off"),
