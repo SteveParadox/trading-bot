@@ -275,7 +275,17 @@ class StructuredJournal:
             return row
 
     def recent_candidates(self, limit: int = 200) -> list[TradeCandidateRow]:
-        return _recent(self.sessions, TradeCandidateRow, limit)
+        with self.sessions() as session:
+            rows = list(
+                session.scalars(
+                    select(TradeCandidateRow)
+                    .order_by(desc(TradeCandidateRow.timestamp))
+                    .limit(limit)
+                )
+            )
+            for row in rows:
+                session.expunge(row)
+            return rows
 
     def ensure_candidate_outcome(
         self,
@@ -359,7 +369,17 @@ class StructuredJournal:
             return row
 
     def recent_candidate_outcomes(self, limit: int = 200) -> list[CandidateOutcomeRow]:
-        return _recent(self.sessions, CandidateOutcomeRow, limit)
+        with self.sessions() as session:
+            rows = list(
+                session.scalars(
+                    select(CandidateOutcomeRow)
+                    .order_by(desc(CandidateOutcomeRow.started_at))
+                    .limit(limit)
+                )
+            )
+            for row in rows:
+                session.expunge(row)
+            return rows
 
     def record_ai_deliberation(self, *, payload: dict[str, Any]) -> tuple[AiDeliberationRow, bool]:
         """Persist a validated audit or failure idempotently by parent signal."""
