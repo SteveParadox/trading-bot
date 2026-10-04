@@ -158,6 +158,12 @@ def test_config_endpoint_does_not_expose_ml_artifact_paths() -> None:
                 metadata_path="/private/models/xgb.metadata.json",
                 entry_model_path="/private/models/entry.joblib",
                 entry_metadata_path="/private/models/entry.metadata.json",
+                immediate_adverse_model_path="/private/models/adverse.joblib",
+                immediate_adverse_metadata_path="/private/models/adverse.metadata.json",
+                continuation_model_path="/private/models/continuation.joblib",
+                continuation_metadata_path="/private/models/continuation.metadata.json",
+                fake_breakout_model_path="/private/models/fake.joblib",
+                fake_breakout_metadata_path="/private/models/fake.metadata.json",
             )
         )
     )
@@ -167,6 +173,9 @@ def test_config_endpoint_does_not_expose_ml_artifact_paths() -> None:
     assert payload["ml_prediction"]["metadata_path_configured"] is True
     assert payload["ml_prediction"]["entry_model_path_configured"] is True
     assert payload["ml_prediction"]["entry_metadata_path_configured"] is True
+    assert payload["ml_prediction"]["immediate_adverse_model_configured"] is True
+    assert payload["ml_prediction"]["continuation_model_configured"] is True
+    assert payload["ml_prediction"]["fake_breakout_model_configured"] is True
     assert "/private/models" not in str(payload)
     assert "model_path" not in payload["ml_prediction"]
     assert "metadata_path" not in payload["ml_prediction"]
