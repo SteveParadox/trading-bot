@@ -89,6 +89,47 @@ class TradeCandidateRow(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False, onupdate=utc_now)
 
 
+class CandidateOutcomeRow(Base):
+    """Forward-observed market outcome for one strategy-generated candidate.
+
+    Values are derived only from quotes observed after candidate creation.
+    Sampling-quality metadata prevents scan-sampled labels from being mistaken
+    for tick-perfect market paths.
+    """
+
+    __tablename__ = "candidate_outcomes"
+
+    candidate_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
+    last_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="tracking", nullable=False, index=True)
+    observation_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    first_touch: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    first_touch_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    tp_hit: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    sl_hit: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    tp_before_sl: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    mfe_pips: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    mae_pips: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    time_to_mfe_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    time_to_mae_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    return_1m_pips: Mapped[float | None] = mapped_column(Float, nullable=True)
+    return_3m_pips: Mapped[float | None] = mapped_column(Float, nullable=True)
+    return_5m_pips: Mapped[float | None] = mapped_column(Float, nullable=True)
+    return_15m_pips: Mapped[float | None] = mapped_column(Float, nullable=True)
+    return_30m_pips: Mapped[float | None] = mapped_column(Float, nullable=True)
+    wait_30s_improvement_pips: Mapped[float | None] = mapped_column(Float, nullable=True)
+    wait_1m_improvement_pips: Mapped[float | None] = mapped_column(Float, nullable=True)
+    wait_3m_improvement_pips: Mapped[float | None] = mapped_column(Float, nullable=True)
+    wait_5m_improvement_pips: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_observation_gap_seconds: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    data_quality: Mapped[str] = mapped_column(String(32), default="good", nullable=False, index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False, onupdate=utc_now)
+
+
 class OrderJournalRow(Base):
     __tablename__ = "order_journal"
     __table_args__ = (UniqueConstraint("client_order_id", name="uq_order_client_id"),)
