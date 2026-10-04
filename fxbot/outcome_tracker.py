@@ -115,20 +115,25 @@ class CandidateOutcomeTracker:
             outcome = self.journal.find_candidate_outcome(candidate.candidate_id)
             if outcome is not None and outcome.status in {"complete", "incomplete"}:
                 continue
-            if outcome is None and age > MAX_OUTCOME_HORIZON_SECONDS + self.observation_lag_tolerance_seconds:
-                # A process interruption prevented any valid forward sampling.
-                self.journal.ensure_candidate_outcome(
-                    candidate_id=candidate.candidate_id,
-                    started_at=started,
-                    payload={
-                        "sampling_method": "forward_scan_executable_quotes",
-                        "label_version": "v1",
-                        "lag_tolerance_seconds": self.observation_lag_tolerance_seconds,
-                        "missed_horizons": sorted(
-                            [*RETURN_HORIZONS_SECONDS.keys(), *WAIT_HORIZONS_SECONDS.keys()]
-                        ),
-                    },
-                )
+            if age > MAX_OUTCOME_HORIZON_SECONDS + self.observation_lag_tolerance_seconds:
+                # Never use a quote arriving well after the label horizon to
+                # fabricate missing 30-minute/path labels.
+                if outcome is None:
+                    self.journal.ensure_candidate_outcome(
+                        candidate_id=candidate.candidate_id,
+                        started_at=started,
+                        payload={
+                            "sampling_method": "forward_scan_executable_quotes",
+                            "label_version": "v1",
+                            "lag_tolerance_seconds": self.observation_lag_tolerance_seconds,
+                            "missed_horizons": sorted(
+                                [*RETURN_HORIZONS_SECONDS.keys(), *WAIT_HORIZONS_SECONDS.keys()]
+                            ),
+                        },
+                    )
+                    reason = "tracker_started_after_horizon"
+                else:
+                    reason = "tracking_gap_exceeded_horizon"
                 self.journal.update_candidate_outcome(
                     candidate.candidate_id,
                     values={
@@ -136,7 +141,7 @@ class CandidateOutcomeTracker:
                         "completed_at": now,
                         "data_quality": "degraded",
                     },
-                    payload_update={"incomplete_reason": "tracker_started_after_horizon"},
+                    payload_update={"incomplete_reason": reason},
                 )
                 continue
 
@@ -181,16 +186,23 @@ class CandidateOutcomeTracker:
         if outcome is None or outcome.status in {"complete", "incomplete"}:
             return
 
-        observed = _utc(observed_at)
         started = _utc(candidate.timestamp)
+        requested_observed = _utc(observed_at)
+        quote_observed = _utc(price.time)
+        # The first sample is the decision-time baseline: the quote was known
+        # then even if its broker tick timestamp is a few seconds older. Every
+        # subsequent sample must advance on an actually newer broker tick.
+        observed = (
+            max(requested_observed, started)
+            if outcome.observation_count == 0
+            else quote_observed
+        )
         elapsed = (observed - started).total_seconds()
         if elapsed < 0:
             return
         if not _valid_quote(price):
             return
         if outcome.last_observed_at is not None and observed <= _utc(outcome.last_observed_at):
-            # The polling loop may see the same broker tick repeatedly. A
-            # repeated quote is not a new future observation.
             return
 
         side = Side(candidate.direction)
