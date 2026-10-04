@@ -26,12 +26,16 @@ from fxbot.database import (
     PositionSnapshotRow,
     RunManifestRow,
     SignalJournalRow,
+    TradeCandidateRow,
     TradeJournalRow,
     session_factory,
     utc_now,
 )
 from fxbot.models import BotRunState
 from fxbot.security import redact
+
+
+_UNSET = object()
 
 
 class StructuredJournal:
@@ -157,6 +161,120 @@ class StructuredJournal:
             session.expunge(row)
         self.write_jsonl("signal_updated", row)
         return row
+
+    def record_candidate(
+        self,
+        *,
+        candidate_id: str,
+        timestamp: datetime,
+        symbol: str,
+        direction: str,
+        entry: float,
+        spread: float,
+        strategy_signal: str,
+        stop_loss: float | None = None,
+        take_profit: float | None = None,
+        atr: float | None = None,
+        momentum: float | None = None,
+        trend_strength: float | None = None,
+        news_risk: dict[str, Any] | None = None,
+        executed: bool = False,
+        rejection_reason: str | None = None,
+        status: str = "generated",
+        payload: dict[str, Any] | None = None,
+        strategy_hash: str | None = None,
+        code_version: str | None = None,
+        data_hash: str | None = None,
+        experiment_manifest_hash: str | None = None,
+    ) -> tuple[TradeCandidateRow, bool]:
+        """Persist the first observation of a strategy candidate idempotently."""
+
+        with self.sessions() as session:
+            existing = session.get(TradeCandidateRow, candidate_id)
+            if existing is not None:
+                session.expunge(existing)
+                return existing, False
+
+        row = TradeCandidateRow(
+            candidate_id=str(candidate_id),
+            timestamp=_aware(timestamp),
+            symbol=symbol.upper(),
+            direction=str(direction),
+            entry=float(entry),
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            spread=float(spread),
+            atr=atr,
+            momentum=momentum,
+            trend_strength=trend_strength,
+            news_risk=_jsonable(news_risk or {}),
+            strategy_signal=str(strategy_signal),
+            executed=bool(executed),
+            rejection_reason=rejection_reason,
+            status=str(status),
+            payload=_jsonable(payload or {}),
+            strategy_hash=strategy_hash or self.strategy_hash,
+            code_version=code_version or self.code_version,
+            data_hash=data_hash or self.data_hash,
+            experiment_manifest_hash=experiment_manifest_hash or self.experiment_manifest_hash,
+        )
+        try:
+            with self.sessions.begin() as session:
+                session.add(row)
+                session.flush()
+                session.expunge(row)
+        except IntegrityError:
+            existing = self.find_candidate(candidate_id)
+            if existing is not None:
+                return existing, False
+            raise
+        self.write_jsonl("candidate", row)
+        return row, True
+
+    def update_candidate(
+        self,
+        candidate_id: str,
+        *,
+        status: str | None = None,
+        executed: bool | None = None,
+        rejection_reason: str | None | object = _UNSET,
+        stop_loss: float | None | object = _UNSET,
+        take_profit: float | None | object = _UNSET,
+        payload_update: dict[str, Any] | None = None,
+    ) -> TradeCandidateRow | None:
+        """Update candidate lifecycle fields without replacing first-observation features."""
+
+        with self.sessions.begin() as session:
+            row = session.get(TradeCandidateRow, candidate_id)
+            if row is None:
+                return None
+            if status is not None:
+                row.status = str(status)
+            if executed is not None:
+                row.executed = bool(executed)
+            if rejection_reason is not _UNSET:
+                row.rejection_reason = rejection_reason
+            if stop_loss is not _UNSET:
+                row.stop_loss = stop_loss
+            if take_profit is not _UNSET:
+                row.take_profit = take_profit
+            if payload_update:
+                row.payload = _jsonable({**(row.payload or {}), **payload_update})
+            row.updated_at = utc_now()
+            session.flush()
+            session.expunge(row)
+        self.write_jsonl("candidate_updated", row)
+        return row
+
+    def find_candidate(self, candidate_id: str) -> TradeCandidateRow | None:
+        with self.sessions() as session:
+            row = session.get(TradeCandidateRow, candidate_id)
+            if row is not None:
+                session.expunge(row)
+            return row
+
+    def recent_candidates(self, limit: int = 200) -> list[TradeCandidateRow]:
+        return _recent(self.sessions, TradeCandidateRow, limit)
 
     def record_ai_deliberation(self, *, payload: dict[str, Any]) -> tuple[AiDeliberationRow, bool]:
         """Persist a validated audit or failure idempotently by parent signal."""
