@@ -213,6 +213,8 @@ class StructuredJournalTests(unittest.TestCase):
                 self.assertEqual(outcome.status, "complete")
                 self.assertEqual(outcome.first_touch, "TP")
                 self.assertTrue(outcome.tp_before_sl)
+                self.assertAlmostEqual(outcome.time_to_tp_seconds, 90.0)
+                self.assertIsNone(outcome.time_to_sl_seconds)
                 self.assertAlmostEqual(outcome.mfe_pips, 11.0)
                 self.assertAlmostEqual(outcome.mae_pips, 5.0)
                 self.assertAlmostEqual(outcome.return_1m_pips, 4.0)
@@ -226,6 +228,34 @@ class StructuredJournalTests(unittest.TestCase):
                 self.assertAlmostEqual(outcome.wait_5m_improvement_pips, -9.0)
                 self.assertTrue(outcome.payload["spread_included_in_returns"])
                 self.assertFalse(outcome.payload["commission_and_slippage_included"])
+
+    def test_candidate_outcomes_ignore_repeated_broker_tick(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with closing(StructuredJournal(f"sqlite:///{Path(tmp) / 'journal.db'}")) as journal:
+                start = datetime(2026, 10, 4, 10, 0, tzinfo=timezone.utc)
+                candidate, _ = journal.record_candidate(
+                    candidate_id="fxsig-repeat-tick", timestamp=start, symbol="EUR_USD", direction="LONG",
+                    entry=1.1002, stop_loss=1.0992, take_profit=1.1012, spread=0.0002,
+                    strategy_signal="signal_confirmed",
+                )
+                tracker = CandidateOutcomeTracker(journal)
+                instrument = FxInstrument("EUR_USD")
+                tracker.seed(
+                    candidate=candidate,
+                    price=PriceSnapshot("EUR_USD", bid=1.1000, ask=1.1002, time=start),
+                    instrument=instrument,
+                    observed_at=start,
+                )
+                same_tick = PriceSnapshot("EUR_USD", bid=1.1000, ask=1.1002, time=start)
+                tracker.observe(
+                    candidate=candidate,
+                    price=same_tick,
+                    instrument=instrument,
+                    observed_at=start + timedelta(seconds=60),
+                )
+                outcome = journal.find_candidate_outcome(candidate.candidate_id)
+                self.assertEqual(outcome.observation_count, 1)
+                self.assertIsNone(outcome.return_1m_pips)
 
     def test_candidate_outcomes_do_not_backfill_missed_horizons(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
