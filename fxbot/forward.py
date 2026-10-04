@@ -487,6 +487,9 @@ class ForwardTestWorker:
                 "hard_news_gate": "passed",
                 "signal_score": intent.score,
                 "signal_time": intent.timestamp.isoformat(),
+                "execution_cost_pips_round_trip": (
+                    float(intent.metadata.get("execution_cost_price", 0.0)) / instrument.pip_size
+                ),
             },
             strategy_hash=self.strategy_hash,
             code_version=self.code_version,
@@ -621,7 +624,13 @@ class ForwardTestWorker:
                 rejection_reason=risk.reason,
                 stop_loss=risk.exit_plan.stop_loss if risk.exit_plan else None,
                 take_profit=risk.exit_plan.take_profit if risk.exit_plan else None,
-                payload_update={"risk": asdict(risk)},
+                payload_update={
+                    "risk": asdict(risk),
+                    "execution_cost_pips_round_trip": (
+                        float(risk.metadata.get("execution_cost_price", intent.metadata.get("execution_cost_price", 0.0)))
+                        / instrument.pip_size
+                    ),
+                },
             )
             if risk.exit_plan is not None:
                 self.journal.update_candidate_outcome(
@@ -663,7 +672,14 @@ class ForwardTestWorker:
             rejection_reason=None,
             stop_loss=risk.exit_plan.stop_loss,
             take_profit=risk.exit_plan.take_profit,
-            payload_update={"risk": asdict(risk), "market_snapshot": market_snapshot_payload},
+            payload_update={
+                "risk": asdict(risk),
+                "market_snapshot": market_snapshot_payload,
+                "execution_cost_pips_round_trip": (
+                    float(risk.metadata.get("execution_cost_price", intent.metadata.get("execution_cost_price", 0.0)))
+                    / instrument.pip_size
+                ),
+            },
         )
 
         self.journal.update_candidate_outcome(
