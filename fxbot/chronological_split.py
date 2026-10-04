@@ -61,8 +61,10 @@ def chronological_split(
 
     cfg = config or ChronologicalSplitConfig()
     cfg.validate()
-    if "timestamp" not in frame.columns:
-        raise ValueError("dataset is missing required timestamp column")
+    required = {"timestamp", "candidate_id"}
+    missing = sorted(required.difference(frame.columns))
+    if missing:
+        raise ValueError(f"dataset is missing required split columns: {missing}")
 
     working = frame.copy()
     timestamps = pd.to_datetime(working["timestamp"], utc=True, errors="raise")
