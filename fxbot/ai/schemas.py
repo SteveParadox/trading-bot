@@ -66,6 +66,8 @@ class NumericalPrediction:
     entry_model_version: str | None = None
     entry_model_hash: str | None = None
     entry_action_error: str | None = None
+    auxiliary_models: dict[str, dict[str, str]] | None = None
+    auxiliary_errors: dict[str, str] | None = None
     model_name: str | None = None
     model_version: str | None = None
     model_hash: str | None = None
