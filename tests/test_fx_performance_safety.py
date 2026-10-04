@@ -6,12 +6,20 @@ from unittest.mock import AsyncMock, Mock, patch
 import pandas as pd
 import pytest
 
-from fxbot.config import FxBotSettings, RuntimeSettings, StrategySettings, RiskSettings
+from fxbot.config import (
+    AiDeliberationSettings,
+    FxBotSettings,
+    NewsEvent,
+    RuntimeSettings,
+    StrategySettings,
+    RiskSettings,
+)
 from fxbot.config import settings_from_env
 from fxbot.forward import ForwardTestWorker, candles_are_current
 from fxbot.instruments import FxInstrument, PriceSnapshot
 from fxbot.journal import StructuredJournal
 from fxbot.models import BotRunState, FxPortfolioState, FxSignalIntent, Side
+from fxbot.news import NewsSnapshot
 from fxbot.mt5 import Mt5Error
 from fxbot.operations import freshness
 from fxbot.risk import FxRiskManager
@@ -27,6 +35,39 @@ def worker(tmp_path):
     result = ForwardTestWorker(settings, client=client, journal=journal)
     yield result
     result.close()
+
+
+class WeekendDatetime(datetime):
+    @classmethod
+    def now(cls, tz=None):
+        value = datetime(2026, 1, 10, 14, 0, tzinfo=timezone.utc)
+        return value if tz is None else value.astimezone(tz)
+
+
+def _shadow_ai_spy(worker: ForwardTestWorker) -> Mock:
+    worker.settings = replace(
+        worker.settings,
+        ai=AiDeliberationSettings(mode="shadow", provider="none"),
+    )
+    spy = Mock()
+    spy.deliberate.side_effect = AssertionError(
+        "AI deliberation must not run before hard safety gates pass"
+    )
+    worker.deliberator = spy
+    return spy
+
+
+def _permissive_strategy() -> StrategySettings:
+    return StrategySettings(
+        partial_tp_enabled=False,
+        trade_sessions_utc=(),
+        avoid_rollover_minutes=0,
+        require_volume_confirmation=False,
+        min_atr_pips=0.1,
+        max_atr_pips=30,
+        adx_min=10,
+        htf_adx_min=10,
+    )
 
 
 @pytest.mark.parametrize("state", [BotRunState.PAUSED, BotRunState.HALTED])
@@ -55,6 +96,220 @@ def test_stale_other_symbol_does_not_disable_fresh_position_management(worker):
         worker.scan_once()
     assert worker._sync_open_trades.call_args.args[2] == {"EUR_USD": fresh}
     worker._scan_instrument.assert_not_called()
+
+
+def test_shadow_ai_not_reached_when_live_release_gate_blocks(worker):
+    spy = _shadow_ai_spy(worker)
+    worker.settings = replace(
+        worker.settings,
+        broker=replace(worker.settings.broker, demo_only=False),
+        runtime=replace(
+            worker.settings.runtime,
+            live_trading_enabled=False,
+            live_release_ack="",
+        ),
+    )
+    worker.journal.set_state(BotRunState.RUNNING)
+    with patch("fxbot.forward.datetime", FixedDatetime):
+        worker.scan_once()
+
+    spy.deliberate.assert_not_called()
+    assert worker.client.created_orders == []
+    assert worker.journal.get_state().state == BotRunState.HALTED.value
+
+
+def test_shadow_ai_not_reached_when_live_enable_is_true_without_release_ack(worker):
+    spy = _shadow_ai_spy(worker)
+    worker.settings = replace(
+        worker.settings,
+        broker=replace(worker.settings.broker, demo_only=False),
+        runtime=replace(
+            worker.settings.runtime,
+            live_trading_enabled=True,
+            live_release_ack="WRONG_ACK",
+        ),
+    )
+    worker.journal.set_state(BotRunState.RUNNING)
+    with patch("fxbot.forward.datetime", FixedDatetime):
+        worker.scan_once()
+
+    spy.deliberate.assert_not_called()
+    assert worker.client.created_orders == []
+    assert worker.journal.get_state().state == BotRunState.HALTED.value
+
+
+def test_shadow_ai_not_reached_on_stale_price_data(worker):
+    spy = _shadow_ai_spy(worker)
+    worker.journal.set_state(BotRunState.RUNNING)
+    worker.client.price = replace(
+        worker.client.price,
+        time=FIXED_NOW - timedelta(hours=1),
+    )
+    with patch("fxbot.forward.datetime", FixedDatetime):
+        worker.scan_once()
+
+    spy.deliberate.assert_not_called()
+    assert worker.client.created_orders == []
+
+
+def test_shadow_ai_not_reached_when_fx_market_is_closed(worker):
+    spy = _shadow_ai_spy(worker)
+    weekend = datetime(2026, 1, 10, 14, 0, tzinfo=timezone.utc)
+    worker.client.price = replace(worker.client.price, time=weekend)
+    worker.journal.set_state(BotRunState.RUNNING)
+
+    with patch("fxbot.forward.datetime", WeekendDatetime):
+        worker.scan_once()
+
+    spy.deliberate.assert_not_called()
+    assert worker.client.created_orders == []
+
+
+def test_shadow_ai_not_reached_when_absolute_spread_gate_blocks(worker):
+    spy = _shadow_ai_spy(worker)
+    worker.settings = replace(
+        worker.settings,
+        strategy=replace(
+            worker.settings.strategy,
+            trade_sessions_utc=(),
+            max_spread_pips=0.1,
+        ),
+    )
+    worker.journal.set_state(BotRunState.RUNNING)
+
+    with patch("fxbot.forward.datetime", FixedDatetime):
+        worker.scan_once()
+
+    spy.deliberate.assert_not_called()
+    assert worker.client.created_orders == []
+
+
+def test_shadow_ai_not_reached_when_news_gate_blocks(worker):
+    spy = _shadow_ai_spy(worker)
+    event_time = FIXED_NOW + timedelta(minutes=10)
+    worker.news.ensure_current = Mock(
+        return_value=NewsSnapshot(
+            events=[
+                NewsEvent(
+                    "US CPI",
+                    "USD",
+                    "high",
+                    event_time,
+                    event_time + timedelta(minutes=15),
+                    impact_score=95,
+                )
+            ],
+            stale=False,
+        )
+    )
+    worker.journal.set_state(BotRunState.RUNNING)
+
+    with patch("fxbot.forward.datetime", FixedDatetime):
+        worker.scan_once()
+
+    spy.deliberate.assert_not_called()
+    assert worker.client.created_orders == []
+
+
+def test_shadow_ai_not_reached_after_max_daily_loss_halt(worker):
+    spy = _shadow_ai_spy(worker)
+    worker.journal.set_state(BotRunState.RUNNING)
+    worker.journal.update_protection_state(
+        timestamp=FIXED_NOW,
+        equity=10_000,
+        max_daily_loss_pct=worker.settings.risk.max_daily_loss_pct,
+        max_drawdown_pct=worker.settings.risk.max_drawdown_pct,
+    )
+    worker.client.account_summary = Mock(return_value={
+        "NAV": 9_000.0,
+        "balance": 9_000.0,
+        "marginUsed": 0.0,
+        "openPositionCount": 0,
+        "currency": "USD",
+        "positionValue": 0.0,
+    })
+
+    with patch("fxbot.forward.datetime", FixedDatetime):
+        worker.scan_once()
+
+    spy.deliberate.assert_not_called()
+    assert worker.client.created_orders == []
+
+
+def test_shadow_ai_not_reached_when_portfolio_risk_limit_blocks(worker):
+    spy = _shadow_ai_spy(worker)
+    strategy = _permissive_strategy()
+    risk_settings = replace(
+        worker.settings.risk,
+        max_portfolio_risk_pct=0.01,
+        max_pair_exposure_pct=10.0,
+        max_gross_exposure_pct=10.0,
+        max_currency_exposure_pct=10.0,
+    )
+    worker.settings = replace(
+        worker.settings,
+        strategy=strategy,
+        risk=risk_settings,
+    )
+    worker.risk = FxRiskManager(risk_settings, strategy)
+    news = NewsSnapshot(events=[], stale=False)
+    portfolio = FxPortfolioState(
+        10_000,
+        10_000,
+        0,
+        0,
+        portfolio_risk=100.0,
+    )
+
+    worker._scan_instrument(
+        FIXED_NOW,
+        FxInstrument("EUR_USD"),
+        worker.client.price,
+        portfolio,
+        {},
+        news,
+    )
+
+    spy.deliberate.assert_not_called()
+    assert worker.client.created_orders == []
+
+
+def test_shadow_ai_not_reached_when_max_exposure_blocks(worker):
+    spy = _shadow_ai_spy(worker)
+    strategy = _permissive_strategy()
+    risk_settings = replace(
+        worker.settings.risk,
+        max_portfolio_risk_pct=1.0,
+        max_pair_exposure_pct=10.0,
+        max_gross_exposure_pct=0.01,
+        max_currency_exposure_pct=10.0,
+    )
+    worker.settings = replace(
+        worker.settings,
+        strategy=strategy,
+        risk=risk_settings,
+    )
+    worker.risk = FxRiskManager(risk_settings, strategy)
+    news = NewsSnapshot(events=[], stale=False)
+    portfolio = FxPortfolioState(
+        10_000,
+        10_000,
+        0,
+        0,
+        gross_exposure=100.0,
+    )
+
+    worker._scan_instrument(
+        FIXED_NOW,
+        FxInstrument("EUR_USD"),
+        worker.client.price,
+        portfolio,
+        {},
+        news,
+    )
+
+    spy.deliberate.assert_not_called()
+    assert worker.client.created_orders == []
 
 
 @pytest.mark.parametrize("state", [BotRunState.RUNNING, BotRunState.PAUSED, BotRunState.HALTED])
