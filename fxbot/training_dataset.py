@@ -27,6 +27,43 @@ from fxbot.journal import StructuredJournal
 TRAINING_DATASET_VERSION = "v1"
 ACTION_LABEL_VERSION = "v1"
 
+IDENTIFIER_COLUMNS = [
+    "dataset_version", "candidate_id", "timestamp", "feature_version",
+    "label_version", "strategy_hash", "code_version",
+]
+
+FEATURE_COLUMNS = [
+    "symbol", "direction", "strategy_signal", "strategy_score",
+    "hour_utc", "day_of_week", "session",
+    "bid", "ask", "spread_pips", "spread_relative_to_atr",
+    "atr_price", "atr_pips", "rsi", "momentum", "trend_strength", "volatility",
+    "support_distance_pips", "resistance_distance_pips", "risk_reward",
+    "proposed_entry", "stop_loss", "take_profit",
+    "open_positions", "portfolio_risk", "gross_exposure", "pair_exposure",
+    "free_margin", "account_currency",
+    "news_risk", "news_risk_score", "upcoming_news_currency",
+    "upcoming_news_impact", "minutes_until_news", "recent_news_currency",
+    "minutes_since_news", "news_event_just_occurred",
+    "news_freshness_state", "news_stale", "news_age_seconds",
+]
+
+TARGET_COLUMNS = [
+    "TP_BEFORE_SL", "PROFITABLE_WITHIN_5_MIN", "PROFITABLE_WITHIN_15_MIN",
+    "EXPECTED_MFE", "EXPECTED_MAE", "EXPECTED_RETURN",
+    "ENTRY_NOW", "WAIT", "SKIP", "ACTION_LABEL",
+]
+
+AUXILIARY_OUTCOME_COLUMNS = [
+    "tp_hit", "sl_hit", "return_1m_pips", "return_5m_pips",
+    "return_15m_pips", "return_30m_pips", "mfe_pips", "mae_pips",
+    "time_to_profit_seconds", "time_to_loss_seconds",
+    "time_to_tp_seconds", "time_to_sl_seconds",
+    "final_net_pnl", "final_net_pnl_currency",
+    "outcome_data_quality", "max_observation_gap_seconds",
+]
+
+AUDIT_COLUMNS = ["audit_executed", "audit_rejection_reason"]
+
 
 @dataclass(frozen=True)
 class ActionLabelConfig:
@@ -78,6 +115,14 @@ def build_training_dataset(
     frame = frame.sort_values(["timestamp", "candidate_id"], kind="stable").reset_index(drop=True)
     if frame["candidate_id"].duplicated().any():
         raise ValueError("training dataset contains duplicate candidate_id values")
+    missing_features = [column for column in FEATURE_COLUMNS if column not in frame.columns]
+    missing_targets = [column for column in TARGET_COLUMNS if column not in frame.columns]
+    if missing_features or missing_targets:
+        raise ValueError(
+            f"training dataset schema mismatch; missing_features={missing_features}, missing_targets={missing_targets}"
+        )
+    if set(FEATURE_COLUMNS).intersection(TARGET_COLUMNS + AUXILIARY_OUTCOME_COLUMNS + AUDIT_COLUMNS):
+        raise ValueError("training feature manifest contains leakage-prone outcome/audit columns")
     if not pd.to_datetime(frame["timestamp"], utc=True).is_monotonic_increasing:
         raise ValueError("training dataset must remain chronological")
     return frame
@@ -115,6 +160,12 @@ def export_training_dataset(
         "target_source": "candidate_outcomes.future_observations",
         "expected_return_definition": "30-minute executable liquidation return in pips",
         "final_net_pnl_definition": "executed trades only: MT5 realized_pl + financing in account currency",
+        "identifier_columns": IDENTIFIER_COLUMNS,
+        "feature_columns": FEATURE_COLUMNS,
+        "target_columns": TARGET_COLUMNS,
+        "auxiliary_outcome_columns": AUXILIARY_OUTCOME_COLUMNS,
+        "audit_columns": AUDIT_COLUMNS,
+        "leakage_guard": "audit and outcome columns are not model features",
     }
     metadata_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n")
     return output, metadata_path
@@ -195,8 +246,8 @@ def _feature_row(candidate: TradeCandidateRow, outcome: CandidateOutcomeRow) -> 
         "news_freshness_state": freshness.get("state"),
         "news_stale": bool(freshness.get("stale", False)),
         "news_age_seconds": _finite_or_none(freshness.get("age_seconds")),
-        "candidate_executed": bool(candidate.executed),
-        "candidate_rejection_reason": candidate.rejection_reason,
+        "audit_executed": bool(candidate.executed),
+        "audit_rejection_reason": candidate.rejection_reason,
     }
 
 
