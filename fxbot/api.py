@@ -17,6 +17,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
+from fxbot.ai_evaluation import AiEvaluationConfig, ai_value_report
 from fxbot.analytics import live_snapshot, performance_summary
 from fxbot.config import FxBotSettings, ensure_runtime_dirs, settings_from_env
 from fxbot.forward import ForwardTestWorker
@@ -274,6 +275,20 @@ def create_app(settings: FxBotSettings | None = None) -> FastAPI:
     def ai_deliberations(limit: int = Query(default=200, ge=1, le=1000)) -> list[dict[str, Any]]:
         """Research/audit records only; this endpoint has no trading controls."""
         return [row_to_dict(row) for row in journal.recent_ai_deliberations(limit=limit)]
+
+    @app.get("/api/ai-evaluation", dependencies=[Depends(require_api_key)])
+    def ai_evaluation(
+        min_wait_improvement_pips: float = Query(default=1.0, ge=0.0, le=100.0),
+        include_degraded: bool = False,
+    ) -> dict[str, Any]:
+        """Research-only shadow AI attribution; never changes trading state."""
+        return ai_value_report(
+            journal,
+            config=AiEvaluationConfig(
+                min_wait_improvement_pips=min_wait_improvement_pips,
+                include_degraded=include_degraded,
+            ),
+        )
 
     @app.get("/api/performance", dependencies=[Depends(require_api_key)])
     def performance(instrument: str | None = None, start: str | None = None, end: str | None = None) -> dict[str, Any]:
@@ -720,6 +735,8 @@ def _config_payload(settings: FxBotSettings) -> dict[str, Any]:
         "verify_hash": settings.ml_prediction.verify_hash,
         "model_path_configured": bool(settings.ml_prediction.model_path),
         "metadata_path_configured": bool(settings.ml_prediction.metadata_path),
+        "entry_model_path_configured": bool(settings.ml_prediction.entry_model_path),
+        "entry_metadata_path_configured": bool(settings.ml_prediction.entry_metadata_path),
     }
     payload["broker"] = {
         "provider": settings.broker.provider,
