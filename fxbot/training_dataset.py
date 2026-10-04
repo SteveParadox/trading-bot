@@ -36,6 +36,7 @@ FEATURE_COLUMNS = [
     "symbol", "direction", "strategy_signal", "strategy_score",
     "hour_utc", "day_of_week", "session",
     "bid", "ask", "spread_pips", "spread_relative_to_atr",
+    "execution_cost_pips_round_trip",
     "atr_price", "atr_pips", "rsi", "momentum", "trend_strength", "volatility",
     "support_distance_pips", "resistance_distance_pips", "risk_reward",
     "proposed_entry", "stop_loss", "take_profit",
@@ -104,7 +105,11 @@ def build_training_dataset(
 
     for candidate, outcome in pairs:
         feature_row = _feature_row(candidate, outcome)
-        target_row = _target_row(outcome, config=config)
+        target_row = _target_row(
+            outcome,
+            execution_cost_pips=_feature_execution_cost_pips(candidate, outcome),
+            config=config,
+        )
         if target_row is None:
             continue
         rows.append({**feature_row, **target_row})
@@ -158,7 +163,7 @@ def export_training_dataset(
         "random_shuffle": False,
         "feature_source": "trade_candidates.first_observation.market_snapshot",
         "target_source": "candidate_outcomes.future_observations",
-        "expected_return_definition": "30-minute executable liquidation return in pips",
+        "expected_return_definition": "30-minute executable liquidation return in pips minus configured non-spread commission/slippage allowance",
         "final_net_pnl_definition": "executed trades only: MT5 realized_pl + financing in account currency",
         "identifier_columns": IDENTIFIER_COLUMNS,
         "feature_columns": FEATURE_COLUMNS,
@@ -194,6 +199,14 @@ def _feature_row(candidate: TradeCandidateRow, outcome: CandidateOutcomeRow) -> 
         risk_reward = _risk_reward(candidate)
     timestamp = _utc(candidate.timestamp)
     news_risk = str(news.get("risk_level") or "UNKNOWN").upper()
+    risk_payload = payload.get("risk") or {}
+    risk_metadata = risk_payload.get("metadata") or {}
+    execution_cost_price = _finite_or_none(risk_metadata.get("execution_cost_price"))
+    execution_cost_pips = (
+        execution_cost_price / pip_size
+        if execution_cost_price is not None and pip_size > 0
+        else _finite_or_none(payload.get("execution_cost_pips_round_trip"))
+    )
 
     return {
         "dataset_version": TRAINING_DATASET_VERSION,
@@ -217,6 +230,7 @@ def _feature_row(candidate: TradeCandidateRow, outcome: CandidateOutcomeRow) -> 
             if atr_price is not None and atr_price > 0
             else None
         ),
+        "execution_cost_pips_round_trip": execution_cost_pips,
         "atr_price": atr_price,
         "atr_pips": atr_pips,
         "rsi": _finite_or_none(snapshot.get("rsi")),
@@ -254,6 +268,7 @@ def _feature_row(candidate: TradeCandidateRow, outcome: CandidateOutcomeRow) -> 
 def _target_row(
     outcome: CandidateOutcomeRow,
     *,
+    execution_cost_pips: float | None,
     config: ActionLabelConfig,
 ) -> dict[str, Any] | None:
     required = (
@@ -266,8 +281,10 @@ def _target_row(
 
     first_touch_reliable = bool((outcome.payload or {}).get("first_touch_reliable", True))
     tp_before_sl = outcome.tp_before_sl if first_touch_reliable else None
-    expected_return = float(outcome.return_30m_pips)
-    action = _action_label(outcome, config=config)
+    if execution_cost_pips is None or not math.isfinite(float(execution_cost_pips)):
+        return None
+    expected_return = float(outcome.return_30m_pips) - float(execution_cost_pips)
+    action = _action_label(outcome, expected_return=expected_return, config=config)
 
     return {
         "label_version": str((outcome.payload or {}).get("label_version") or "unknown"),
@@ -300,8 +317,12 @@ def _target_row(
     }
 
 
-def _action_label(outcome: CandidateOutcomeRow, *, config: ActionLabelConfig) -> str:
-    expected_return = float(outcome.return_30m_pips)
+def _action_label(
+    outcome: CandidateOutcomeRow,
+    *,
+    expected_return: float,
+    config: ActionLabelConfig,
+) -> str:
     mfe = float(outcome.mfe_pips)
     mae = float(outcome.mae_pips)
     positive_setup = expected_return > config.min_expected_return_pips
@@ -320,6 +341,22 @@ def _action_label(outcome: CandidateOutcomeRow, *, config: ActionLabelConfig) ->
     if valid_waits and max(valid_waits) >= config.min_wait_improvement_pips:
         return "WAIT"
     return "ENTRY_NOW"
+
+
+def _feature_execution_cost_pips(
+    candidate: TradeCandidateRow,
+    outcome: CandidateOutcomeRow,
+) -> float | None:
+    payload = candidate.payload or {}
+    risk_payload = payload.get("risk") or {}
+    risk_metadata = risk_payload.get("metadata") or {}
+    pip_size = _finite_or_none((outcome.payload or {}).get("pip_size"))
+    if pip_size is None or pip_size <= 0:
+        pip_size = FxInstrument(candidate.symbol).pip_size
+    execution_cost_price = _finite_or_none(risk_metadata.get("execution_cost_price"))
+    if execution_cost_price is not None and pip_size > 0:
+        return execution_cost_price / pip_size
+    return _finite_or_none(payload.get("execution_cost_pips_round_trip"))
 
 
 def _risk_reward(candidate: TradeCandidateRow) -> float | None:
