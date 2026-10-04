@@ -69,6 +69,21 @@ class _EntryLoader:
         return self.artifact
 
 
+class _TargetLoader:
+    def __init__(self, target: str, probability: float, version: str) -> None:
+        self.artifact = SimpleNamespace(
+            model=_ProbModel(probability),
+            metadata={},
+            model_name="XGBoost",
+            model_version=version,
+            model_hash=f"hash-{target.lower()}",
+            target=target,
+        )
+
+    def load(self):
+        return self.artifact
+
+
 def _request() -> PredictionRequest:
     snapshot = {
         "version": "v1",
@@ -235,6 +250,54 @@ def test_entry_timing_failure_does_not_destroy_primary_shadow_prediction() -> No
     assert result.tp_before_sl_probability == pytest.approx(0.79)
     assert result.entry_action is None
     assert "ModelLoadError" in result.entry_action_error
+
+
+def test_prediction_service_combines_auxiliary_entry_quality_probabilities() -> None:
+    service = PredictionService(
+        MlPredictionSettings(mode="shadow"),
+        loader=_FakeLoader(0.82),
+        auxiliary_loaders={
+            "IMMEDIATE_ADVERSE_MOVEMENT": _TargetLoader(
+                "IMMEDIATE_ADVERSE_MOVEMENT", 0.21, "xgb_immediate_adverse_movement_v1"
+            ),
+            "CONTINUATION": _TargetLoader(
+                "CONTINUATION", 0.74, "xgb_continuation_v1"
+            ),
+            "FAKE_BREAKOUT": _TargetLoader(
+                "FAKE_BREAKOUT", 0.18, "xgb_fake_breakout_v1"
+            ),
+        },
+    )
+    result = service.predict(_request())
+
+    assert result.immediate_adverse_probability == pytest.approx(0.21)
+    assert result.continuation_probability == pytest.approx(0.74)
+    assert result.fake_breakout_probability == pytest.approx(0.18)
+    assert set(result.auxiliary_models) == {
+        "IMMEDIATE_ADVERSE_MOVEMENT",
+        "CONTINUATION",
+        "FAKE_BREAKOUT",
+    }
+    assert result.auxiliary_errors is None
+
+
+def test_auxiliary_classifier_failure_isolated_from_primary_prediction() -> None:
+    class BrokenLoader:
+        def load(self):
+            raise ModelLoadError("bad auxiliary")
+
+    result = PredictionService(
+        MlPredictionSettings(mode="shadow"),
+        loader=_FakeLoader(0.80),
+        auxiliary_loaders={
+            "CONTINUATION": BrokenLoader(),
+        },
+    ).predict(_request())
+
+    assert result.successful is True
+    assert result.tp_before_sl_probability == pytest.approx(0.80)
+    assert result.continuation_probability is None
+    assert "CONTINUATION" in result.auxiliary_errors
 
 
 def test_prediction_service_off_mode_does_not_load_model() -> None:
