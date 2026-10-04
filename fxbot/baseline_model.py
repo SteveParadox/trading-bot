@@ -38,6 +38,7 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import OneHotEncoder
 
 from fxbot.chronological_split import ChronologicalSplitConfig, chronological_split
+from fxbot.ai.feature_builder import FEATURE_BUILDER_VERSION
 from fxbot.training_dataset import FEATURE_COLUMNS
 
 
@@ -147,6 +148,7 @@ def train_xgboost_baseline(
         "target": cfg.target,
         "problem_type": "binary_classification",
         "feature_columns": FEATURE_COLUMNS,
+        "feature_builder_version": FEATURE_BUILDER_VERSION,
         "categorical_features": CATEGORICAL_FEATURES,
         "model_config": asdict(cfg),
         "split_config": asdict(split_cfg),
