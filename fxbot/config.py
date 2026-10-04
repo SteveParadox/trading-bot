@@ -553,7 +553,7 @@ class AiDeliberationSettings:
     timeout_seconds: float = 8.0
     max_output_tokens: int = 1200
     max_retries: int = 1
-    prompt_version: str = "v1"
+    prompt_version: str = "v2"
     fail_policy: str = "fail_closed_if_confirmation_required"
     flag_blocks: bool = False
     reject_blocks: bool = False
@@ -782,7 +782,7 @@ def settings_from_env() -> FxBotSettings:
             timeout_seconds=_get_float("FX_AI_TIMEOUT_SECONDS", 8.0),
             max_output_tokens=_get_int("FX_AI_MAX_OUTPUT_TOKENS", 1200),
             max_retries=_get_int("FX_AI_MAX_RETRIES", 1),
-            prompt_version=_get_str("AI_DELIBERATION_PROMPT_VERSION", "v1"),
+            prompt_version=_get_str("AI_DELIBERATION_PROMPT_VERSION", "v2"),
             fail_policy=_get_str("FX_AI_FAIL_POLICY", "fail_closed_if_confirmation_required"),
             flag_blocks=_get_bool("FX_AI_FLAG_BLOCKS", False),
             reject_blocks=_get_bool("FX_AI_REJECT_BLOCKS", False),
