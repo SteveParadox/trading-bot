@@ -34,14 +34,28 @@ class PredictionService:
         settings: MlPredictionSettings,
         *,
         loader: VersionedModelLoader | None = None,
+        entry_loader: VersionedModelLoader | None = None,
     ) -> None:
         self.settings = settings
         self.loader = loader
+        self.entry_loader = entry_loader
         if self.loader is None and settings.mode != "off" and settings.model_path and settings.metadata_path:
             self.loader = VersionedModelLoader(
                 model_path=settings.model_path,
                 metadata_path=settings.metadata_path,
                 expected_target=settings.target,
+                verify_hash=settings.verify_hash,
+            )
+        if (
+            self.entry_loader is None
+            and settings.mode != "off"
+            and settings.entry_model_path
+            and settings.entry_metadata_path
+        ):
+            self.entry_loader = VersionedModelLoader(
+                model_path=settings.entry_model_path,
+                metadata_path=settings.entry_metadata_path,
+                expected_target="ENTRY_ACTION_LABEL",
                 verify_hash=settings.verify_hash,
             )
 
@@ -68,9 +82,11 @@ class PredictionService:
             frame = pd.DataFrame([features])
             probability = float(artifact.model.predict_proba(frame)[0][1])
             outputs = _classification_outputs(artifact.target, probability)
+            entry_outputs = _entry_timing_outputs(self.entry_loader, frame)
             return NumericalPrediction(
                 status="ok",
                 **outputs,
+                **entry_outputs,
                 model_name=artifact.model_name,
                 model_version=artifact.model_version,
                 model_hash=artifact.model_hash,
@@ -103,3 +119,38 @@ def _classification_outputs(target: str, probability: float) -> dict[str, float]
     except KeyError as exc:
         raise ValueError(f"unsupported classification target {target!r}") from exc
     return {key: probability}
+
+
+def _entry_timing_outputs(
+    loader: VersionedModelLoader | None,
+    frame: pd.DataFrame,
+) -> dict[str, object]:
+    if loader is None:
+        return {}
+    try:
+        artifact = loader.load()
+        labels = artifact.metadata.get("class_labels")
+        expected = ["ENTER_NOW", "WAIT_30S", "WAIT_1M", "WAIT_3M", "SKIP"]
+        if labels != expected:
+            raise ValueError("entry timing artifact class labels do not match serving action space")
+        probabilities = [float(value) for value in artifact.model.predict_proba(frame)[0]]
+        if len(probabilities) != len(labels):
+            raise ValueError("entry timing probability count does not match class labels")
+        distribution = {
+            label: probability
+            for label, probability in zip(labels, probabilities)
+        }
+        best_index = max(range(len(probabilities)), key=probabilities.__getitem__)
+        return {
+            "entry_action": labels[best_index],
+            "entry_action_confidence": probabilities[best_index],
+            "entry_action_probabilities": distribution,
+            "entry_model_name": artifact.model_name,
+            "entry_model_version": artifact.model_version,
+            "entry_model_hash": artifact.model_hash,
+        }
+    except Exception as exc:
+        log.warning("entry timing prediction failed: %s", type(exc).__name__)
+        return {
+            "entry_action_error": f"{type(exc).__name__}: {exc}",
+        }
