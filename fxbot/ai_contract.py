@@ -31,6 +31,8 @@ class AiTradeRecommendation:
     def __post_init__(self) -> None:
         if not math.isfinite(self.confidence) or not 0.0 <= self.confidence <= 1.0:
             raise ValueError("confidence must be finite and between 0 and 1")
+        if not self.reason_codes:
+            raise ValueError("reason_codes must contain at least one code")
         if any(not isinstance(value, str) or not value.strip() for value in self.reason_codes):
             raise ValueError("reason_codes must contain non-empty strings")
 
