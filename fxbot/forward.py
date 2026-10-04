@@ -48,6 +48,7 @@ from fxbot.ai_deliberation import (
 )
 from fxbot.ai_contract import AiTradeDecision
 from fxbot.market_snapshot import build_market_snapshot, build_news_context
+from fxbot.outcome_tracker import CandidateOutcomeTracker
 from fxbot.operations import clock_health
 from fxbot.security import code_version, data_hash, experiment_manifest, strategy_config_hash
 from fxbot.sniper import qualify_entry, qualify_execution, exit_reason
@@ -99,6 +100,13 @@ class ForwardTestWorker:
         monitor_ref = self.monitor
         set_lock_retry_callback(monitor_ref.record_db_lock_retry)
         self.risk = FxRiskManager(self.settings.risk, self.settings.strategy)
+        self.outcomes = CandidateOutcomeTracker(
+            self.journal,
+            observation_lag_tolerance_seconds=max(
+                30.0,
+                float(self.settings.runtime.loop_interval_seconds) * 3.0,
+            ),
+        )
         self.strategy_hash = strategy_config_hash(self.settings)
         self.code_version = code_version()
         self.run_id = uuid4().hex
@@ -187,6 +195,21 @@ class ForwardTestWorker:
         prices_ready = self._check_price_freshness(now, prices.prices)
         fresh_prices = {name: price for name, price in prices.prices.items()
                         if freshness(now, price.time, max_age_seconds=self.settings.runtime.max_price_age_seconds)[0]}
+        # Outcome tracking is observation-only and must never destabilize the
+        # execution loop. Only fresh executable quotes are eligible labels.
+        try:
+            self.outcomes.observe_active(
+                prices=fresh_prices,
+                instruments=instruments,
+                observed_at=now,
+            )
+        except Exception as exc:
+            log.exception("candidate outcome tracking failed")
+            self.journal.log_event(
+                "candidate_outcome_tracking_failed",
+                f"Candidate outcome tracking failed: {type(exc).__name__}",
+                level="warning",
+            )
         # Record price freshness for the monitoring dashboard
         for name, price in prices.prices.items():
             self.monitor.record_price(name, price.time)
@@ -470,6 +493,23 @@ class ForwardTestWorker:
             data_hash=data_hash({"instrument": instrument.name, "decision_time": decision_time.isoformat(), "signal": intent.signal_row}),
             experiment_manifest_hash=self.journal.experiment_manifest_hash,
         )
+        if candidate_created:
+            try:
+                self.outcomes.seed(
+                    candidate=candidate_row,
+                    price=price,
+                    instrument=instrument,
+                    observed_at=now,
+                )
+            except Exception as exc:
+                log.exception("candidate outcome seed failed for %s", candidate_id)
+                self.journal.log_event(
+                    "candidate_outcome_seed_failed",
+                    f"{instrument.name} candidate outcome seed failed: {type(exc).__name__}",
+                    level="warning",
+                    payload={"candidate_id": candidate_id},
+                )
+
         if not candidate_created and candidate_row.executed:
             self.journal.log_event(
                 "candidate_already_executed",
