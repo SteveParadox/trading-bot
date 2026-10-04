@@ -758,12 +758,10 @@ class ForwardTestWorker:
             take_profit=risk.exit_plan.take_profit,
         )
 
+        # Serving features must be identical to the candidate-time snapshot
+        # used by training_dataset.py. Final deterministic risk values belong
+        # in candidate_trade/risk_context for the LLM, not in model features.
         prediction_snapshot = dict(market_snapshot_payload or {})
-        prediction_snapshot.update({
-            "stop_loss": risk.exit_plan.stop_loss,
-            "take_profit": risk.exit_plan.take_profit,
-            "risk_reward": risk.exit_plan.risk_reward,
-        })
         if not market_snapshot_payload:
             prediction = NumericalPrediction(
                 status="unavailable",
