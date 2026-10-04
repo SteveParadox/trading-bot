@@ -443,7 +443,7 @@ class ForwardTestWorker:
                 "ai_decision_space": ai_decision_space,
             },
         )
-        _, candidate_created = self.journal.record_candidate(
+        candidate_row, candidate_created = self.journal.record_candidate(
             candidate_id=candidate_id,
             timestamp=now,
             symbol=instrument.name,
@@ -470,6 +470,13 @@ class ForwardTestWorker:
             data_hash=data_hash({"instrument": instrument.name, "decision_time": decision_time.isoformat(), "signal": intent.signal_row}),
             experiment_manifest_hash=self.journal.experiment_manifest_hash,
         )
+        if not candidate_created and candidate_row.executed:
+            self.journal.log_event(
+                "candidate_already_executed",
+                f"{candidate_id} already executed; duplicate signal-candle scan ignored",
+                payload={"candidate_id": candidate_id},
+            )
+            return False
         if candidate_created:
             if market_snapshot_payload is not None:
                 self.journal.log_event(
