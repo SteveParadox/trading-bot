@@ -11,10 +11,11 @@ import pytest
 from fxbot.baseline_model import XGBoostBaselineConfig, train_xgboost_baseline
 from fxbot.chronological_split import ChronologicalSplitConfig, chronological_split
 from fxbot.config import BrokerSettings, FxBotSettings, RiskSettings, StrategySettings
+from fxbot.entry_timing_model import EntryTimingModelConfig, train_entry_timing_model
 from fxbot.historical_reconstruction import HistoricalReconstructionConfig, reconstruct_historical_candidates
 from fxbot.instruments import FxInstrument
 from fxbot.journal import StructuredJournal
-from fxbot.training_dataset import FEATURE_COLUMNS, build_training_dataset
+from fxbot.training_dataset import ENTRY_ACTIONS, FEATURE_COLUMNS, build_training_dataset
 
 
 def _row(timestamp: str, candidate_id: str, target: int, value: float = 1.0) -> dict:
@@ -340,3 +341,95 @@ def test_xgboost_baseline_fits_train_only_and_reports_validation_and_test(tmp_pa
     assert artifacts.test_metrics["rows"] == 8
     assert 0.0 <= artifacts.validation_metrics["brier_score"] <= 1.0
     assert 0.0 <= artifacts.test_metrics["brier_score"] <= 1.0
+
+
+def test_entry_timing_xgboost_trains_all_five_actions_chronologically(tmp_path) -> None:
+    rows: list[dict] = []
+    actions = list(ENTRY_ACTIONS)
+
+    for year in (2023, 2024):
+        for index, action in enumerate(actions):
+            row = _row(
+                f"{year}-{index + 1:02d}-15T12:00:00+00:00",
+                f"train-{year}-{action}",
+                index % 2,
+                value=float(index + 1),
+            )
+            row["ENTRY_ACTION_LABEL"] = action
+            rows.append(row)
+
+    for index, action in enumerate(actions):
+        row = _row(
+            f"2025-{index + 1:02d}-15T12:00:00+00:00",
+            f"validation-{action}",
+            index % 2,
+            value=float(index + 20),
+        )
+        row["ENTRY_ACTION_LABEL"] = action
+        rows.append(row)
+
+    for index, action in enumerate(actions):
+        row = _row(
+            f"2026-{index + 1:02d}-15T12:00:00+00:00",
+            f"test-{action}",
+            index % 2,
+            value=float(index + 40),
+        )
+        row["ENTRY_ACTION_LABEL"] = action
+        rows.append(row)
+
+    forward = _row(
+        "2026-08-15T12:00:00+00:00",
+        "forward-enter",
+        1,
+        value=80.0,
+    )
+    forward["ENTRY_ACTION_LABEL"] = "ENTER_NOW"
+    rows.append(forward)
+
+    artifacts = train_entry_timing_model(
+        pd.DataFrame(rows),
+        tmp_path,
+        model_config=EntryTimingModelConfig(
+            n_estimators=10,
+            max_depth=2,
+            learning_rate=0.1,
+            min_child_weight=1.0,
+        ),
+    )
+
+    assert artifacts.model_path.exists()
+    metadata = json.loads(artifacts.metadata_path.read_text())
+    assert metadata["target"] == "ENTRY_ACTION_LABEL"
+    assert metadata["class_labels"] == actions
+    assert metadata["fit_data"] == "train_only"
+    assert metadata["forward_used_for_fit"] is False
+    assert metadata["rows"] == {
+        "train": 10,
+        "validation": 5,
+        "test": 5,
+        "forward": 1,
+    }
+    assert artifacts.validation_metrics["rows"] == 5
+    assert artifacts.test_metrics["rows"] == 5
+    assert len(artifacts.validation_metrics["confusion_matrix"]) == 5
+
+
+def test_entry_timing_trainer_refuses_incomplete_training_action_space(tmp_path) -> None:
+    rows: list[dict] = []
+    for timestamp, candidate, action in (
+        ("2023-01-15T12:00:00+00:00", "train-a", "ENTER_NOW"),
+        ("2023-02-15T12:00:00+00:00", "train-b", "SKIP"),
+        ("2025-01-15T12:00:00+00:00", "validation", "ENTER_NOW"),
+        ("2026-01-15T12:00:00+00:00", "test", "SKIP"),
+    ):
+        row = _row(timestamp, candidate, 1)
+        row["ENTRY_ACTION_LABEL"] = action
+        rows.append(row)
+
+    with pytest.raises(ValueError, match="complete action space"):
+        train_entry_timing_model(
+            pd.DataFrame(rows),
+            tmp_path,
+            model_config=EntryTimingModelConfig(n_estimators=5, max_depth=2),
+        )
