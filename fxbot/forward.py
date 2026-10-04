@@ -1314,12 +1314,23 @@ class ForwardTestWorker:
             candidate_id = context.get("candidate_id")
             account_currency = account_currency or context.get("account_currency")
         if candidate_id:
+            candidate = self.journal.find_candidate(str(candidate_id))
+            if candidate is not None and self.journal.find_candidate_outcome(str(candidate_id)) is None:
+                self.journal.ensure_candidate_outcome(
+                    candidate_id=str(candidate_id),
+                    started_at=candidate.timestamp,
+                    payload={
+                        "label_version": "v2",
+                        "recovered_for_realized_pnl": True,
+                    },
+                )
             final_net_pnl = float(closed_row.realized_pl or 0.0) + float(closed_row.financing or 0.0)
+            resolved_currency = str(account_currency or self.settings.risk.account_currency).upper()
             self.journal.update_candidate_outcome(
                 str(candidate_id),
                 values={
                     "final_net_pnl": final_net_pnl,
-                    "final_net_pnl_currency": str(account_currency).upper() if account_currency else None,
+                    "final_net_pnl_currency": resolved_currency,
                     "final_net_pnl_at": closed_row.exit_time,
                 },
                 payload_update={
