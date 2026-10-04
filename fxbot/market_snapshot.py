@@ -44,6 +44,7 @@ class CandleSnapshot:
 
 @dataclass(frozen=True)
 class ExposureSnapshot:
+    account_currency: str
     open_positions: int
     portfolio_risk: float
     gross_exposure: float
@@ -53,6 +54,7 @@ class ExposureSnapshot:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            "account_currency": self.account_currency,
             "open_positions": self.open_positions,
             "portfolio_risk": self.portfolio_risk,
             "gross_exposure": self.gross_exposure,
@@ -252,6 +254,7 @@ def build_market_snapshot(
         raise ValueError("market snapshot requires a positive executable spread")
 
     exposure = ExposureSnapshot(
+        account_currency=str(portfolio.account_currency).upper(),
         open_positions=int(portfolio.open_positions),
         portfolio_risk=float(portfolio.portfolio_risk),
         gross_exposure=float(portfolio.gross_exposure),
