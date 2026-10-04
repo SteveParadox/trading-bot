@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 import pytest
 
-from fxbot.ai_contract import AiTradeDecision, validate_ai_trade_recommendation
+from fxbot.ai_contract import AiCandidateEvaluator, AiTradeDecision, validate_ai_trade_recommendation
 from fxbot.instruments import FxInstrument, PriceSnapshot
 from fxbot.market_snapshot import MARKET_SNAPSHOT_VERSION, build_market_snapshot
 from fxbot.models import FxPortfolioState, FxSignalIntent, Side
@@ -27,6 +27,24 @@ def test_ai_job_is_strictly_take_wait_skip() -> None:
     )
     assert recommendation.decision is AiTradeDecision.WAIT
     assert recommendation.to_dict()["decision"] == "WAIT"
+
+
+def test_candidate_evaluator_only_returns_structured_recommendation() -> None:
+    seen = {}
+    evaluator = AiCandidateEvaluator(
+        lambda snapshot: (
+            seen.update(snapshot)
+            or {
+                "decision": "TAKE",
+                "confidence": 0.81,
+                "reason_codes": ["trend_alignment"],
+                "warnings": [],
+            }
+        )
+    )
+    result = evaluator.evaluate({"candidate_id": "fxsig-test", "symbol": "EUR_USD"})
+    assert seen["candidate_id"] == "fxsig-test"
+    assert result.decision is AiTradeDecision.TAKE
 
 
 def test_ai_contract_rejects_trade_generation_or_risk_fields() -> None:
