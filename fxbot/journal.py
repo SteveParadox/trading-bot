@@ -335,6 +335,8 @@ class StructuredJournal:
             row = session.get(CandidateOutcomeRow, candidate_id)
             if row is None:
                 return None
+            prior_status = row.status
+            prior_first_touch = row.first_touch
             for name, value in values.items():
                 if name.endswith("_at") and isinstance(value, datetime):
                     value = _aware(value)
@@ -343,8 +345,10 @@ class StructuredJournal:
                 row.payload = _jsonable({**(row.payload or {}), **payload_update})
             row.updated_at = utc_now()
             session.flush()
+            emit_jsonl = row.status != prior_status or row.first_touch != prior_first_touch
             session.expunge(row)
-        self.write_jsonl("candidate_outcome_updated", row)
+        if emit_jsonl:
+            self.write_jsonl("candidate_outcome_updated", row)
         return row
 
     def find_candidate_outcome(self, candidate_id: str) -> CandidateOutcomeRow | None:
