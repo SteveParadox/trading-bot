@@ -78,6 +78,7 @@ class MarketSnapshot:
     """
 
     version: str
+    candidate_id: str
     symbol: str
     timestamp: datetime
     signal_timestamp: datetime
@@ -104,6 +105,7 @@ class MarketSnapshot:
     def to_dict(self) -> dict[str, Any]:
         return {
             "version": self.version,
+            "candidate_id": self.candidate_id,
             "symbol": self.symbol,
             "timestamp": _utc(self.timestamp).isoformat(),
             "signal_timestamp": _utc(self.signal_timestamp).isoformat(),
@@ -131,6 +133,7 @@ class MarketSnapshot:
 
 def build_market_snapshot(
     *,
+    candidate_id: str,
     intent: FxSignalIntent,
     instrument: FxInstrument,
     price: PriceSnapshot,
@@ -195,8 +198,11 @@ def build_market_snapshot(
         free_margin=float(portfolio.free_margin),
     )
 
+    if not candidate_id.strip():
+        raise ValueError("candidate_id is required")
     return MarketSnapshot(
         version=MARKET_SNAPSHOT_VERSION,
+        candidate_id=candidate_id,
         symbol=instrument.name,
         timestamp=observed,
         signal_timestamp=_utc(intent.timestamp),
