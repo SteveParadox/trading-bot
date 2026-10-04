@@ -116,6 +116,8 @@ class CandidateOutcomeRow(Base):
     time_to_mae_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
     time_to_tp_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
     time_to_sl_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    time_to_profit_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    time_to_loss_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
     return_1m_pips: Mapped[float | None] = mapped_column(Float, nullable=True)
     return_3m_pips: Mapped[float | None] = mapped_column(Float, nullable=True)
     return_5m_pips: Mapped[float | None] = mapped_column(Float, nullable=True)
@@ -127,6 +129,9 @@ class CandidateOutcomeRow(Base):
     wait_5m_improvement_pips: Mapped[float | None] = mapped_column(Float, nullable=True)
     max_observation_gap_seconds: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
     data_quality: Mapped[str] = mapped_column(String(32), default="good", nullable=False, index=True)
+    final_net_pnl: Mapped[float | None] = mapped_column(Float, nullable=True)
+    final_net_pnl_currency: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    final_net_pnl_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False, onupdate=utc_now)
@@ -402,6 +407,20 @@ def _ensure_sqlite_columns(engine: Any) -> None:
         for name, ddl in additions.items():
             if name not in existing:
                 connection.execute(text(ddl))
+    if "candidate_outcomes" in inspect(engine).get_table_names():
+        existing_outcomes = {column["name"] for column in inspect(engine).get_columns("candidate_outcomes")}
+        outcome_additions = {
+            "time_to_profit_seconds": "ALTER TABLE candidate_outcomes ADD COLUMN time_to_profit_seconds FLOAT",
+            "time_to_loss_seconds": "ALTER TABLE candidate_outcomes ADD COLUMN time_to_loss_seconds FLOAT",
+            "final_net_pnl": "ALTER TABLE candidate_outcomes ADD COLUMN final_net_pnl FLOAT",
+            "final_net_pnl_currency": "ALTER TABLE candidate_outcomes ADD COLUMN final_net_pnl_currency VARCHAR(16)",
+            "final_net_pnl_at": "ALTER TABLE candidate_outcomes ADD COLUMN final_net_pnl_at DATETIME",
+        }
+        with engine.begin() as connection:
+            for name, ddl in outcome_additions.items():
+                if name not in existing_outcomes:
+                    connection.execute(text(ddl))
+
     for table in ("signal_journal", "order_journal", "trade_journal"):
         existing = {column["name"] for column in inspect(engine).get_columns(table)}
         additions = {
