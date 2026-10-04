@@ -319,11 +319,11 @@ def build_news_context(
     affected = {base, quote}
     related = [event for event in events if event.currency.upper() in affected]
     future = sorted(
-        (event for event in related if _utc(event.starts_at) >= observed),
+        (event for event in related if _utc(event.starts_at) > observed),
         key=lambda event: _utc(event.starts_at),
     )
     past = sorted(
-        (event for event in related if _utc(event.starts_at) < observed),
+        (event for event in related if _utc(event.starts_at) <= observed),
         key=lambda event: _utc(event.starts_at),
         reverse=True,
     )
@@ -350,7 +350,7 @@ def build_news_context(
             key=_impact_rank,
             default="NONE",
         )
-        freshness_state = "FRESH" if related else "EMPTY"
+        freshness_state = "FRESH" if events else "EMPTY"
 
     return NewsContextSnapshot(
         affected_currencies=tuple(sorted(affected)),
