@@ -210,21 +210,33 @@ class CandidateOutcomeTracker:
             updates["mae_pips"] = adverse
             updates["time_to_mae_seconds"] = elapsed
 
-        if outcome.first_touch is None:
-            touch = _first_observed_touch(
-                side=side,
-                liquidation=liquidation,
-                stop_loss=candidate.stop_loss,
-                take_profit=candidate.take_profit,
+        tp_now, sl_now = _observed_level_hits(
+            side=side,
+            liquidation=liquidation,
+            stop_loss=candidate.stop_loss,
+            take_profit=candidate.take_profit,
+        )
+        if tp_now and not outcome.tp_hit:
+            updates["tp_hit"] = True
+            updates["time_to_tp_seconds"] = elapsed
+        if sl_now and not outcome.sl_hit:
+            updates["sl_hit"] = True
+            updates["time_to_sl_seconds"] = elapsed
+
+        if outcome.first_touch is None and (tp_now or sl_now):
+            if tp_now and sl_now:
+                updates["first_touch"] = "AMBIGUOUS"
+                updates["tp_before_sl"] = None
+                degraded = True
+            else:
+                updates["first_touch"] = "TP" if tp_now else "SL"
+                updates["tp_before_sl"] = tp_now
+            updates["first_touch_at"] = observed
+            payload["first_touch_sampling_gap_seconds"] = gap
+            payload["first_touch_reliable"] = (
+                not (tp_now and sl_now)
+                and (gap <= self.observation_lag_tolerance_seconds or outcome.observation_count == 0)
             )
-            if touch is not None:
-                updates["first_touch"] = touch
-                updates["first_touch_at"] = observed
-                updates["tp_hit"] = touch == "TP"
-                updates["sl_hit"] = touch == "SL"
-                updates["tp_before_sl"] = touch == "TP"
-                payload["first_touch_sampling_gap_seconds"] = gap
-                payload["first_touch_reliable"] = gap <= self.observation_lag_tolerance_seconds or outcome.observation_count == 0
 
         for field, horizon in RETURN_HORIZONS_SECONDS.items():
             if getattr(outcome, field) is not None:
@@ -297,26 +309,22 @@ def _capture_horizon(
         missed.add(field)
 
 
-def _first_observed_touch(
+def _observed_level_hits(
     *,
     side: Side,
     liquidation: float,
     stop_loss: float | None,
     take_profit: float | None,
-) -> str | None:
+) -> tuple[bool, bool]:
     stop = _finite_or_none(stop_loss)
     target = _finite_or_none(take_profit)
     if side is Side.LONG:
-        if stop is not None and liquidation <= stop:
-            return "SL"
-        if target is not None and liquidation >= target:
-            return "TP"
+        tp_hit = target is not None and liquidation >= target
+        sl_hit = stop is not None and liquidation <= stop
     else:
-        if stop is not None and liquidation >= stop:
-            return "SL"
-        if target is not None and liquidation <= target:
-            return "TP"
-    return None
+        tp_hit = target is not None and liquidation <= target
+        sl_hit = stop is not None and liquidation >= stop
+    return tp_hit, sl_hit
 
 
 def _valid_quote(price: PriceSnapshot) -> bool:
