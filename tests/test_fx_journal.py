@@ -460,6 +460,7 @@ class StructuredJournalTests(unittest.TestCase):
                             "wait_5m_improvement_pips": 0.1,
                             "time_to_profit_seconds": 40.0 if return30 > 0 else None,
                             "time_to_loss_seconds": 0.0,
+                            "time_to_mae_seconds": 30.0,
                         },
                     )
 
