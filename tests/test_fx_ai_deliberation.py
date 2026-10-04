@@ -50,6 +50,12 @@ def intent() -> FxSignalIntent:
             "entry_price_source": "broker_executable_bid_ask",
             "details": {"di_edge": 13, "directional_ma28_slope_atr": 0.2, "entry_extension_atr": 0.4, "htf": {"signal": "LONG", "ma7": 1.2, "ma14": 1.1, "ma28": 1.0, "di_plus": 20, "di_minus": 5, "open": 1.1, "close": 1.2}},
             "score_details": {"score": 70.0, "adx_points": 20, "di_points": 30, "volume_points": 0},
+            "news_context": {
+                "upcoming_event": {"name": "FOMC", "impact_level": "HIGH", "currency": "USD", "minutes_until_event": 12},
+                "event_just_occurred": False,
+                "freshness": {"state": "FRESH", "stale": False, "age_seconds": 25.0, "source": "forexfactory"},
+                "risk_level": "HIGH",
+            },
         },
     )
 
@@ -125,6 +131,10 @@ def test_evidence_uses_executable_ask_and_authoritative_calendar_metadata() -> N
     assert event["currency"] == "USD"
     assert event["time_until_event_seconds"] == 720
     assert "description" not in event
+    news_context = payload["external_context"]["candidate_news_context"]
+    assert news_context["upcoming_event"]["currency"] == "USD"
+    assert news_context["freshness"]["state"] == "FRESH"
+    assert news_context["freshness"]["age_seconds"] == 25.0
 
 
 def test_persistence_is_idempotent_per_parent_signal() -> None:
