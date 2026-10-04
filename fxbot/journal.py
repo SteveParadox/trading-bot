@@ -19,6 +19,7 @@ from sqlalchemy.orm import Session, close_all_sessions, sessionmaker
 from fxbot.database import (
     AiDeliberationRow,
     BotStateRow,
+    CandidateOutcomeRow,
     CurrentPositionRow,
     EquitySnapshotRow,
     EventLogRow,
@@ -275,6 +276,86 @@ class StructuredJournal:
 
     def recent_candidates(self, limit: int = 200) -> list[TradeCandidateRow]:
         return _recent(self.sessions, TradeCandidateRow, limit)
+
+    def ensure_candidate_outcome(
+        self,
+        *,
+        candidate_id: str,
+        started_at: datetime,
+        payload: dict[str, Any] | None = None,
+    ) -> tuple[CandidateOutcomeRow, bool]:
+        """Create the forward-outcome row once, preserving first observation."""
+
+        with self.sessions() as session:
+            existing = session.get(CandidateOutcomeRow, candidate_id)
+            if existing is not None:
+                session.expunge(existing)
+                return existing, False
+        row = CandidateOutcomeRow(
+            candidate_id=candidate_id,
+            started_at=_aware(started_at),
+            payload=_jsonable(payload or {}),
+        )
+        try:
+            with self.sessions.begin() as session:
+                session.add(row)
+                session.flush()
+                session.expunge(row)
+        except IntegrityError:
+            existing = self.find_candidate_outcome(candidate_id)
+            if existing is not None:
+                return existing, False
+            raise
+        self.write_jsonl("candidate_outcome", row)
+        return row, True
+
+    def update_candidate_outcome(
+        self,
+        candidate_id: str,
+        *,
+        values: dict[str, Any],
+        payload_update: dict[str, Any] | None = None,
+    ) -> CandidateOutcomeRow | None:
+        """Update only approved outcome fields for a tracked candidate."""
+
+        allowed = {
+            "last_observed_at", "completed_at", "status", "observation_count",
+            "first_touch", "first_touch_at", "tp_hit", "sl_hit", "tp_before_sl",
+            "mfe_pips", "mae_pips", "time_to_mfe_seconds", "time_to_mae_seconds",
+            "return_1m_pips", "return_3m_pips", "return_5m_pips",
+            "return_15m_pips", "return_30m_pips",
+            "wait_30s_improvement_pips", "wait_1m_improvement_pips",
+            "wait_3m_improvement_pips", "wait_5m_improvement_pips",
+            "max_observation_gap_seconds", "data_quality",
+        }
+        unsupported = set(values).difference(allowed)
+        if unsupported:
+            raise ValueError(f"unsupported candidate outcome fields: {sorted(unsupported)}")
+        with self.sessions.begin() as session:
+            row = session.get(CandidateOutcomeRow, candidate_id)
+            if row is None:
+                return None
+            for name, value in values.items():
+                if name.endswith("_at") and isinstance(value, datetime):
+                    value = _aware(value)
+                setattr(row, name, value)
+            if payload_update:
+                row.payload = _jsonable({**(row.payload or {}), **payload_update})
+            row.updated_at = utc_now()
+            session.flush()
+            session.expunge(row)
+        self.write_jsonl("candidate_outcome_updated", row)
+        return row
+
+    def find_candidate_outcome(self, candidate_id: str) -> CandidateOutcomeRow | None:
+        with self.sessions() as session:
+            row = session.get(CandidateOutcomeRow, candidate_id)
+            if row is not None:
+                session.expunge(row)
+            return row
+
+    def recent_candidate_outcomes(self, limit: int = 200) -> list[CandidateOutcomeRow]:
+        return _recent(self.sessions, CandidateOutcomeRow, limit)
 
     def record_ai_deliberation(self, *, payload: dict[str, Any]) -> tuple[AiDeliberationRow, bool]:
         """Persist a validated audit or failure idempotently by parent signal."""
