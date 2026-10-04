@@ -112,6 +112,70 @@ class StructuredJournalTests(unittest.TestCase):
                 self.assertEqual(journal.find_trade("9001").state, "closed")
                 self.assertEqual([row.broker_trade_id for row in journal.filtered_trades()], ["9001"])
                 worker.close()
+    def test_candidate_journal_is_idempotent_and_tracks_lifecycle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with closing(StructuredJournal(f"sqlite:///{Path(tmp) / 'journal.db'}")) as journal:
+                timestamp = datetime(2026, 1, 6, 14, 0, tzinfo=timezone.utc)
+                first, created_first = journal.record_candidate(
+                    candidate_id="fxsig-EURUSD-test",
+                    timestamp=timestamp,
+                    symbol="EUR_USD",
+                    direction="LONG",
+                    entry=1.1010,
+                    stop_loss=1.0990,
+                    take_profit=1.1050,
+                    spread=0.0002,
+                    atr=0.0010,
+                    momentum=0.7,
+                    trend_strength=28.0,
+                    news_risk={"risk_level": "MEDIUM"},
+                    strategy_signal="signal_confirmed",
+                    payload={"first_observation": True},
+                )
+                second, created_second = journal.record_candidate(
+                    candidate_id="fxsig-EURUSD-test",
+                    timestamp=timestamp + timedelta(seconds=30),
+                    symbol="EUR_USD",
+                    direction="LONG",
+                    entry=1.1020,
+                    spread=0.0004,
+                    strategy_signal="signal_confirmed",
+                    payload={"first_observation": False},
+                )
+
+                self.assertTrue(created_first)
+                self.assertFalse(created_second)
+                self.assertEqual(first.candidate_id, second.candidate_id)
+                self.assertEqual(second.entry, 1.1010)
+                self.assertEqual(second.payload["first_observation"], True)
+
+                journal.update_candidate(
+                    "fxsig-EURUSD-test",
+                    status="rejected",
+                    executed=False,
+                    rejection_reason="spread_to_atr_filter",
+                )
+                rejected = journal.find_candidate("fxsig-EURUSD-test")
+                self.assertIsNotNone(rejected)
+                self.assertFalse(rejected.executed)
+                self.assertEqual(rejected.rejection_reason, "spread_to_atr_filter")
+
+                journal.update_candidate(
+                    "fxsig-EURUSD-test",
+                    status="executed",
+                    executed=True,
+                    rejection_reason=None,
+                    stop_loss=1.0992,
+                    take_profit=1.1052,
+                )
+                executed = journal.find_candidate("fxsig-EURUSD-test")
+                self.assertTrue(executed.executed)
+                self.assertEqual(executed.status, "executed")
+                self.assertIsNone(executed.rejection_reason)
+                self.assertEqual(executed.stop_loss, 1.0992)
+                self.assertEqual(executed.take_profit, 1.1052)
+                self.assertEqual(len(journal.recent_candidates()), 1)
+
     def test_order_reservation_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with closing(StructuredJournal(f"sqlite:///{Path(tmp) / 'journal.db'}")) as journal:
