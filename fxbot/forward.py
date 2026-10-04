@@ -48,7 +48,7 @@ from fxbot.ai_deliberation import (
 )
 from fxbot.ai_contract import AiTradeDecision
 from fxbot.ai.predictor import PredictionService, TradePredictor
-from fxbot.ai.schemas import PredictionRequest
+from fxbot.ai.schemas import NumericalPrediction, PredictionRequest
 from fxbot.market_snapshot import build_market_snapshot, build_news_context
 from fxbot.outcome_tracker import CandidateOutcomeTracker
 from fxbot.operations import clock_health
@@ -764,28 +764,34 @@ class ForwardTestWorker:
             "take_profit": risk.exit_plan.take_profit,
             "risk_reward": risk.exit_plan.risk_reward,
         })
-        prediction = self.predictor.predict(
-            PredictionRequest(
-                candidate_id=candidate_id,
-                candidate_trade={
-                    "candidate_id": candidate_id,
-                    "symbol": instrument.name,
-                    "direction": intent.side.value,
-                    "entry": executable_entry,
-                    "stop_loss": risk.exit_plan.stop_loss,
-                    "take_profit": risk.exit_plan.take_profit,
-                    "risk_reward": risk.exit_plan.risk_reward,
-                },
-                market_snapshot=prediction_snapshot,
-                strategy_signal=str(intent.metadata.get("decision") or decision.reason),
-                strategy_score=float(intent.score),
-                execution_cost_pips_round_trip=(
-                    float(risk.metadata.get("execution_cost_price", intent.metadata.get("execution_cost_price", 0.0)))
-                    / instrument.pip_size
-                ),
-                pip_size=instrument.pip_size,
+        if not market_snapshot_payload:
+            prediction = NumericalPrediction(
+                status="unavailable",
+                error="market_snapshot_unavailable",
             )
-        )
+        else:
+            prediction = self.predictor.predict(
+                PredictionRequest(
+                    candidate_id=candidate_id,
+                    candidate_trade={
+                        "candidate_id": candidate_id,
+                        "symbol": instrument.name,
+                        "direction": intent.side.value,
+                        "entry": executable_entry,
+                        "stop_loss": risk.exit_plan.stop_loss,
+                        "take_profit": risk.exit_plan.take_profit,
+                        "risk_reward": risk.exit_plan.risk_reward,
+                    },
+                    market_snapshot=prediction_snapshot,
+                    strategy_signal=str(intent.metadata.get("decision") or decision.reason),
+                    strategy_score=float(intent.score),
+                    execution_cost_pips_round_trip=(
+                        float(risk.metadata.get("execution_cost_price", intent.metadata.get("execution_cost_price", 0.0)))
+                        / instrument.pip_size
+                    ),
+                    pip_size=instrument.pip_size,
+                )
+            )
         self.journal.update_candidate(
             candidate_id,
             payload_update={
