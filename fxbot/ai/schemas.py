@@ -88,8 +88,20 @@ class NumericalPrediction:
                 raise ValueError(f"{name} must be finite")
         if self.latency_ms < 0:
             raise ValueError("latency_ms cannot be negative")
-        if self.status == "ok" and self.tp_before_sl_probability is None:
-            raise ValueError("successful v1 prediction requires tp_before_sl_probability")
+        if self.status == "ok" and all(
+            value is None
+            for value in (
+                self.tp_before_sl_probability,
+                self.profitable_5m_probability,
+                self.profitable_15m_probability,
+                self.expected_mfe_pips,
+                self.expected_mae_pips,
+                self.expected_return_pips,
+                self.pullback_probability,
+                self.expected_pullback_pips,
+            )
+        ):
+            raise ValueError("successful prediction requires at least one numerical output")
 
     @property
     def successful(self) -> bool:
