@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -108,6 +109,21 @@ def _request() -> PredictionRequest:
         execution_cost_pips_round_trip=0.4,
         pip_size=0.0001,
     )
+
+
+def test_prediction_package_has_no_mt5_or_order_execution_dependency() -> None:
+    import fxbot.ai.feature_builder as feature_builder
+    import fxbot.ai.model_loader as model_loader
+    import fxbot.ai.predictor as predictor
+
+    source = "\n".join(
+        inspect.getsource(module)
+        for module in (feature_builder, model_loader, predictor)
+    )
+    assert "fxbot.mt5" not in source
+    assert "create_market_order" not in source
+    assert "close_position" not in source
+    assert "order_send" not in source
 
 
 def test_feature_builder_matches_training_feature_manifest_exactly() -> None:
