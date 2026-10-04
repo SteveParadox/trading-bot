@@ -475,9 +475,20 @@ class StructuredJournalTests(unittest.TestCase):
                     "fxsig-dataset-skip",
                 ])
                 self.assertEqual(frame["ACTION_LABEL"].tolist(), ["ENTRY_NOW", "WAIT", "SKIP"])
+                self.assertEqual(frame["ENTRY_ACTION_LABEL"].tolist(), ["ENTER_NOW", "WAIT_1M", "SKIP"])
+                self.assertEqual(frame["BEST_ENTRY_DELAY_SECONDS"].tolist()[:2], [0.0, 60.0])
+                self.assertTrue(pd.isna(frame.iloc[2]["BEST_ENTRY_DELAY_SECONDS"]))
+                self.assertEqual(frame["ENTER_NOW"].tolist(), [1, 0, 0])
+                self.assertEqual(frame["WAIT_30S"].tolist(), [0, 0, 0])
+                self.assertEqual(frame["WAIT_1M"].tolist(), [0, 1, 0])
+                self.assertEqual(frame["WAIT_3M"].tolist(), [0, 0, 0])
                 self.assertEqual(frame["ENTRY_NOW"].tolist(), [1, 0, 0])
                 self.assertEqual(frame["WAIT"].tolist(), [0, 1, 0])
                 self.assertEqual(frame["SKIP"].tolist(), [0, 0, 1])
+                self.assertEqual(frame["IMMEDIATE_ADVERSE_MOVEMENT"].tolist(), [1, 1, 1])
+                self.assertEqual(frame["CONTINUATION"].tolist(), [1, 1, 0])
+                self.assertAlmostEqual(frame.iloc[0]["EXPECTED_PULLBACK"], 0.5)
+                self.assertAlmostEqual(frame.iloc[1]["EXPECTED_PULLBACK"], 1.5)
                 self.assertEqual(frame["PROFITABLE_WITHIN_5_MIN"].tolist(), [1, 1, 0])
                 self.assertEqual(frame["PROFITABLE_WITHIN_15_MIN"].tolist(), [1, 1, 0])
                 self.assertEqual(frame["TP_BEFORE_SL"].tolist(), [1, 1, 0])
@@ -494,6 +505,80 @@ class StructuredJournalTests(unittest.TestCase):
                 self.assertNotIn("audit_rejection_reason", FEATURE_COLUMNS)
                 self.assertNotIn("final_net_pnl", FEATURE_COLUMNS)
                 self.assertNotIn("EXPECTED_RETURN", FEATURE_COLUMNS)
+
+    def test_entry_timing_does_not_label_wait_after_original_tp_was_already_hit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with closing(StructuredJournal(f"sqlite:///{Path(tmp) / 'journal.db'}")) as journal:
+                timestamp = datetime(2026, 10, 4, 10, 0, tzinfo=timezone.utc)
+                snapshot = {
+                    "version": "v1",
+                    "bid": 1.1000,
+                    "ask": 1.1002,
+                    "spread_pips": 2.0,
+                    "atr": 0.001,
+                    "rsi": 55.0,
+                    "momentum": 0.8,
+                    "trend_strength": 30.0,
+                    "volatility": 1.0,
+                    "support_distance_pips": 5.0,
+                    "resistance_distance_pips": 15.0,
+                    "risk_reward": 1.5,
+                    "session": ["london"],
+                    "recent_candles": [
+                        {"open": 1.0990, "high": 1.0995, "low": 1.0988, "close": 1.0993},
+                        {"open": 1.0993, "high": 1.0998, "low": 1.0991, "close": 1.0996},
+                        {"open": 1.0996, "high": 1.1000, "low": 1.0994, "close": 1.0999},
+                        {"open": 1.0999, "high": 1.1010, "low": 1.0998, "close": 1.1008},
+                    ],
+                    "current_exposure": {"account_currency": "USD"},
+                }
+                candidate, _ = journal.record_candidate(
+                    candidate_id="fxsig-tp-before-wait",
+                    timestamp=timestamp,
+                    symbol="EUR_USD",
+                    direction="LONG",
+                    entry=1.1002,
+                    stop_loss=1.0992,
+                    take_profit=1.1012,
+                    spread=0.0002,
+                    strategy_signal="signal_confirmed",
+                    payload={
+                        "market_snapshot": snapshot,
+                        "signal_score": 75.0,
+                        "execution_cost_pips_round_trip": 0.0,
+                    },
+                )
+                journal.ensure_candidate_outcome(
+                    candidate_id=candidate.candidate_id,
+                    started_at=timestamp,
+                    payload={"label_version": "v2", "pip_size": 0.0001, "first_touch_reliable": True},
+                )
+                journal.update_candidate_outcome(
+                    candidate.candidate_id,
+                    values={
+                        "status": "complete",
+                        "completed_at": timestamp + timedelta(minutes=30),
+                        "data_quality": "good",
+                        "tp_hit": True,
+                        "tp_before_sl": True,
+                        "mfe_pips": 15.0,
+                        "mae_pips": 2.0,
+                        "return_1m_pips": 10.0,
+                        "return_5m_pips": 12.0,
+                        "return_15m_pips": 13.0,
+                        "return_30m_pips": 14.0,
+                        "wait_30s_improvement_pips": 2.0,
+                        "wait_1m_improvement_pips": 3.0,
+                        "wait_3m_improvement_pips": 4.0,
+                        "time_to_tp_seconds": 20.0,
+                        "time_to_profit_seconds": 10.0,
+                    },
+                )
+
+                frame = build_training_dataset(journal)
+                self.assertEqual(frame.iloc[0]["ENTRY_ACTION_LABEL"], "ENTER_NOW")
+                self.assertEqual(frame.iloc[0]["BEST_ENTRY_DELAY_SECONDS"], 0)
+                self.assertEqual(frame.iloc[0]["FAKE_BREAKOUT"], 0)
 
     def test_order_reservation_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
