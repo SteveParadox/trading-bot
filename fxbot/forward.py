@@ -1939,7 +1939,10 @@ def _ai_result_from_row(row: Any) -> AiDeliberationResult:
     if not isinstance(response, dict):
         return AiDeliberationResult(None, int(row.latency_ms or 0), row.failure_reason or "previous_ai_failure")
     try:
-        audit = validate_ai_audit_response(response)
+        audit = validate_ai_audit_response(
+            response,
+            allow_legacy_stored_response=True,
+        )
     except Exception:
         return AiDeliberationResult(None, int(row.latency_ms or 0), "stored_ai_response_invalid")
     return AiDeliberationResult(audit, int(row.latency_ms or 0), row.failure_reason)
