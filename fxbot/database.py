@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Generator
 
-from sqlalchemy import JSON, DateTime, Float, Integer, String, Text, UniqueConstraint, create_engine, event, inspect, text
+from sqlalchemy import Boolean, JSON, DateTime, Float, Integer, String, Text, UniqueConstraint, create_engine, event, inspect, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
@@ -57,6 +57,36 @@ class SignalJournalRow(Base):
     code_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     data_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
     experiment_manifest_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+
+class TradeCandidateRow(Base):
+    """One durable row per strategy-generated candidate setup."""
+
+    __tablename__ = "trade_candidates"
+
+    candidate_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
+    symbol: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    direction: Mapped[str] = mapped_column(String(16), nullable=False)
+    entry: Mapped[float] = mapped_column(Float, nullable=False)
+    stop_loss: Mapped[float | None] = mapped_column(Float, nullable=True)
+    take_profit: Mapped[float | None] = mapped_column(Float, nullable=True)
+    spread: Mapped[float] = mapped_column(Float, nullable=False)
+    atr: Mapped[float | None] = mapped_column(Float, nullable=True)
+    momentum: Mapped[float | None] = mapped_column(Float, nullable=True)
+    trend_strength: Mapped[float | None] = mapped_column(Float, nullable=True)
+    news_risk: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    strategy_signal: Mapped[str] = mapped_column(String(128), nullable=False)
+    executed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+    rejection_reason: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String(32), default="generated", nullable=False, index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    strategy_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    code_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    data_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    experiment_manifest_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False, onupdate=utc_now)
 
 
 class OrderJournalRow(Base):
