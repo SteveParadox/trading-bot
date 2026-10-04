@@ -46,6 +46,8 @@ from fxbot.ai_deliberation import (
     build_signal_evidence,
     validate_ai_audit_response,
 )
+from fxbot.ai_contract import AiTradeDecision
+from fxbot.market_snapshot import build_market_snapshot
 from fxbot.operations import clock_health
 from fxbot.security import code_version, data_hash, experiment_manifest, strategy_config_hash
 from fxbot.sniper import qualify_entry, qualify_execution, exit_reason
@@ -444,6 +446,41 @@ class ForwardTestWorker:
             if self.settings.sniper.mode == "enforce" and self.settings.sniper.slippage_pips_per_side is not None and self.settings.sniper.commission_pips_round_trip is not None:
                 extra_cost = max(intent.metadata["execution_cost_price"], instrument.pip_size * (2 * self.settings.sniper.slippage_pips_per_side + self.settings.sniper.commission_pips_round_trip))
                 intent = replace(intent, metadata={**intent.metadata, "execution_cost_price": extra_cost})
+
+        # Capture the complete candidate state before risk/AI can affect the
+        # execution path. This is observation-only: the strategy still creates
+        # candidates and deterministic risk remains authoritative.
+        provisional_exit_plan = self.risk.build_exit_plan(intent, instrument)
+        candidate_id = parent_signal_id_for(intent)
+        market_snapshot = build_market_snapshot(
+            intent=intent,
+            instrument=instrument,
+            price=price,
+            entry_frame=entry_frame,
+            timeframe=self.settings.strategy.entry_timeframe,
+            portfolio=portfolio,
+            exit_plan=provisional_exit_plan,
+            observed_at=now,
+            sessions=active_sessions(now),
+        )
+        intent = replace(
+            intent,
+            metadata={
+                **intent.metadata,
+                "candidate_id": candidate_id,
+                "market_snapshot": market_snapshot.to_dict(),
+                "ai_decision_space": [decision.value for decision in AiTradeDecision],
+            },
+        )
+        self.journal.log_event(
+            "candidate_market_snapshot",
+            f"{instrument.name} {intent.side.value} candidate snapshot captured",
+            payload={
+                "candidate_id": candidate_id,
+                "market_snapshot": market_snapshot.to_dict(),
+                "ai_decision_space": [decision.value for decision in AiTradeDecision],
+            },
+        )
 
         risk = self.risk.evaluate_intent(
             intent,
