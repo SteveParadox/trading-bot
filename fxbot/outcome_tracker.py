@@ -30,6 +30,7 @@ WAIT_HORIZONS_SECONDS: dict[str, int] = {
 }
 
 MAX_OUTCOME_HORIZON_SECONDS = max(RETURN_HORIZONS_SECONDS.values())
+OUTCOME_LABEL_VERSION = "v2"
 
 
 class CandidateOutcomeTracker:
@@ -65,7 +66,7 @@ class CandidateOutcomeTracker:
             started_at=started_at,
             payload={
                 "sampling_method": "forward_scan_executable_quotes",
-                "label_version": "v1",
+                "label_version": OUTCOME_LABEL_VERSION,
                 "lag_tolerance_seconds": self.observation_lag_tolerance_seconds,
                 "entry": float(candidate.entry),
                 "stop_loss": candidate.stop_loss,
@@ -124,7 +125,7 @@ class CandidateOutcomeTracker:
                         started_at=started,
                         payload={
                             "sampling_method": "forward_scan_executable_quotes",
-                            "label_version": "v1",
+                            "label_version": OUTCOME_LABEL_VERSION,
                             "lag_tolerance_seconds": self.observation_lag_tolerance_seconds,
                             "missed_horizons": sorted(
                                 [*RETURN_HORIZONS_SECONDS.keys(), *WAIT_HORIZONS_SECONDS.keys()]
@@ -155,7 +156,7 @@ class CandidateOutcomeTracker:
                     started_at=started,
                     payload={
                         "sampling_method": "forward_scan_executable_quotes",
-                        "label_version": "v1",
+                        "label_version": OUTCOME_LABEL_VERSION,
                         "lag_tolerance_seconds": self.observation_lag_tolerance_seconds,
                         "entry": float(candidate.entry),
                         "stop_loss": candidate.stop_loss,
@@ -229,6 +230,11 @@ class CandidateOutcomeTracker:
         max_gap = max(float(outcome.max_observation_gap_seconds or 0.0), gap)
         updates["max_observation_gap_seconds"] = max_gap
         degraded = outcome.data_quality == "degraded" or max_gap > self.observation_lag_tolerance_seconds
+
+        if move_pips > 0 and outcome.time_to_profit_seconds is None:
+            updates["time_to_profit_seconds"] = elapsed
+        if move_pips < 0 and outcome.time_to_loss_seconds is None:
+            updates["time_to_loss_seconds"] = elapsed
 
         favorable = max(0.0, move_pips)
         adverse = max(0.0, -move_pips)
