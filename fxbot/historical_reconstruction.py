@@ -19,6 +19,7 @@ import hashlib
 import json
 import math
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Protocol
 
 import pandas as pd
@@ -126,6 +127,7 @@ def reconstruct_historical_candidates(
         "account_state_replayed": False,
         "ai_replayed": False,
         "sniper_execution_gate_replayed": False,
+        "strategy_replay_semantics": "current configured strategy applied counterfactually to historical market data",
         "symbols": {},
     }
 
@@ -238,8 +240,10 @@ def _reconstruct_symbol(
             instrument.name,
             decision_time,
             settings=settings.strategy,
-            events=news_events,
-            news_stale=not news_authoritative,
+            news_state=SimpleNamespace(
+                events=news_events,
+                stale=not news_authoritative,
+            ),
         )
         if not permission.allowed:
             stats["permission_blocks"] += 1
