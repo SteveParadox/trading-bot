@@ -226,3 +226,23 @@ def test_model_loader_rejects_training_serving_feature_mismatch(tmp_path: Path) 
             model_path=model_path,
             metadata_path=metadata_path,
         ).load()
+
+
+def test_model_loader_rejects_feature_builder_version_mismatch(tmp_path: Path) -> None:
+    model_path = tmp_path / "model.joblib"
+    metadata_path = tmp_path / "model.metadata.json"
+    joblib.dump(_ProbModel(), model_path)
+    digest = hashlib.sha256(model_path.read_bytes()).hexdigest()
+    metadata_path.write_text(json.dumps({
+        "model_name": "XGBoost",
+        "model_version": "bad-feature-version",
+        "target": "TP_BEFORE_SL",
+        "feature_columns": FEATURE_COLUMNS,
+        "feature_builder_version": "future-incompatible-version",
+        "model_sha256": digest,
+    }))
+    with pytest.raises(ModelLoadError, match="feature-builder version"):
+        VersionedModelLoader(
+            model_path=model_path,
+            metadata_path=metadata_path,
+        ).load()
