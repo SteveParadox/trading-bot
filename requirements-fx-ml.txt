@@ -1,0 +1,6 @@
+# Optional runtime dependencies for FX numerical model serving.
+# Install in addition to the normal trading-bot environment only when
+# FX_ML_PREDICTION_MODE is shadow or required.
+scikit-learn>=1.5.0
+xgboost>=2.1.0
+joblib>=1.4.0
