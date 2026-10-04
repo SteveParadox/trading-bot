@@ -11,7 +11,7 @@ from typing import Protocol
 import pandas as pd
 
 from fxbot.ai.feature_builder import FEATURE_BUILDER_VERSION, build_prediction_features
-from fxbot.ai.model_loader import ModelLoadError, VersionedModelLoader
+from fxbot.ai.model_loader import VersionedModelLoader
 from fxbot.ai.schemas import NumericalPrediction, PredictionRequest
 from fxbot.config import MlPredictionSettings
 
