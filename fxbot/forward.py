@@ -452,33 +452,46 @@ class ForwardTestWorker:
         # candidates and deterministic risk remains authoritative.
         provisional_exit_plan = self.risk.build_exit_plan(intent, instrument)
         candidate_id = parent_signal_id_for(intent)
-        market_snapshot = build_market_snapshot(
-            intent=intent,
-            instrument=instrument,
-            price=price,
-            entry_frame=entry_frame,
-            timeframe=self.settings.strategy.entry_timeframe,
-            portfolio=portfolio,
-            exit_plan=provisional_exit_plan,
-            observed_at=now,
-            sessions=active_sessions(now),
-        )
+        ai_decision_space = [decision.value for decision in AiTradeDecision]
+        market_snapshot_payload: dict[str, Any] | None = None
+        try:
+            market_snapshot_payload = build_market_snapshot(
+                intent=intent,
+                instrument=instrument,
+                price=price,
+                entry_frame=entry_frame,
+                timeframe=self.settings.strategy.entry_timeframe,
+                portfolio=portfolio,
+                exit_plan=provisional_exit_plan,
+                observed_at=now,
+                sessions=active_sessions(now),
+            ).to_dict()
+            self.journal.log_event(
+                "candidate_market_snapshot",
+                f"{instrument.name} {intent.side.value} candidate snapshot captured",
+                payload={
+                    "candidate_id": candidate_id,
+                    "market_snapshot": market_snapshot_payload,
+                    "ai_decision_space": ai_decision_space,
+                },
+            )
+        except Exception as exc:
+            # The snapshot layer is observation-only in this phase. A feature
+            # extraction defect must be visible, but it must not silently alter
+            # the existing deterministic strategy/risk/execution behavior.
+            self.journal.log_event(
+                "candidate_market_snapshot_failed",
+                f"{instrument.name} candidate snapshot failed: {type(exc).__name__}",
+                level="warning",
+                payload={"candidate_id": candidate_id},
+            )
         intent = replace(
             intent,
             metadata={
                 **intent.metadata,
                 "candidate_id": candidate_id,
-                "market_snapshot": market_snapshot.to_dict(),
-                "ai_decision_space": [decision.value for decision in AiTradeDecision],
-            },
-        )
-        self.journal.log_event(
-            "candidate_market_snapshot",
-            f"{instrument.name} {intent.side.value} candidate snapshot captured",
-            payload={
-                "candidate_id": candidate_id,
-                "market_snapshot": market_snapshot.to_dict(),
-                "ai_decision_space": [decision.value for decision in AiTradeDecision],
+                "market_snapshot": market_snapshot_payload,
+                "ai_decision_space": ai_decision_space,
             },
         )
 
@@ -566,7 +579,7 @@ class ForwardTestWorker:
         # its partial exit legs. It is intentionally independent of SQLite's
         # surrogate signal-row id so a restarted scan cannot create another AI
         # deliberation for the same closed candle.
-        parent_signal_id = parent_signal_id_for(intent)
+        parent_signal_id = candidate_id
         ai_result: AiDeliberationResult | None = None
         ai_row = None
         if self.settings.ai.mode != "off":
