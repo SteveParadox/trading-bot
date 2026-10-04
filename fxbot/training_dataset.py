@@ -56,7 +56,9 @@ TARGET_COLUMNS = [
 
 AUXILIARY_OUTCOME_COLUMNS = [
     "tp_hit", "sl_hit", "return_1m_pips", "return_5m_pips",
-    "return_15m_pips", "return_30m_pips", "mfe_pips", "mae_pips",
+    "return_15m_pips", "return_30m_pips",
+    "net_return_5m_pips", "net_return_15m_pips", "net_return_30m_pips",
+    "mfe_pips", "mae_pips",
     "time_to_profit_seconds", "time_to_loss_seconds",
     "time_to_tp_seconds", "time_to_sl_seconds",
     "final_net_pnl", "final_net_pnl_currency",
@@ -164,6 +166,8 @@ def export_training_dataset(
         "feature_source": "trade_candidates.first_observation.market_snapshot",
         "target_source": "candidate_outcomes.future_observations",
         "expected_return_definition": "30-minute executable liquidation return in pips minus configured non-spread commission/slippage allowance",
+        "profitability_label_definition": "executable liquidation return at horizon minus configured non-spread commission/slippage allowance > 0",
+        "raw_return_columns": ["return_1m_pips", "return_5m_pips", "return_15m_pips", "return_30m_pips"],
         "final_net_pnl_definition": "executed trades only: MT5 realized_pl + financing in account currency",
         "identifier_columns": IDENTIFIER_COLUMNS,
         "feature_columns": FEATURE_COLUMNS,
@@ -283,14 +287,16 @@ def _target_row(
     tp_before_sl = outcome.tp_before_sl if first_touch_reliable else None
     if execution_cost_pips is None or not math.isfinite(float(execution_cost_pips)):
         return None
+    net_return_5m = float(outcome.return_5m_pips) - float(execution_cost_pips)
+    net_return_15m = float(outcome.return_15m_pips) - float(execution_cost_pips)
     expected_return = float(outcome.return_30m_pips) - float(execution_cost_pips)
     action = _action_label(outcome, expected_return=expected_return, config=config)
 
     return {
         "label_version": str((outcome.payload or {}).get("label_version") or "unknown"),
         "TP_BEFORE_SL": _bool_int(tp_before_sl),
-        "PROFITABLE_WITHIN_5_MIN": int(float(outcome.return_5m_pips) > 0.0),
-        "PROFITABLE_WITHIN_15_MIN": int(float(outcome.return_15m_pips) > 0.0),
+        "PROFITABLE_WITHIN_5_MIN": int(net_return_5m > 0.0),
+        "PROFITABLE_WITHIN_15_MIN": int(net_return_15m > 0.0),
         "EXPECTED_MFE": float(outcome.mfe_pips),
         "EXPECTED_MAE": float(outcome.mae_pips),
         "EXPECTED_RETURN": expected_return,
@@ -303,7 +309,10 @@ def _target_row(
         "return_1m_pips": _finite_or_none(outcome.return_1m_pips),
         "return_5m_pips": float(outcome.return_5m_pips),
         "return_15m_pips": float(outcome.return_15m_pips),
-        "return_30m_pips": expected_return,
+        "return_30m_pips": float(outcome.return_30m_pips),
+        "net_return_5m_pips": net_return_5m,
+        "net_return_15m_pips": net_return_15m,
+        "net_return_30m_pips": expected_return,
         "mfe_pips": float(outcome.mfe_pips),
         "mae_pips": float(outcome.mae_pips),
         "time_to_profit_seconds": _finite_or_none(outcome.time_to_profit_seconds),
