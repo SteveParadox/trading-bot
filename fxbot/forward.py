@@ -1266,7 +1266,21 @@ class ForwardTestWorker:
         trade_id = str(trade.get("broker_trade_id") or "")
         if not trade_id:
             return
-        self.journal.upsert_trade(
+        candidate_id = None
+        account_currency = None
+        existing = self.journal.find_trade(trade_id)
+        if existing is not None:
+            context = (existing.payload or {}).get("strategy_context", {})
+            candidate_id = context.get("candidate_id")
+            account_currency = context.get("account_currency")
+        if candidate_id is None and alias_trade_id is not None:
+            alias = self.journal.find_trade(alias_trade_id)
+            if alias is not None:
+                context = (alias.payload or {}).get("strategy_context", {})
+                candidate_id = context.get("candidate_id")
+                account_currency = context.get("account_currency")
+
+        closed_row = self.journal.upsert_trade(
             broker_trade_id=trade_id,
             instrument=str(trade.get("instrument") or ""),
             side=str(trade.get("side") or ""),
@@ -1279,6 +1293,24 @@ class ForwardTestWorker:
             exit_reason=str(trade.get("exit_reason") or "mt5_history_deal"),
             payload=trade,
         )
+        if candidate_id is None:
+            context = (closed_row.payload or {}).get("strategy_context", {})
+            candidate_id = context.get("candidate_id")
+            account_currency = account_currency or context.get("account_currency")
+        if candidate_id:
+            final_net_pnl = float(closed_row.realized_pl or 0.0) + float(closed_row.financing or 0.0)
+            self.journal.update_candidate_outcome(
+                str(candidate_id),
+                values={
+                    "final_net_pnl": final_net_pnl,
+                    "final_net_pnl_currency": str(account_currency).upper() if account_currency else None,
+                    "final_net_pnl_at": closed_row.exit_time,
+                },
+                payload_update={
+                    "final_net_pnl_source": "mt5_realized_pl_plus_financing",
+                    "broker_trade_id": trade_id,
+                },
+            )
         self.journal.reconcile_duplicate_open_trade(
             canonical_trade_id=trade_id,
             instrument=str(trade.get("instrument") or ""),
@@ -1319,6 +1351,10 @@ class ForwardTestWorker:
                     "strategy_decision": intent.metadata.get("decision"),
                     "signal_features": intent.metadata.get("score_details", {}),
                     "entry_price_source": intent.metadata.get("entry_price_source"),
+                    "candidate_id": intent.metadata.get("candidate_id"),
+                    "account_currency": (
+                        ((intent.metadata.get("market_snapshot") or {}).get("current_exposure") or {}).get("account_currency")
+                    ),
                     "parent_signal_id": intent.metadata.get("parent_signal_id"),
                     "parent_signal_row_id": intent.metadata.get("parent_signal_row_id"),
                     "ai_deliberation_id": intent.metadata.get("ai_deliberation_id"),
