@@ -407,6 +407,12 @@ def _reconstruct_symbol(
             instrument=instrument,
             observed_at=price.time,
         )
+        if snapshot_payload is None:
+            journal.update_candidate_outcome(
+                candidate_id,
+                values={"data_quality": "degraded"},
+                payload_update={"feature_snapshot_missing": True},
+            )
         for quote in quotes.itertuples(index=False):
             quote_time = _utc(pd.Timestamp(quote.timestamp).to_pydatetime())
             if quote_time <= price.time:
