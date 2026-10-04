@@ -188,6 +188,39 @@ def test_historical_reconstruction_requires_authoritative_news_when_production_r
             )
 
 
+def test_authoritative_empty_historical_news_window_is_not_treated_as_missing(tmp_path) -> None:
+    settings = FxBotSettings(
+        instruments=["EUR_USD"],
+        strategy=StrategySettings(
+            require_news_data=True,
+            require_volume_confirmation=False,
+            min_atr_pips=0.1,
+            max_atr_pips=100.0,
+            adx_min=10.0,
+            htf_adx_min=10.0,
+            trade_sessions_utc=(),
+            avoid_rollover_minutes=0,
+            close_before_weekend_minutes=0,
+            partial_tp_enabled=False,
+        ),
+    )
+    start = datetime(2024, 1, 2, 12, 0, tzinfo=timezone.utc)
+    with closing(StructuredJournal(f"sqlite:///{tmp_path / 'historical.db'}")) as journal:
+        report = reconstruct_historical_candidates(
+            source=_HistoricalSource(),
+            settings=settings,
+            journal=journal,
+            config=HistoricalReconstructionConfig(
+                start=start,
+                end=start + timedelta(minutes=1),
+            ),
+            news_events=[],
+            news_authoritative=True,
+        )
+        assert report["totals"]["permission_blocks"] == 0
+        assert report["totals"]["strategy_candidates"] == 1
+
+
 def test_chronological_split_uses_explicit_half_open_boundaries() -> None:
     frame = pd.DataFrame([
         _row("2023-01-01T00:00:00+00:00", "train-start", 0),
