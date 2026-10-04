@@ -515,12 +515,14 @@ class ForwardTestWorker:
                 instrument.name, tp_timeframe, self.settings.strategy.candle_limit
             )
             if not candles_are_current(tp_frame, tp_timeframe, now, self.settings.runtime.max_price_age_seconds):
-                self._skip(now, instrument.name, "stale_or_invalid_tp_candles", {"timeframe": tp_timeframe})
+                self.journal.update_candidate(candidate_id, status="rejected", rejection_reason="stale_or_invalid_tp_candles")
+                self._skip(now, instrument.name, "stale_or_invalid_tp_candles", {"candidate_id": candidate_id, "timeframe": tp_timeframe})
                 return
             tp_row = last_closed_row(prepare_indicators(tp_frame), tp_timeframe, timestamp=now)
             tp_atr = float(tp_row.get("atr") or 0.0) if tp_row is not None else 0.0
             if not math.isfinite(tp_atr) or tp_atr <= 0:
-                self._skip(now, instrument.name, "tp_atr_unavailable", {"timeframe": tp_timeframe})
+                self.journal.update_candidate(candidate_id, status="rejected", rejection_reason="tp_atr_unavailable")
+                self._skip(now, instrument.name, "tp_atr_unavailable", {"candidate_id": candidate_id, "timeframe": tp_timeframe})
                 return
             intent = replace(intent, metadata={**intent.metadata, "tp_atr": tp_atr,
                                               "tp_timeframe": tp_timeframe,
@@ -561,6 +563,14 @@ class ForwardTestWorker:
             now=now,
         )
         if not risk.allowed or risk.exit_plan is None:
+            self.journal.update_candidate(
+                candidate_id,
+                status="rejected",
+                rejection_reason=risk.reason,
+                stop_loss=risk.exit_plan.stop_loss if risk.exit_plan else None,
+                take_profit=risk.exit_plan.take_profit if risk.exit_plan else None,
+                payload_update={"risk": asdict(risk)},
+            )
             self.journal.record_signal(
                 timestamp=now,
                 instrument=instrument.name,
@@ -574,6 +584,26 @@ class ForwardTestWorker:
             )
             return
 
+        if market_snapshot_payload is not None:
+            market_snapshot_payload = {
+                **market_snapshot_payload,
+                "stop_loss": risk.exit_plan.stop_loss,
+                "take_profit": risk.exit_plan.take_profit,
+                "risk_reward": risk.exit_plan.risk_reward,
+            }
+            intent = replace(
+                intent,
+                metadata={**intent.metadata, "market_snapshot": market_snapshot_payload},
+            )
+        self.journal.update_candidate(
+            candidate_id,
+            status="risk_accepted",
+            rejection_reason=None,
+            stop_loss=risk.exit_plan.stop_loss,
+            take_profit=risk.exit_plan.take_profit,
+            payload_update={"risk": asdict(risk), "market_snapshot": market_snapshot_payload},
+        )
+
         if sniper is not None:
             sniper = qualify_execution(intent.metadata["sniper"], reward=risk.exit_plan.reward_distance,
                                        spread=spread_price, pip_size=instrument.pip_size, settings=self.settings.sniper)
@@ -583,6 +613,7 @@ class ForwardTestWorker:
                 "would_allow": sniper.allowed, "snapshot": sniper.snapshot,
                 "baseline_risk": asdict(risk), "shadow_only": self.settings.sniper.mode == "shadow"})
             if self.settings.sniper.mode == "enforce" and not sniper.allowed:
+                self.journal.update_candidate(candidate_id, status="rejected", rejection_reason=sniper.reason)
                 self.journal.record_signal(timestamp=now, instrument=instrument.name, status="rejected",
                                            reason=sniper.reason, side=intent.side.value, score=intent.score,
                                            entry_price=executable_entry, payload={"intent": asdict(intent), "risk": asdict(risk)})
@@ -597,6 +628,15 @@ class ForwardTestWorker:
             self.settings.strategy.min_reward_to_spread_ratio,
         ):
             ratio = risk.exit_plan.reward_distance / spread_price if spread_price > 0 else 0.0
+            self.journal.update_candidate(
+                candidate_id,
+                status="rejected",
+                rejection_reason="target_cost_filter",
+                payload_update={
+                    "reward_to_spread_ratio": ratio,
+                    "required_reward_to_spread_ratio": self.settings.strategy.min_reward_to_spread_ratio,
+                },
+            )
             self.journal.record_signal(
                 timestamp=now,
                 instrument=instrument.name,
@@ -618,6 +658,13 @@ class ForwardTestWorker:
             )
             return
 
+        self.journal.update_candidate(
+            candidate_id,
+            status="eligible",
+            rejection_reason=None,
+            stop_loss=risk.exit_plan.stop_loss,
+            take_profit=risk.exit_plan.take_profit,
+        )
         signal_row = self.journal.record_signal(
             timestamp=now,
             instrument=instrument.name,
@@ -709,6 +756,7 @@ class ForwardTestWorker:
                 },
             )
             if not policy.allowed:
+                self.journal.update_candidate(candidate_id, status="rejected", rejection_reason=policy.reason)
                 return
             intent = replace(
                 intent,
@@ -720,12 +768,30 @@ class ForwardTestWorker:
                 },
             )
         if self.settings.sniper.mode == "enforce" and not self._revalidate_sniper_execution(intent, instrument, risk):
+            self.journal.update_candidate(candidate_id, status="rejected", rejection_reason="SNIPER_REJECT_REVALIDATION")
             self.journal.update_signal(signal_row.id, status="rejected", reason="SNIPER_REJECT_REVALIDATION")
             return
         if self.settings.strategy.tp_timeframe is not None and not self._tp_candle_still_current(intent, instrument):
+            self.journal.update_candidate(candidate_id, status="rejected", rejection_reason="tp_candle_expired")
             self.journal.update_signal(signal_row.id, status="rejected", reason="tp_candle_expired")
             return
-        return self._submit_idempotent(intent, instrument, risk)
+        try:
+            submitted = self._submit_idempotent(intent, instrument, risk)
+        except Mt5Error as exc:
+            self.journal.update_candidate(
+                candidate_id,
+                status="execution_failed",
+                executed=False,
+                rejection_reason=f"mt5_execution_failed:{type(exc).__name__}",
+            )
+            raise
+        self.journal.update_candidate(
+            candidate_id,
+            status="executed" if submitted else "not_executed",
+            executed=submitted,
+            rejection_reason=None if submitted else "execution_not_submitted",
+        )
+        return submitted
 
     def _tp_candle_still_current(self, intent: FxSignalIntent, instrument: FxInstrument) -> bool:
         timeframe = self.settings.strategy.tp_timeframe
