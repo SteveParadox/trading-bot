@@ -44,6 +44,31 @@ class _FakeLoader:
         return self.artifact
 
 
+class _EntryProbModel:
+    def predict_proba(self, frame):
+        assert list(frame.columns) == FEATURE_COLUMNS
+        return [[0.10, 0.15, 0.50, 0.15, 0.10]]
+
+
+class _EntryLoader:
+    def __init__(self) -> None:
+        self.calls = 0
+        self.artifact = SimpleNamespace(
+            model=_EntryProbModel(),
+            metadata={
+                "class_labels": ["ENTER_NOW", "WAIT_30S", "WAIT_1M", "WAIT_3M", "SKIP"],
+            },
+            model_name="XGBoost",
+            model_version="xgb_entry_timing_v1",
+            model_hash="entry123",
+            target="ENTRY_ACTION_LABEL",
+        )
+
+    def load(self):
+        self.calls += 1
+        return self.artifact
+
+
 def _request() -> PredictionRequest:
     snapshot = {
         "version": "v1",
@@ -161,6 +186,55 @@ def test_prediction_service_returns_versioned_probability_without_execution_depe
     assert result.feature_version == FEATURE_BUILDER_VERSION
     assert result.feature_hash
     assert loader.calls == 1
+
+
+def test_prediction_service_returns_entry_timing_distribution_as_shadow_evidence() -> None:
+    loader = _FakeLoader(0.81)
+    entry_loader = _EntryLoader()
+    service = PredictionService(
+        MlPredictionSettings(
+            mode="shadow",
+            model_path="ignored.joblib",
+            metadata_path="ignored.json",
+            entry_model_path="ignored-entry.joblib",
+            entry_metadata_path="ignored-entry.json",
+        ),
+        loader=loader,
+        entry_loader=entry_loader,
+    )
+    result = service.predict(_request())
+
+    assert result.successful is True
+    assert result.tp_before_sl_probability == pytest.approx(0.81)
+    assert result.entry_action == "WAIT_1M"
+    assert result.entry_action_confidence == pytest.approx(0.50)
+    assert result.entry_action_probabilities == {
+        "ENTER_NOW": pytest.approx(0.10),
+        "WAIT_30S": pytest.approx(0.15),
+        "WAIT_1M": pytest.approx(0.50),
+        "WAIT_3M": pytest.approx(0.15),
+        "SKIP": pytest.approx(0.10),
+    }
+    assert result.entry_model_version == "xgb_entry_timing_v1"
+    assert result.entry_model_hash == "entry123"
+    assert entry_loader.calls == 1
+
+
+def test_entry_timing_failure_does_not_destroy_primary_shadow_prediction() -> None:
+    class BadEntryLoader:
+        def load(self):
+            raise ModelLoadError("broken entry model")
+
+    result = PredictionService(
+        MlPredictionSettings(mode="shadow"),
+        loader=_FakeLoader(0.79),
+        entry_loader=BadEntryLoader(),
+    ).predict(_request())
+
+    assert result.successful is True
+    assert result.tp_before_sl_probability == pytest.approx(0.79)
+    assert result.entry_action is None
+    assert "ModelLoadError" in result.entry_action_error
 
 
 def test_prediction_service_off_mode_does_not_load_model() -> None:
