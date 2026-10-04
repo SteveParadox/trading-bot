@@ -26,12 +26,20 @@ NOW = datetime(2026, 9, 15, 14, 0, tzinfo=timezone.utc)
 
 def valid_response() -> dict:
     return {
+        "decision": "WAIT",
+        "confidence": 0.9,
+        "reason_codes": ["news_risk", "pullback_risk"],
+    }
+
+
+def legacy_response() -> dict:
+    return {
         "decision": "FLAG",
         "confidence": 0.9,
         "reasoning_audit": {"status": "CONSISTENT", "issues": [], "supporting_factors": ["ADX is 25"]},
         "market_context": {"status": "MATERIAL_CONTRADICTION", "issues": ["USD event in 12 minutes"], "supporting_factors": []},
         "contradictions": ["USD event in 12 minutes"],
-        "recommended_action": "FLAG",
+        "recommended_action": "WAIT",
         "summary": "The supplied event is imminent.",
     }
 
@@ -75,7 +83,7 @@ def test_off_policy_does_not_require_or_consult_ai() -> None:
 
 
 def test_hard_safety_gate_always_wins_over_ai_confirm() -> None:
-    service = AiDeliberationService(AiDeliberationSettings(mode="advisory"), provider=lambda *_: valid_response() | {"decision": "CONFIRM", "recommended_action": "ALLOW"})
+    service = AiDeliberationService(AiDeliberationSettings(mode="advisory"), provider=lambda *_: valid_response() | {"decision": "TAKE", "reason_codes": ["trend_alignment"]})
     result = service.deliberate(_evidence())
     policy = apply_ai_execution_policy(hard_safety_allowed=False, settings=AiDeliberationSettings(mode="advisory", reject_blocks=True), result=result)
     assert result.successful is True
@@ -93,7 +101,7 @@ def test_shadow_provider_failure_is_recordable_and_nonblocking() -> None:
 
 
 def test_advisory_reject_requires_explicit_opt_in_and_confidence() -> None:
-    service = AiDeliberationService(AiDeliberationSettings(mode="advisory"), provider=lambda *_: valid_response() | {"decision": "REJECT", "recommended_action": "REJECT"})
+    service = AiDeliberationService(AiDeliberationSettings(mode="advisory"), provider=lambda *_: valid_response() | {"decision": "SKIP", "reason_codes": ["weak_tp_probability"]})
     result = service.deliberate(_evidence())
     default = apply_ai_execution_policy(hard_safety_allowed=True, settings=AiDeliberationSettings(mode="advisory"), result=result)
     opt_in = apply_ai_execution_policy(hard_safety_allowed=True, settings=AiDeliberationSettings(mode="advisory", reject_blocks=True), result=result)
@@ -101,14 +109,30 @@ def test_advisory_reject_requires_explicit_opt_in_and_confidence() -> None:
     assert opt_in.allowed is False
 
 
-def test_inconsistent_decision_and_action_is_rejected() -> None:
-    malformed = valid_response() | {"decision": "CONFIRM", "recommended_action": "REJECT"}
+def test_unsupported_reason_code_is_rejected() -> None:
+    malformed = valid_response() | {"reason_codes": ["make_money_now"]}
     try:
         validate_ai_audit_response(malformed)
     except Exception as exc:
         assert type(exc).__name__ == "AiResponseValidationError"
     else:
-        raise AssertionError("inconsistent AI output was accepted")
+        raise AssertionError("unsupported AI reason code was accepted")
+
+
+def test_legacy_stored_response_maps_to_take_wait_skip() -> None:
+    migrated = validate_ai_audit_response(legacy_response())
+    assert migrated.decision == "WAIT"
+    assert migrated.reason_codes == ["legacy_flag"]
+
+
+def test_inconsistent_legacy_decision_and_action_is_rejected() -> None:
+    malformed = legacy_response() | {"decision": "CONFIRM", "recommended_action": "REJECT"}
+    try:
+        validate_ai_audit_response(malformed)
+    except Exception as exc:
+        assert type(exc).__name__ == "AiResponseValidationError"
+    else:
+        raise AssertionError("inconsistent legacy AI output was accepted")
 
 
 def test_deterministic_audit_catches_numeric_reasoning_contradictions() -> None:
@@ -135,6 +159,51 @@ def test_evidence_uses_executable_ask_and_authoritative_calendar_metadata() -> N
     assert news_context["upcoming_event"]["currency"] == "USD"
     assert news_context["freshness"]["state"] == "FRESH"
     assert news_context["freshness"]["age_seconds"] == 25.0
+    assert payload["candidate_trade"]["symbol"] == "EUR_USD"
+    assert payload["candidate_trade"]["direction"] == "LONG"
+    assert payload["risk_context"]["risk_allowed"] is True
+    assert payload["risk_context"]["portfolio_equity"] == 10_000
+    assert payload["numerical_model_prediction"]["status"] == "unavailable"
+
+
+def test_llm_evidence_contains_market_snapshot_numerical_prediction_news_and_risk() -> None:
+    prediction = {
+        "status": "ok",
+        "tp_before_sl_probability": 0.83,
+        "model_name": "XGBoost",
+        "model_version": "xgb_tp_before_sl_v1",
+    }
+    snapshot = {
+        "candidate_id": "fxsig-EURUSD-abc",
+        "symbol": "EUR_USD",
+        "direction": "LONG",
+        "timestamp": NOW.isoformat(),
+        "trend_strength": 25.0,
+        "momentum": 0.7,
+        "news_context": {"risk_level": "LOW"},
+    }
+    evidence = build_signal_evidence(
+        signal_id="fxsig-EURUSD-abc",
+        intent=intent(),
+        instrument=FxInstrument("EUR_USD"),
+        price=PriceSnapshot("EUR_USD", bid=1.1008, ask=1.1010, time=NOW),
+        portfolio=FxPortfolioState(10_000, 10_000, 0, 1, portfolio_risk=15.0),
+        risk=risk(),
+        strategy=StrategySettings(),
+        news_events=[],
+        news_stale=False,
+        active_sessions={"new_york"},
+        now=NOW,
+        demo_only=True,
+        market_snapshot=snapshot,
+        numerical_prediction=prediction,
+    )
+    payload = evidence.to_dict()
+    assert payload["candidate_trade"]["entry"] == 1.1010
+    assert payload["market_snapshot"]["trend_strength"] == 25.0
+    assert payload["numerical_model_prediction"]["tp_before_sl_probability"] == 0.83
+    assert payload["external_context"]["candidate_news_context"]["risk_level"] == "HIGH"
+    assert payload["risk_context"]["portfolio_risk"] == 15.0
 
 
 def test_persistence_is_idempotent_per_parent_signal() -> None:
@@ -142,7 +211,7 @@ def test_persistence_is_idempotent_per_parent_signal() -> None:
         with closing(StructuredJournal(f"sqlite:///{Path(tmp) / 'journal.db'}")) as journal:
             payload = {
                 "signal_id": "fxsig-EURUSD-abc", "timestamp": NOW, "instrument": "EUR_USD", "side": "LONG", "model": "test",
-                "prompt_version": "v1", "mode": "shadow", "status": "completed", "decision": "FLAG", "confidence": 0.9,
+                "prompt_version": "v1", "mode": "shadow", "status": "completed", "decision": "WAIT", "confidence": 0.9,
                 "reasoning_audit_status": "CONSISTENT", "reasoning_issues": [], "reasoning_supporting_factors": [],
                 "market_context_status": "MATERIAL_CONTRADICTION", "market_context_issues": [], "market_context_supporting_factors": [],
                 "contradictions": [], "recommended_action": "FLAG", "summary": "test", "evidence_hash": "a", "output_hash": "b",
