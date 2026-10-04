@@ -410,6 +410,7 @@ class ForwardTestWorker:
             after_minutes=self.settings.strategy.news_blackout_after_minutes,
         ).to_dict()
         market_snapshot_payload: dict[str, Any] | None = None
+        market_snapshot_failure: str | None = None
         try:
             market_snapshot_payload = build_market_snapshot(
                 candidate_id=candidate_id,
@@ -430,22 +431,8 @@ class ForwardTestWorker:
                 news_before_minutes=self.settings.strategy.news_blackout_before_minutes,
                 news_after_minutes=self.settings.strategy.news_blackout_after_minutes,
             ).to_dict()
-            self.journal.log_event(
-                "candidate_market_snapshot",
-                f"{instrument.name} {intent.side.value} candidate snapshot captured",
-                payload={
-                    "candidate_id": candidate_id,
-                    "market_snapshot": market_snapshot_payload,
-                    "ai_decision_space": ai_decision_space,
-                },
-            )
         except Exception as exc:
-            self.journal.log_event(
-                "candidate_market_snapshot_failed",
-                f"{instrument.name} candidate snapshot failed: {type(exc).__name__}",
-                level="warning",
-                payload={"candidate_id": candidate_id},
-            )
+            market_snapshot_failure = type(exc).__name__
         intent = replace(
             intent,
             metadata={
@@ -456,7 +443,7 @@ class ForwardTestWorker:
                 "ai_decision_space": ai_decision_space,
             },
         )
-        self.journal.record_candidate(
+        _, candidate_created = self.journal.record_candidate(
             candidate_id=candidate_id,
             timestamp=now,
             symbol=instrument.name,
@@ -483,6 +470,24 @@ class ForwardTestWorker:
             data_hash=data_hash({"instrument": instrument.name, "decision_time": decision_time.isoformat(), "signal": intent.signal_row}),
             experiment_manifest_hash=self.journal.experiment_manifest_hash,
         )
+        if candidate_created:
+            if market_snapshot_payload is not None:
+                self.journal.log_event(
+                    "candidate_market_snapshot",
+                    f"{instrument.name} {intent.side.value} candidate snapshot captured",
+                    payload={
+                        "candidate_id": candidate_id,
+                        "market_snapshot": market_snapshot_payload,
+                        "ai_decision_space": ai_decision_space,
+                    },
+                )
+            elif market_snapshot_failure is not None:
+                self.journal.log_event(
+                    "candidate_market_snapshot_failed",
+                    f"{instrument.name} candidate snapshot failed: {market_snapshot_failure}",
+                    level="warning",
+                    payload={"candidate_id": candidate_id},
+                )
 
         if atr_price <= 0 or spread_price <= 0:
             self.journal.update_candidate(candidate_id, status="rejected", rejection_reason="volatility_or_spread_unavailable")
