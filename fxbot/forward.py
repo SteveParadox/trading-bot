@@ -47,6 +47,8 @@ from fxbot.ai_deliberation import (
     validate_ai_audit_response,
 )
 from fxbot.ai_contract import AiTradeDecision
+from fxbot.ai.predictor import PredictionService, TradePredictor
+from fxbot.ai.schemas import PredictionRequest
 from fxbot.market_snapshot import build_market_snapshot, build_news_context
 from fxbot.outcome_tracker import CandidateOutcomeTracker
 from fxbot.operations import clock_health
@@ -76,6 +78,7 @@ class ForwardTestWorker:
         monitor: OperationalMonitor | None = None,
         news: NewsGateway | None = None,
         deliberator: AiDeliberationService | None = None,
+        predictor: TradePredictor | None = None,
     ) -> None:
         self.settings = settings or settings_from_env()
         ensure_runtime_dirs(self.settings)
@@ -96,6 +99,7 @@ class ForwardTestWorker:
             static_events=self.settings.news_events,
         )
         self.deliberator = deliberator or AiDeliberationService(self.settings.ai)
+        self.predictor = predictor or PredictionService(self.settings.ml_prediction)
         # Feed SQLite lock retries into the operational monitor.
         monitor_ref = self.monitor
         set_lock_retry_callback(monitor_ref.record_db_lock_retry)
@@ -753,6 +757,76 @@ class ForwardTestWorker:
             stop_loss=risk.exit_plan.stop_loss,
             take_profit=risk.exit_plan.take_profit,
         )
+
+        prediction_snapshot = dict(market_snapshot_payload or {})
+        prediction_snapshot.update({
+            "stop_loss": risk.exit_plan.stop_loss,
+            "take_profit": risk.exit_plan.take_profit,
+            "risk_reward": risk.exit_plan.risk_reward,
+        })
+        prediction = self.predictor.predict(
+            PredictionRequest(
+                candidate_id=candidate_id,
+                candidate_trade={
+                    "candidate_id": candidate_id,
+                    "symbol": instrument.name,
+                    "direction": intent.side.value,
+                    "entry": executable_entry,
+                    "stop_loss": risk.exit_plan.stop_loss,
+                    "take_profit": risk.exit_plan.take_profit,
+                    "risk_reward": risk.exit_plan.risk_reward,
+                },
+                market_snapshot=prediction_snapshot,
+                strategy_signal=str(intent.metadata.get("decision") or decision.reason),
+                strategy_score=float(intent.score),
+                execution_cost_pips_round_trip=(
+                    float(risk.metadata.get("execution_cost_price", intent.metadata.get("execution_cost_price", 0.0)))
+                    / instrument.pip_size
+                ),
+                pip_size=instrument.pip_size,
+            )
+        )
+        self.journal.update_candidate(
+            candidate_id,
+            payload_update={
+                "prediction_market_snapshot": prediction_snapshot,
+                "numerical_prediction": prediction.to_dict(),
+            },
+        )
+        if self.settings.ml_prediction.mode != "off":
+            self.journal.log_event(
+                "candidate_ml_prediction",
+                f"{instrument.name} candidate numerical prediction {prediction.status}",
+                payload={
+                    "candidate_id": candidate_id,
+                    "prediction": prediction.to_dict(),
+                },
+            )
+        if self.settings.ml_prediction.mode == "required" and not prediction.successful:
+            self.journal.update_candidate(
+                candidate_id,
+                status="rejected",
+                rejection_reason="ml_prediction_required_unavailable",
+            )
+            self.journal.record_signal(
+                timestamp=now,
+                instrument=instrument.name,
+                status="rejected",
+                reason="ml_prediction_required_unavailable",
+                side=intent.side.value,
+                score=intent.score,
+                entry_price=executable_entry,
+                stop_loss=risk.exit_plan.stop_loss,
+                take_profit=risk.exit_plan.take_profit,
+                risk_amount=risk.risk_amount,
+                payload={
+                    "risk": asdict(risk),
+                    "intent": asdict(intent),
+                    "numerical_prediction": prediction.to_dict(),
+                },
+            )
+            return
+
         signal_row = self.journal.record_signal(
             timestamp=now,
             instrument=instrument.name,
@@ -792,6 +866,8 @@ class ForwardTestWorker:
                     active_sessions=active_sessions(intent.timestamp),
                     now=now,
                     demo_only=self.settings.broker.demo_only,
+                    market_snapshot=prediction_snapshot,
+                    numerical_prediction=prediction.to_dict(),
                 )
                 ai_result = self.deliberator.deliberate(evidence)
                 try:
@@ -820,11 +896,10 @@ class ForwardTestWorker:
                     )
                 response = ai_result.response
                 log.info(
-                    "ai_deliberation signal_id=%s pair=%s direction=%s score=%.2f mode=%s decision=%s confidence=%s reasoning=%s context=%s latency_ms=%s failure=%s",
+                    "ai_deliberation signal_id=%s pair=%s direction=%s score=%.2f mode=%s decision=%s confidence=%s reason_codes=%s latency_ms=%s failure=%s",
                     parent_signal_id, instrument.name, intent.side.value, intent.score, self.settings.ai.mode,
                     response.decision if response else None, response.confidence if response else None,
-                    response.reasoning_audit["status"] if response else None,
-                    response.market_context["status"] if response else None,
+                    response.reason_codes if response else None,
                     ai_result.latency_ms, ai_result.failure_reason,
                 )
         policy = apply_ai_execution_policy(
@@ -1807,8 +1882,7 @@ def _ai_journal_payload(
     result: AiDeliberationResult,
 ) -> dict[str, Any]:
     response = result.response.to_dict() if result.response else None
-    reasoning = (response or {}).get("reasoning_audit", {})
-    context = (response or {}).get("market_context", {})
+    reason_codes = (response or {}).get("reason_codes", [])
     output_hash = data_hash(response) if response is not None else None
     return {
         "signal_id": signal_id,
@@ -1821,15 +1895,15 @@ def _ai_journal_payload(
         "status": "completed" if response else "failed",
         "decision": response.get("decision") if response else None,
         "confidence": response.get("confidence") if response else None,
-        "reasoning_audit_status": reasoning.get("status"),
-        "reasoning_issues": reasoning.get("issues", []),
-        "reasoning_supporting_factors": reasoning.get("supporting_factors", []),
-        "market_context_status": context.get("status"),
-        "market_context_issues": context.get("issues", []),
-        "market_context_supporting_factors": context.get("supporting_factors", []),
-        "contradictions": response.get("contradictions", []) if response else [],
-        "recommended_action": response.get("recommended_action") if response else None,
-        "summary": response.get("summary", "") if response else "",
+        "reasoning_audit_status": "STRUCTURED_V2" if response else None,
+        "reasoning_issues": [],
+        "reasoning_supporting_factors": reason_codes,
+        "market_context_status": "EMBEDDED_IN_EVIDENCE" if response else None,
+        "market_context_issues": [],
+        "market_context_supporting_factors": [],
+        "contradictions": [],
+        "recommended_action": response.get("decision") if response else None,
+        "summary": ",".join(reason_codes) if response else "",
         "evidence_hash": evidence_hash,
         "output_hash": output_hash,
         "latency_ms": result.latency_ms,
