@@ -623,6 +623,16 @@ class ForwardTestWorker:
                 take_profit=risk.exit_plan.take_profit if risk.exit_plan else None,
                 payload_update={"risk": asdict(risk)},
             )
+            if risk.exit_plan is not None:
+                self.journal.update_candidate_outcome(
+                    candidate_id,
+                    values={},
+                    payload_update={
+                        "final_stop_loss": risk.exit_plan.stop_loss,
+                        "final_take_profit": risk.exit_plan.take_profit,
+                        "final_risk_reward": risk.exit_plan.risk_reward,
+                    },
+                )
             self.journal.record_signal(
                 timestamp=now,
                 instrument=instrument.name,
@@ -654,6 +664,16 @@ class ForwardTestWorker:
             stop_loss=risk.exit_plan.stop_loss,
             take_profit=risk.exit_plan.take_profit,
             payload_update={"risk": asdict(risk), "market_snapshot": market_snapshot_payload},
+        )
+
+        self.journal.update_candidate_outcome(
+            candidate_id,
+            values={},
+            payload_update={
+                "final_stop_loss": risk.exit_plan.stop_loss,
+                "final_take_profit": risk.exit_plan.take_profit,
+                "final_risk_reward": risk.exit_plan.risk_reward,
+            },
         )
 
         if sniper is not None:
