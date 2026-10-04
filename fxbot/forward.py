@@ -923,7 +923,24 @@ class ForwardTestWorker:
                 },
             )
             if not policy.allowed:
-                self.journal.update_candidate(candidate_id, status="rejected", rejection_reason=policy.reason)
+                if policy.reason == "ai_advisory_wait":
+                    self.journal.update_candidate(
+                        candidate_id,
+                        status="delayed",
+                        rejection_reason=None,
+                        payload_update={"ai_delay_reason": policy.reason},
+                    )
+                    self.journal.update_signal(
+                        signal_row.id,
+                        status="advisory_wait",
+                        reason=policy.reason,
+                    )
+                else:
+                    self.journal.update_candidate(
+                        candidate_id,
+                        status="rejected",
+                        rejection_reason=policy.reason,
+                    )
                 return
             intent = replace(
                 intent,
