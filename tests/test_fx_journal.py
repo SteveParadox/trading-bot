@@ -10,6 +10,8 @@ from fxbot.journal import StructuredJournal, row_to_dict
 from fxbot.models import BotRunState
 from fxbot.config import BrokerSettings, FxBotSettings, RuntimeSettings
 from fxbot.forward import ForwardTestWorker
+from fxbot.instruments import FxInstrument, PriceSnapshot
+from fxbot.outcome_tracker import CandidateOutcomeTracker
 
 class StructuredJournalTests(unittest.TestCase):
     def test_equity_history_is_chronological_and_keeps_date_range_endpoints(self) -> None:
@@ -175,6 +177,95 @@ class StructuredJournalTests(unittest.TestCase):
                 self.assertEqual(executed.stop_loss, 1.0992)
                 self.assertEqual(executed.take_profit, 1.1052)
                 self.assertEqual(len(journal.recent_candidates()), 1)
+
+
+    def test_candidate_outcomes_capture_future_returns_waits_and_first_touch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with closing(StructuredJournal(f"sqlite:///{Path(tmp) / 'journal.db'}")) as journal:
+                start = datetime(2026, 10, 4, 10, 0, tzinfo=timezone.utc)
+                candidate, _ = journal.record_candidate(
+                    candidate_id="fxsig-outcome-long", timestamp=start, symbol="EUR_USD", direction="LONG",
+                    entry=1.1002, stop_loss=1.0992, take_profit=1.1012, spread=0.0002,
+                    atr=0.001, momentum=0.5, trend_strength=25.0, news_risk={},
+                    strategy_signal="signal_confirmed",
+                )
+                tracker = CandidateOutcomeTracker(journal, observation_lag_tolerance_seconds=2000)
+                instrument = FxInstrument("EUR_USD")
+                tracker.seed(
+                    candidate=candidate,
+                    price=PriceSnapshot("EUR_USD", bid=1.1000, ask=1.1002, time=start),
+                    instrument=instrument,
+                    observed_at=start,
+                )
+                for seconds, bid, ask in [
+                    (30, 1.0998, 1.1000), (60, 1.1006, 1.1008), (90, 1.1013, 1.1015),
+                    (180, 1.1004, 1.1006), (300, 1.1009, 1.1011),
+                    (900, 1.1010, 1.1012), (1800, 1.0997, 1.0999),
+                ]:
+                    observed = start + timedelta(seconds=seconds)
+                    tracker.observe(
+                        candidate=candidate,
+                        price=PriceSnapshot("EUR_USD", bid=bid, ask=ask, time=observed),
+                        instrument=instrument,
+                        observed_at=observed,
+                    )
+                outcome = journal.find_candidate_outcome(candidate.candidate_id)
+                self.assertEqual(outcome.status, "complete")
+                self.assertEqual(outcome.first_touch, "TP")
+                self.assertTrue(outcome.tp_before_sl)
+                self.assertAlmostEqual(outcome.mfe_pips, 11.0)
+                self.assertAlmostEqual(outcome.mae_pips, 5.0)
+                self.assertAlmostEqual(outcome.return_1m_pips, 4.0)
+                self.assertAlmostEqual(outcome.return_3m_pips, 2.0)
+                self.assertAlmostEqual(outcome.return_5m_pips, 7.0)
+                self.assertAlmostEqual(outcome.return_15m_pips, 8.0)
+                self.assertAlmostEqual(outcome.return_30m_pips, -5.0)
+                self.assertAlmostEqual(outcome.wait_30s_improvement_pips, 2.0)
+                self.assertAlmostEqual(outcome.wait_1m_improvement_pips, -6.0)
+                self.assertAlmostEqual(outcome.wait_3m_improvement_pips, -4.0)
+                self.assertAlmostEqual(outcome.wait_5m_improvement_pips, -9.0)
+                self.assertTrue(outcome.payload["spread_included_in_returns"])
+                self.assertFalse(outcome.payload["commission_and_slippage_included"])
+
+    def test_candidate_outcomes_do_not_backfill_missed_horizons(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            with closing(StructuredJournal(f"sqlite:///{Path(tmp) / 'journal.db'}")) as journal:
+                start = datetime(2026, 10, 4, 10, 0, tzinfo=timezone.utc)
+                candidate, _ = journal.record_candidate(
+                    candidate_id="fxsig-outcome-gap", timestamp=start, symbol="EUR_USD", direction="LONG",
+                    entry=1.1002, stop_loss=1.0992, take_profit=1.1012, spread=0.0002,
+                    strategy_signal="signal_confirmed",
+                )
+                tracker = CandidateOutcomeTracker(journal, observation_lag_tolerance_seconds=30)
+                instrument = FxInstrument("EUR_USD")
+                tracker.seed(
+                    candidate=candidate,
+                    price=PriceSnapshot("EUR_USD", bid=1.1000, ask=1.1002, time=start),
+                    instrument=instrument,
+                    observed_at=start,
+                )
+                late = start + timedelta(seconds=100)
+                tracker.observe(
+                    candidate=candidate,
+                    price=PriceSnapshot("EUR_USD", bid=1.1010, ask=1.1012, time=late),
+                    instrument=instrument,
+                    observed_at=late,
+                )
+                outcome = journal.find_candidate_outcome(candidate.candidate_id)
+                self.assertIsNone(outcome.return_1m_pips)
+                self.assertIn("return_1m_pips", outcome.payload["missed_horizons"])
+                self.assertEqual(outcome.data_quality, "degraded")
+                much_later = start + timedelta(seconds=1900)
+                tracker.observe(
+                    candidate=candidate,
+                    price=PriceSnapshot("EUR_USD", bid=1.1020, ask=1.1022, time=much_later),
+                    instrument=instrument,
+                    observed_at=much_later,
+                )
+                outcome = journal.find_candidate_outcome(candidate.candidate_id)
+                self.assertEqual(outcome.status, "incomplete")
+                self.assertIsNone(outcome.return_30m_pips)
+                self.assertEqual(outcome.payload["incomplete_reason"], "missed_30m_horizon")
 
     def test_order_reservation_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
