@@ -153,7 +153,7 @@ class CandidateOutcomeTracker:
                 candidate=candidate,
                 price=price,
                 instrument=instrument,
-                observed_at=now,
+                observed_at=_utc(price.time),
             )
 
     def observe(
@@ -174,6 +174,10 @@ class CandidateOutcomeTracker:
         if elapsed < 0:
             return
         if not _valid_quote(price):
+            return
+        if outcome.last_observed_at is not None and observed <= _utc(outcome.last_observed_at):
+            # The polling loop may see the same broker tick repeatedly. A
+            # repeated quote is not a new future observation.
             return
 
         side = Side(candidate.direction)
