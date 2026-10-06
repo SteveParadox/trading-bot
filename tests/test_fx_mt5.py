@@ -109,6 +109,122 @@ class Mt5ConfigAndInstrumentTests(unittest.TestCase):
         self.assertAlmostEqual(ticks.iloc[0]["bid"], 1.1000)
         self.assertAlmostEqual(ticks.iloc[0]["ask"], 1.1002)
 
+
+    def test_mt5_historical_candles_chunk_large_ranges(self) -> None:
+        class FakeMt5:
+            TIMEFRAME_M15 = 15
+
+            def __init__(self) -> None:
+                self.calls: list[tuple[datetime, datetime]] = []
+
+            def initialize(self, *args, **kwargs): return True
+            def account_info(self): return SimpleNamespace(currency="USD", trade_mode=0)
+            def symbol_info(self, symbol): return SimpleNamespace(name=symbol, visible=True)
+            def copy_rates_range(self, symbol, timeframe, start, end):
+                self.calls.append((start, end))
+                return [{
+                    "time": int(start.timestamp()),
+                    "open": 1.1,
+                    "high": 1.2,
+                    "low": 1.0,
+                    "close": 1.15,
+                    "tick_volume": 10,
+                    "spread": 12,
+                }]
+            def last_error(self): return "ok"
+
+        fake = FakeMt5()
+        client = Mt5Client(BrokerSettings(), module=fake)
+        start = datetime(2023, 1, 1, tzinfo=timezone.utc)
+        end = datetime(2023, 3, 7, tzinfo=timezone.utc)
+
+        candles = client.historical_candles("EUR_USD", "15m", start, end)
+
+        self.assertEqual(len(fake.calls), 3)
+        self.assertEqual(len(candles), 3)
+        self.assertLessEqual(
+            max((call_end - call_start).days for call_start, call_end in fake.calls),
+            30,
+        )
+
+    def test_mt5_historical_ticks_prime_old_history_and_retry_range(self) -> None:
+        class FakeMt5:
+            COPY_TICKS_INFO = 1
+            COPY_TICKS_ALL = 2
+
+            def __init__(self) -> None:
+                self.range_calls = 0
+                self.from_calls: list[tuple[int, int]] = []
+                self.error = (-1, "Terminal: Call failed")
+
+            def initialize(self, *args, **kwargs): return True
+            def account_info(self): return SimpleNamespace(currency="USD", trade_mode=0)
+            def symbol_info(self, symbol): return SimpleNamespace(name=symbol, visible=True)
+            def copy_ticks_range(self, symbol, start, end, flags):
+                self.range_calls += 1
+                if self.range_calls == 1:
+                    return None
+                return [
+                    {"time_msc": 1_700_000_000_000, "bid": 1.1000, "ask": 1.1002},
+                    {"time_msc": 1_700_000_001_000, "bid": 1.1001, "ask": 1.1003},
+                ]
+            def copy_ticks_from(self, symbol, start, count, flags):
+                self.from_calls.append((count, flags))
+                return [{"time_msc": 1_700_000_000_000, "bid": 1.1000, "ask": 1.1002}]
+            def last_error(self): return self.error
+
+        fake = FakeMt5()
+        client = Mt5Client(BrokerSettings(), module=fake)
+        start = datetime.fromtimestamp(1_700_000_000, tz=timezone.utc)
+        end = datetime.fromtimestamp(1_700_000_001, tz=timezone.utc)
+
+        ticks = client.historical_ticks("EUR_USD", start, end)
+
+        self.assertEqual(fake.range_calls, 2)
+        self.assertEqual(fake.from_calls, [(1_000, fake.COPY_TICKS_ALL)])
+        self.assertEqual(len(ticks), 2)
+        self.assertAlmostEqual(ticks.iloc[0]["bid"], 1.1000)
+
+    def test_mt5_historical_ticks_fallback_to_copy_ticks_from_window(self) -> None:
+        class FakeMt5:
+            COPY_TICKS_INFO = 1
+            COPY_TICKS_ALL = 2
+
+            def __init__(self) -> None:
+                self.range_calls = 0
+                self.from_flags: list[int] = []
+
+            def initialize(self, *args, **kwargs): return True
+            def account_info(self): return SimpleNamespace(currency="USD", trade_mode=0)
+            def symbol_info(self, symbol): return SimpleNamespace(name=symbol, visible=True)
+            def copy_ticks_range(self, symbol, start, end, flags):
+                self.range_calls += 1
+                return None
+            def copy_ticks_from(self, symbol, start, count, flags):
+                self.from_flags.append(flags)
+                if flags == self.COPY_TICKS_ALL:
+                    return [
+                        {"time_msc": 1_700_000_000_000, "bid": 1.1000, "ask": 1.1002},
+                    ]
+                return [
+                    {"time_msc": 1_700_000_000_000, "bid": 1.1000, "ask": 1.1002},
+                    {"time_msc": 1_700_000_001_000, "bid": 1.1001, "ask": 1.1003},
+                ]
+            def last_error(self): return (-1, "Terminal: Call failed")
+
+        fake = FakeMt5()
+        client = Mt5Client(BrokerSettings(), module=fake)
+        start = datetime.fromtimestamp(1_700_000_000, tz=timezone.utc)
+        end = datetime.fromtimestamp(1_700_000_001, tz=timezone.utc)
+
+        ticks = client.historical_ticks("EUR_USD", start, end)
+
+        self.assertEqual(fake.range_calls, 2)
+        self.assertEqual(fake.from_flags[0], fake.COPY_TICKS_ALL)
+        self.assertIn(fake.COPY_TICKS_INFO, fake.from_flags[1:])
+        self.assertEqual(len(ticks), 2)
+        self.assertAlmostEqual(ticks.iloc[-1]["ask"], 1.1003)
+
     def test_normalize_rejects_malformed_fx_symbol(self) -> None:
         with self.assertRaises(ValueError):
             normalize_instrument_name("EUR")
