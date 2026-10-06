@@ -280,6 +280,7 @@ def create_app(settings: FxBotSettings | None = None) -> FastAPI:
     def ai_evaluation(
         min_wait_improvement_pips: float = Query(default=1.0, ge=0.0, le=100.0),
         include_degraded: bool = False,
+        limit: int = Query(default=10000, ge=1, le=100000),
     ) -> dict[str, Any]:
         """Research-only shadow AI attribution; never changes trading state."""
         return ai_value_report(
@@ -287,6 +288,7 @@ def create_app(settings: FxBotSettings | None = None) -> FastAPI:
             config=AiEvaluationConfig(
                 min_wait_improvement_pips=min_wait_improvement_pips,
                 include_degraded=include_degraded,
+                max_candidates=limit,
             ),
         )
 
@@ -765,9 +767,9 @@ def _config_payload(settings: FxBotSettings) -> dict[str, Any]:
         "symbol_map": settings.broker.symbol_map,
     }
     payload["runtime"] = {
-        "database_url": settings.runtime.database_url,
+        "database_configured": bool(settings.runtime.database_url),
         "loop_interval_seconds": settings.runtime.loop_interval_seconds,
-        "log_jsonl_path": settings.runtime.log_jsonl_path,
+        "jsonl_logging_configured": bool(settings.runtime.log_jsonl_path),
         "frontend_origin": settings.runtime.frontend_origin,
         "start_worker_with_api": settings.runtime.start_worker_with_api,
         "bind_host": settings.runtime.bind_host,

@@ -11,13 +11,15 @@ from fxbot.ai.schemas import PredictionRequest
 from fxbot.training_dataset import FEATURE_COLUMNS
 
 
-FEATURE_BUILDER_VERSION = "v1"
+FEATURE_BUILDER_VERSION = "v2"
 
 
 def build_prediction_features(request: PredictionRequest) -> dict[str, Any]:
     """Return exactly the feature manifest used by baseline model training."""
 
     snapshot = request.market_snapshot
+    if snapshot.get("version") != "v1":
+        raise ValueError("unsupported market snapshot version")
     snapshot_candidate_id = str(snapshot.get("candidate_id") or "")
     if snapshot_candidate_id and snapshot_candidate_id != request.candidate_id:
         raise ValueError("market snapshot candidate_id does not match prediction request")

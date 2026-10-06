@@ -236,9 +236,9 @@ def test_chronological_split_uses_explicit_half_open_boundaries() -> None:
 
     splits = chronological_split(frame)
 
-    assert splits.train["candidate_id"].tolist() == ["train-start", "train-end"]
-    assert splits.validation["candidate_id"].tolist() == ["validation-start", "validation-end"]
-    assert splits.test["candidate_id"].tolist() == ["test-start", "test-end"]
+    assert splits.train["candidate_id"].tolist() == ["train-start"]
+    assert splits.validation["candidate_id"].tolist() == ["validation-start"]
+    assert splits.test["candidate_id"].tolist() == ["test-start"]
     assert splits.forward["candidate_id"].tolist() == ["forward-start", "forward-current"]
 
 
@@ -391,6 +391,7 @@ def test_entry_timing_xgboost_trains_all_five_actions_chronologically(tmp_path) 
         pd.DataFrame(rows),
         tmp_path,
         model_config=EntryTimingModelConfig(
+            min_samples_per_class=2,
             n_estimators=10,
             max_depth=2,
             learning_rate=0.1,

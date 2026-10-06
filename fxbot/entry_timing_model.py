@@ -13,6 +13,7 @@ import argparse
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+from importlib.metadata import version
 from pathlib import Path
 from typing import Any
 
@@ -23,11 +24,11 @@ from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.metrics import accuracy_score, balanced_accuracy_score, confusion_matrix, f1_score, log_loss
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder
+from sklearn.preprocessing import OneHotEncoder, FunctionTransformer
 
 from fxbot.ai.feature_builder import FEATURE_BUILDER_VERSION
-from fxbot.baseline_model import CATEGORICAL_FEATURES
 from fxbot.chronological_split import ChronologicalSplitConfig, chronological_split
+from fxbot.ai.preprocessing import CATEGORICAL_FEATURES, feature_frame
 from fxbot.training_dataset import ENTRY_ACTIONS, FEATURE_COLUMNS
 
 
@@ -43,8 +44,11 @@ class EntryTimingModelConfig:
     min_child_weight: float = 5.0
     reg_lambda: float = 1.0
     random_state: int = 42
+    min_samples_per_class: int = 20
 
     def validate(self) -> None:
+        if self.min_samples_per_class < 2:
+            raise ValueError("min_samples_per_class must be at least 2")
         if self.n_estimators <= 0 or self.max_depth <= 0 or self.learning_rate <= 0:
             raise ValueError("invalid entry-timing XGBoost hyperparameters")
 
@@ -86,6 +90,9 @@ def train_entry_timing_model(
         )
 
     label_to_index = {label: index for index, label in enumerate(ENTRY_ACTIONS)}
+    counts = train[ENTRY_TIMING_TARGET].value_counts()
+    if (counts < cfg.min_samples_per_class).any():
+        raise ValueError(f"insufficient per-class training support (minimum {cfg.min_samples_per_class}): {counts.to_dict()}")
     x_train = _feature_frame(train)
     y_train = train[ENTRY_TIMING_TARGET].map(label_to_index).astype(int)
     x_validation = _feature_frame(validation)
@@ -132,6 +139,11 @@ def train_entry_timing_model(
         "forward_used_for_fit": False,
         "random_shuffle": False,
         "model_sha256": model_hash,
+        "dataset_sha256": hashlib.sha256(frame.to_csv(index=False).encode()).hexdigest(),
+        "training_rows_sha256": hashlib.sha256(train.to_csv(index=False).encode()).hexdigest(),
+        "dependency_versions": {name: version(name) for name in ("numpy", "pandas", "scikit-learn", "xgboost", "joblib")},
+        "dataset_versions": sorted(train["dataset_version"].dropna().astype(str).unique()) if "dataset_version" in train else [],
+        "label_versions": sorted(train["label_version"].dropna().astype(str).unique()) if "label_version" in train else [],
         "rows": {
             "train": int(len(train)),
             "validation": int(len(validation)),
@@ -178,13 +190,13 @@ def _pipeline(config: EntryTimingModelConfig) -> Pipeline:
         transformers=[
             (
                 "numeric",
-                Pipeline([("imputer", SimpleImputer(strategy="median"))]),
+                Pipeline([("imputer", SimpleImputer(strategy="median", keep_empty_features=True))]),
                 numeric,
             ),
             (
                 "categorical",
                 Pipeline([
-                    ("imputer", SimpleImputer(strategy="constant", fill_value="UNKNOWN")),
+                    ("imputer", SimpleImputer(strategy="constant", fill_value="UNKNOWN", keep_empty_features=True)),
                     ("onehot", OneHotEncoder(handle_unknown="ignore")),
                 ]),
                 categorical,
@@ -209,24 +221,13 @@ def _pipeline(config: EntryTimingModelConfig) -> Pipeline:
         verbosity=0,
     )
     return Pipeline([
+        ("coerce", FunctionTransformer(feature_frame)),
         ("preprocess", preprocess),
         ("model", classifier),
     ])
 
 
-def _feature_frame(frame: pd.DataFrame) -> pd.DataFrame:
-    missing = [column for column in FEATURE_COLUMNS if column not in frame.columns]
-    if missing:
-        raise ValueError(f"dataset is missing model feature columns: {missing}")
-    features = frame.loc[:, FEATURE_COLUMNS].copy()
-    for column in CATEGORICAL_FEATURES:
-        if column in features:
-            features[column] = features[column].astype("string")
-    for column in features.columns:
-        if column not in CATEGORICAL_FEATURES:
-            features[column] = pd.to_numeric(features[column], errors="coerce")
-    return features
-
+_feature_frame = feature_frame
 
 def _ready(frame: pd.DataFrame) -> pd.DataFrame:
     if ENTRY_TIMING_TARGET not in frame.columns:
@@ -284,12 +285,14 @@ def main() -> None:
     parser.add_argument("--validation-start", default="2025-01-01")
     parser.add_argument("--test-start", default="2026-01-01")
     parser.add_argument("--forward-start", default="2026-07-01")
+    parser.add_argument("--min-samples-per-class", type=int, default=20)
     args = parser.parse_args()
 
     frame = pd.read_csv(args.dataset)
     artifacts = train_entry_timing_model(
         frame,
         args.output_dir,
+        model_config=EntryTimingModelConfig(min_samples_per_class=args.min_samples_per_class),
         split_config=ChronologicalSplitConfig(
             train_start=args.train_start,
             validation_start=args.validation_start,

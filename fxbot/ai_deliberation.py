@@ -46,9 +46,6 @@ AI_REASON_CODES = {
     "insufficient_evidence",
     "deterministic_context_supportive",
     "deterministic_context_conflicting",
-    "legacy_confirm",
-    "legacy_flag",
-    "legacy_reject",
 }
 
 AI_RESPONSE_SCHEMA_NAME = "fx_trade_deliberation_v3"
@@ -368,7 +365,7 @@ def apply_ai_execution_policy(
     if settings.mode in {"off", "shadow"}:
         return AiExecutionPolicyDecision(True, "deterministic_execution_authoritative")
     if result is None or not result.successful or result.response is None:
-        if settings.advisory_require_confirmation and settings.fail_policy == "fail_closed_if_confirmation_required":
+        if settings.advisory_require_confirmation:
             return AiExecutionPolicyDecision(False, "ai_confirmation_unavailable")
         return AiExecutionPolicyDecision(True, "ai_failure_nonblocking_advisory")
     response = result.response
@@ -405,7 +402,7 @@ class AiDeliberationService:
             # No response body, prompt, or credential is logged. The failure is
             # research metadata and must never crash the worker.
             log.warning("AI deliberation failed: %s", type(exc).__name__)
-            return AiDeliberationResult(response=None, latency_ms=_elapsed_ms(started), failure_reason=f"{type(exc).__name__}: {exc}")
+            return AiDeliberationResult(response=None, latency_ms=_elapsed_ms(started), failure_reason=type(exc).__name__)
 
     def close(self) -> None:
         """Release a reusable HTTP connection pool when the worker stops."""
@@ -493,7 +490,14 @@ def _extract_provider_json(payload: Any) -> dict[str, Any]:
     if not isinstance(text, str):
         raise AiResponseValidationError("provider response has no structured content")
     try:
-        decoded = json.loads(text)
+        def unique_object(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise AiResponseValidationError("duplicate JSON property")
+                result[key] = value
+            return result
+        decoded = json.loads(text, object_pairs_hook=unique_object)
     except json.JSONDecodeError as exc:
         raise AiResponseValidationError("provider content is not JSON") from exc
     if not isinstance(decoded, dict):
@@ -552,7 +556,8 @@ def validate_ai_audit_response(
         raise AiResponseValidationError("reason_codes may contain at most 8 codes")
     if len(set(reason_codes)) != len(reason_codes):
         raise AiResponseValidationError("reason_codes must be unique")
-    invalid = [code for code in reason_codes if code not in AI_REASON_CODES]
+    allowed_codes = AI_REASON_CODES | ({"legacy_confirm", "legacy_flag", "legacy_reject"} if allow_legacy_stored_response else set())
+    invalid = [code for code in reason_codes if code not in allowed_codes]
     if invalid:
         raise AiResponseValidationError(f"unsupported reason_codes: {invalid[:3]}")
     return AiAuditResponse(decision, confidence, reason_codes)

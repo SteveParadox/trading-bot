@@ -23,7 +23,7 @@ from typing import Any
 import pandas as pd
 
 
-SPLIT_VERSION = "v1"
+SPLIT_VERSION = "v2"
 
 
 @dataclass(frozen=True)
@@ -32,8 +32,13 @@ class ChronologicalSplitConfig:
     validation_start: str = "2025-01-01"
     test_start: str = "2026-01-01"
     forward_start: str = "2026-07-01"
+    # 30-minute labels may be sampled up to 30 seconds late. Purge the
+    # earlier period so no label observes prices from the next period.
+    purge_seconds: int = 1830
 
     def validate(self) -> None:
+        if self.purge_seconds < 1830:
+            raise ValueError("purge_seconds must cover the 1830-second label horizon")
         points = [
             pd.Timestamp(self.train_start, tz="UTC"),
             pd.Timestamp(self.validation_start, tz="UTC"),
@@ -68,6 +73,10 @@ def chronological_split(
 
     working = frame.copy()
     timestamps = pd.to_datetime(working["timestamp"], utc=True, errors="raise")
+    if timestamps.isna().any() or working["candidate_id"].isna().any():
+        raise ValueError("split timestamps and candidate IDs must not be missing")
+    if working["candidate_id"].astype(str).duplicated().any():
+        raise ValueError("duplicate candidate IDs in chronological dataset")
     working = working.assign(_split_timestamp=timestamps)
     working = working.sort_values(["_split_timestamp", "candidate_id"], kind="stable").reset_index(drop=True)
 
@@ -76,9 +85,18 @@ def chronological_split(
     test_start = pd.Timestamp(cfg.test_start, tz="UTC")
     forward_start = pd.Timestamp(cfg.forward_start, tz="UTC")
 
-    train = _slice(working, train_start, validation_start)
-    validation = _slice(working, validation_start, test_start)
-    test = _slice(working, test_start, forward_start)
+    purge = pd.Timedelta(seconds=cfg.purge_seconds)
+    train = _slice(working, train_start, validation_start - purge)
+    validation = _slice(working, validation_start, test_start - purge)
+    test = _slice(working, test_start, forward_start - purge)
+    # Honor longer configured sampling lags recorded by the tracker too.
+    if "label_end_timestamp" in working:
+        def purge_observed(data, boundary):
+            ends = pd.to_datetime(data["label_end_timestamp"], utc=True, errors="coerce")
+            return data.loc[ends.notna() & (ends < boundary)].copy()
+        train = purge_observed(train, validation_start)
+        validation = purge_observed(validation, test_start)
+        test = purge_observed(test, forward_start)
     forward = working.loc[working["_split_timestamp"] >= forward_start].copy()
 
     result = SplitFrames(
@@ -127,6 +145,7 @@ def export_chronological_splits(
         "chronological": True,
         "random_shuffle": False,
         "interval_convention": "[start, end)",
+        "purged_or_out_of_range_rows": len(frame) - sum(len(f) for f in (splits.train, splits.validation, splits.test, splits.forward)),
         "files": files,
     }
     manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")

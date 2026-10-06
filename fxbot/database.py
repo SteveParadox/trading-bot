@@ -319,8 +319,7 @@ def session_factory(database_url: str) -> sessionmaker[Session]:
     else:
         engine = create_engine(database_url)
     Base.metadata.create_all(engine)
-    if database_url.startswith("sqlite:///"):
-        _ensure_sqlite_columns(engine)
+    _ensure_schema_columns(engine)
     return sessionmaker(engine, expire_on_commit=False)
 
 
@@ -396,7 +395,7 @@ def sqlite_retry_operation(
     raise last_exc  # type: ignore[misc]
 
 
-def _ensure_sqlite_columns(engine: Any) -> None:
+def _ensure_schema_columns(engine: Any) -> None:
     existing = {column["name"] for column in inspect(engine).get_columns("bot_state")}
     additions = {
         "daily_start_day": "ALTER TABLE bot_state ADD COLUMN daily_start_day VARCHAR(16)",
@@ -414,7 +413,7 @@ def _ensure_sqlite_columns(engine: Any) -> None:
             "time_to_loss_seconds": "ALTER TABLE candidate_outcomes ADD COLUMN time_to_loss_seconds FLOAT",
             "final_net_pnl": "ALTER TABLE candidate_outcomes ADD COLUMN final_net_pnl FLOAT",
             "final_net_pnl_currency": "ALTER TABLE candidate_outcomes ADD COLUMN final_net_pnl_currency VARCHAR(16)",
-            "final_net_pnl_at": "ALTER TABLE candidate_outcomes ADD COLUMN final_net_pnl_at DATETIME",
+            "final_net_pnl_at": "ALTER TABLE candidate_outcomes ADD COLUMN final_net_pnl_at TIMESTAMP",
         }
         with engine.begin() as connection:
             for name, ddl in outcome_additions.items():

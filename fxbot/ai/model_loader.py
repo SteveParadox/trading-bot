@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import io
 from pathlib import Path
 from typing import Any
 
@@ -47,9 +48,9 @@ class VersionedModelLoader:
         if self._loaded is not None:
             return self._loaded
         if not self.model_path.is_file():
-            raise ModelLoadError(f"model artifact not found: {self.model_path}")
+            raise ModelLoadError("model artifact not found")
         if not self.metadata_path.is_file():
-            raise ModelLoadError(f"model metadata not found: {self.metadata_path}")
+            raise ModelLoadError("model metadata not found")
 
         try:
             metadata = json.loads(self.metadata_path.read_text(encoding="utf-8"))
@@ -67,22 +68,24 @@ class VersionedModelLoader:
         if feature_columns != FEATURE_COLUMNS:
             raise ModelLoadError("model feature manifest does not match serving feature schema")
         artifact_feature_version = metadata.get("feature_builder_version")
-        if artifact_feature_version is not None and artifact_feature_version != FEATURE_BUILDER_VERSION:
+        if artifact_feature_version != FEATURE_BUILDER_VERSION:
             raise ModelLoadError(
                 "model feature-builder version does not match serving feature builder"
             )
 
-        actual_hash = hashlib.sha256(self.model_path.read_bytes()).hexdigest()
+        artifact_bytes = self.model_path.read_bytes()
+        actual_hash = hashlib.sha256(artifact_bytes).hexdigest()
         expected_hash = str(metadata.get("model_sha256") or "")
         if self.verify_hash and (not expected_hash or actual_hash != expected_hash):
             raise ModelLoadError("model SHA-256 does not match metadata")
 
         try:
             import joblib
-            model = joblib.load(self.model_path)
+            # Deserialize exactly the verified bytes, avoiding a file-swap race.
+            model = joblib.load(io.BytesIO(artifact_bytes))
         except Exception as exc:
             raise ModelLoadError(f"model artifact could not be loaded: {type(exc).__name__}") from exc
-        if not hasattr(model, "predict_proba"):
+        if not callable(getattr(model, "predict_proba", None)):
             raise ModelLoadError("loaded baseline model does not expose predict_proba")
 
         self._loaded = LoadedModel(

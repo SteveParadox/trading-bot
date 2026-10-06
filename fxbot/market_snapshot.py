@@ -338,11 +338,12 @@ def build_news_context(
         and recent.minutes_since_event <= max(0, after_minutes)
     )
 
-    nearby: list[NewsEventSnapshot] = []
-    if upcoming is not None and upcoming.minutes_until_event is not None and upcoming.minutes_until_event <= max(0, before_minutes):
-        nearby.append(upcoming)
-    if just_occurred and recent is not None:
-        nearby.append(recent)
+    # A closer low-impact event must not hide a simultaneous/nearby high event.
+    nearby = [
+        _news_event_snapshot(event, observed)
+        for event in related
+        if -max(0, after_minutes) <= (_utc(event.starts_at) - observed).total_seconds() / 60 <= max(0, before_minutes)
+    ]
 
     if stale:
         risk_level = "UNKNOWN"
@@ -379,7 +380,7 @@ def _news_event_snapshot(event: NewsEvent, observed_at: datetime) -> NewsEventSn
         impact_score=int(event.impact_score or 0),
         scheduled_at=scheduled,
         minutes_until_event=delta_minutes if delta_minutes >= 0 else None,
-        minutes_since_event=abs(delta_minutes) if delta_minutes < 0 else None,
+        minutes_since_event=abs(delta_minutes) if delta_minutes <= 0 else None,
     )
 
 

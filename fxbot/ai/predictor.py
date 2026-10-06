@@ -6,6 +6,7 @@ import hashlib
 import json
 import logging
 import time
+import math
 from typing import Protocol
 
 import pandas as pd
@@ -106,7 +107,7 @@ class PredictionService:
             ).hexdigest()
             artifact = self.loader.load()
             frame = pd.DataFrame([features])
-            probability = float(artifact.model.predict_proba(frame)[0][1])
+            probability = _binary_probability(artifact, frame)
             outputs = _classification_outputs(artifact.target, probability)
             auxiliary_outputs = _auxiliary_classification_outputs(
                 self.auxiliary_loaders,
@@ -131,12 +132,28 @@ class PredictionService:
             return NumericalPrediction(
                 status="error",
                 latency_ms=_elapsed_ms(started),
-                error=f"{type(exc).__name__}: {exc}",
+                error=type(exc).__name__,
             )
 
 
 def _elapsed_ms(started: float) -> int:
     return max(0, int(round((time.perf_counter() - started) * 1000)))
+
+
+def _probabilities(artifact, frame, expected_classes: list[int]) -> list[float]:
+    classes = list(getattr(artifact.model, "classes_", []))
+    if classes != expected_classes:
+        raise ValueError("model probability class order is incompatible")
+    values = [float(v) for v in artifact.model.predict_proba(frame)[0]]
+    if len(values) != len(expected_classes) or any(not math.isfinite(v) or not 0 <= v <= 1 for v in values):
+        raise ValueError("invalid model probabilities")
+    if not math.isclose(sum(values), 1, abs_tol=1e-6):
+        raise ValueError("model probabilities do not sum to one")
+    return values
+
+
+def _binary_probability(artifact, frame) -> float:
+    return _probabilities(artifact, frame, [0, 1])[1]
 
 
 def _classification_outputs(target: str, probability: float) -> dict[str, float]:
@@ -167,7 +184,7 @@ def _entry_timing_outputs(
         expected = ["ENTER_NOW", "WAIT_30S", "WAIT_1M", "WAIT_3M", "SKIP"]
         if labels != expected:
             raise ValueError("entry timing artifact class labels do not match serving action space")
-        probabilities = [float(value) for value in artifact.model.predict_proba(frame)[0]]
+        probabilities = _probabilities(artifact, frame, list(range(5)))
         if len(probabilities) != len(labels):
             raise ValueError("entry timing probability count does not match class labels")
         distribution = {
@@ -186,7 +203,7 @@ def _entry_timing_outputs(
     except Exception as exc:
         log.warning("entry timing prediction failed: %s", type(exc).__name__)
         return {
-            "entry_action_error": f"{type(exc).__name__}: {exc}",
+            "entry_action_error": type(exc).__name__,
         }
 
 
@@ -202,7 +219,9 @@ def _auxiliary_classification_outputs(
     for target, loader in loaders.items():
         try:
             artifact = loader.load()
-            probability = float(artifact.model.predict_proba(frame)[0][1])
+            if artifact.target != target:
+                raise ValueError("auxiliary target mismatch")
+            probability = _binary_probability(artifact, frame)
             outputs.update(_classification_outputs(target, probability))
             model_metadata[target] = {
                 "model_name": artifact.model_name,
@@ -211,7 +230,7 @@ def _auxiliary_classification_outputs(
             }
         except Exception as exc:
             log.warning("auxiliary %s prediction failed: %s", target, type(exc).__name__)
-            errors[target] = f"{type(exc).__name__}: {exc}"
+            errors[target] = type(exc).__name__
     if model_metadata:
         outputs["auxiliary_models"] = model_metadata
     if errors:

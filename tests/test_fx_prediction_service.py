@@ -19,6 +19,7 @@ from fxbot.training_dataset import FEATURE_COLUMNS
 
 
 class _ProbModel:
+    classes_ = [0, 1]
     def __init__(self, probability: float = 0.83) -> None:
         self.probability = probability
 
@@ -45,6 +46,7 @@ class _FakeLoader:
 
 
 class _EntryProbModel:
+    classes_ = [0, 1, 2, 3, 4]
     def predict_proba(self, frame):
         assert list(frame.columns) == FEATURE_COLUMNS
         return [[0.10, 0.15, 0.50, 0.15, 0.10]]
@@ -326,6 +328,7 @@ def test_model_loader_verifies_hash_target_and_feature_manifest(tmp_path: Path) 
         "model_version": "xgb_tp_before_sl_v1",
         "target": "TP_BEFORE_SL",
         "problem_type": "binary_classification",
+        "feature_builder_version": FEATURE_BUILDER_VERSION,
         "feature_columns": FEATURE_COLUMNS,
         "model_sha256": digest,
     }))

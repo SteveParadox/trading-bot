@@ -33,10 +33,13 @@ AI_EVALUATION_VERSION = "v1"
 class AiEvaluationConfig:
     min_wait_improvement_pips: float = 1.0
     include_degraded: bool = False
+    max_candidates: int = 10000
 
     def __post_init__(self) -> None:
         if self.min_wait_improvement_pips < 0:
             raise ValueError("min_wait_improvement_pips cannot be negative")
+        if not 1 <= self.max_candidates <= 100000:
+            raise ValueError("max_candidates must be between 1 and 100000")
 
 
 def build_ai_outcome_frame(
@@ -59,7 +62,9 @@ def build_ai_outcome_frame(
                 AiDeliberationRow.signal_id == TradeCandidateRow.candidate_id,
             )
             .where(CandidateOutcomeRow.status == "complete")
-            .order_by(TradeCandidateRow.timestamp.asc())
+            .where(AiDeliberationRow.mode == "shadow")
+            .order_by(TradeCandidateRow.timestamp.desc(), TradeCandidateRow.candidate_id)
+            .limit(cfg.max_candidates)
         )
         if not cfg.include_degraded:
             query = query.where(CandidateOutcomeRow.data_quality == "good")
@@ -74,6 +79,8 @@ def build_ai_outcome_frame(
             continue
         cost = candidate_execution_cost_pips(candidate, outcome)
         if cost is None or not math.isfinite(float(cost)):
+            continue
+        if not math.isfinite(float(outcome.return_30m_pips)):
             continue
         net_return = float(outcome.return_30m_pips) - float(cost)
         wait_action, wait_improvement = _best_wait(outcome)
@@ -162,6 +169,8 @@ def ai_value_report(
     return {
         "version": AI_EVALUATION_VERSION,
         "sample_size": int(len(frame)),
+        "sample_window": "most recent completed shadow candidates with valid decisions and known costs",
+        "query_limit": cfg.max_candidates,
         "config": asdict(cfg),
         "decision_outcomes": decision_outcomes,
         "baseline": baseline_metrics,
@@ -337,11 +346,11 @@ def _realized_shadow_metrics(frame: pd.DataFrame) -> dict[str, Any]:
         str(value)
         for value in executed["final_net_pnl_currency"].dropna().tolist()
     })
-    if len(currencies) > 1:
+    if len(currencies) > 1 or executed["final_net_pnl_currency"].isna().any():
         return {
             "trade_count": len(values),
             "comparable": False,
-            "reason": "multiple final_net_pnl currencies",
+            "reason": "multiple or unknown final_net_pnl currencies",
             "currencies": currencies,
         }
     metrics = _money_metrics(values)

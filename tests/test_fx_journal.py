@@ -368,7 +368,7 @@ class StructuredJournalTests(unittest.TestCase):
                 outcome = journal.find_candidate_outcome(candidate.candidate_id)
                 self.assertEqual(outcome.status, "incomplete")
                 self.assertIsNone(outcome.return_30m_pips)
-                self.assertEqual(outcome.payload["incomplete_reason"], "missed_30m_horizon")
+                self.assertEqual(outcome.payload["incomplete_reason"], "late_observation_after_horizon")
 
     def test_training_dataset_builds_features_and_entry_wait_skip_labels(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

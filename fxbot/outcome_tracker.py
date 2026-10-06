@@ -95,19 +95,7 @@ class CandidateOutcomeTracker:
         """Update all recent candidates with currently observed executable quotes."""
 
         now = _utc(observed_at)
-        if not self._reconciled_history:
-            # One startup pass repairs rows left incomplete by a restart. Later
-            # scans stay bounded to the active 30-minute labeling horizon.
-            candidates = self.journal.recent_candidates(limit=self.candidate_scan_limit)
-            self._reconciled_history = True
-        else:
-            candidates = self.journal.candidates_since(
-                now - timedelta(
-                    seconds=MAX_OUTCOME_HORIZON_SECONDS
-                    + self.observation_lag_tolerance_seconds
-                ),
-                limit=self.candidate_scan_limit,
-            )
+        candidates = self.journal.pending_outcome_candidates(limit=self.candidate_scan_limit)
         for candidate in candidates:
             started = _utc(candidate.timestamp)
             age = (now - started).total_seconds()
@@ -203,6 +191,11 @@ class CandidateOutcomeTracker:
             return
         if not _valid_quote(price):
             return
+        if elapsed > MAX_OUTCOME_HORIZON_SECONDS + self.observation_lag_tolerance_seconds:
+            self.journal.update_candidate_outcome(candidate.candidate_id, values={
+                "status": "incomplete", "completed_at": observed, "data_quality": "degraded",
+            }, payload_update={"incomplete_reason": "late_observation_after_horizon"})
+            return
         if outcome.last_observed_at is not None and observed <= _utc(outcome.last_observed_at):
             return
 
@@ -224,7 +217,7 @@ class CandidateOutcomeTracker:
         payload = dict(outcome.payload or {})
         missed = set(payload.get("missed_horizons") or [])
 
-        gap = 0.0
+        gap = max(0.0, elapsed) if outcome.observation_count == 0 else 0.0
         if outcome.last_observed_at is not None:
             gap = max(0.0, (observed - _utc(outcome.last_observed_at)).total_seconds())
         max_gap = max(float(outcome.max_observation_gap_seconds or 0.0), gap)
@@ -248,8 +241,8 @@ class CandidateOutcomeTracker:
         tp_now, sl_now = _observed_level_hits(
             side=side,
             liquidation=liquidation,
-            stop_loss=candidate.stop_loss,
-            take_profit=candidate.take_profit,
+            stop_loss=payload.get("stop_loss", candidate.stop_loss),
+            take_profit=payload.get("take_profit", candidate.take_profit),
         )
         if tp_now and not outcome.tp_hit:
             updates["tp_hit"] = True
@@ -306,6 +299,11 @@ class CandidateOutcomeTracker:
         payload["latest_quote_time"] = _utc(price.time).isoformat()
         payload["latest_bid"] = float(price.bid)
         payload["latest_ask"] = float(price.ask)
+        sampled = dict(payload.get("horizon_observed_seconds") or {})
+        for field in (*RETURN_HORIZONS_SECONDS, *WAIT_HORIZONS_SECONDS):
+            if field in updates:
+                sampled[field] = elapsed
+        payload["horizon_observed_seconds"] = sampled
 
         if elapsed >= MAX_OUTCOME_HORIZON_SECONDS:
             return_30m = updates.get("return_30m_pips", outcome.return_30m_pips)

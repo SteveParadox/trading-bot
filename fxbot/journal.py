@@ -12,7 +12,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, select, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, close_all_sessions, sessionmaker
 
@@ -260,7 +260,10 @@ class StructuredJournal:
             if take_profit is not _UNSET:
                 row.take_profit = take_profit
             if payload_update:
-                row.payload = _jsonable({**(row.payload or {}), **payload_update})
+                # Candidate-time features are immutable, including across retries.
+                protected = {"market_snapshot", "signal_score", "signal_time", "execution_cost_pips_round_trip", "pip_size"}
+                updates = {key: value for key, value in payload_update.items() if key not in protected}
+                row.payload = _jsonable({**(row.payload or {}), **updates})
             row.updated_at = utc_now()
             session.flush()
             session.expunge(row)
@@ -283,6 +286,17 @@ class StructuredJournal:
                     .limit(limit)
                 )
             )
+            for row in rows:
+                session.expunge(row)
+            return rows
+
+    def pending_outcome_candidates(self, limit: int = 2000) -> list[TradeCandidateRow]:
+        """Bounded backlog, excluding completed rows so restarts make progress."""
+        with self.sessions() as session:
+            rows = list(session.scalars(select(TradeCandidateRow).outerjoin(
+                CandidateOutcomeRow, CandidateOutcomeRow.candidate_id == TradeCandidateRow.candidate_id
+            ).where(or_(CandidateOutcomeRow.candidate_id.is_(None), CandidateOutcomeRow.status == "tracking"))
+                .order_by(TradeCandidateRow.timestamp.asc()).limit(limit)))
             for row in rows:
                 session.expunge(row)
             return rows
@@ -384,6 +398,22 @@ class StructuredJournal:
             if row is not None:
                 session.expunge(row)
             return row
+
+    def candidate_realized_pnl(self, candidate_id: str) -> dict[str, Any]:
+        """Aggregate all execution legs once, refusing partial/unknown totals."""
+        with self.sessions() as session:
+            rows = list(session.scalars(select(TradeJournalRow).where(
+                TradeJournalRow.payload["strategy_context"]["candidate_id"].as_string() == candidate_id,
+                TradeJournalRow.state != "reconciled_alias",
+            )))
+            currencies = {(row.payload or {}).get("strategy_context", {}).get("account_currency") for row in rows}
+            complete = bool(rows) and all(row.state == "closed" and (row.payload or {}).get("costs_complete", True) for row in rows)
+            complete = complete and len(currencies) == 1 and None not in currencies
+            return {
+                "final_net_pnl": sum(float(row.realized_pl or 0) + float(row.financing or 0) for row in rows) if complete else None,
+                "final_net_pnl_currency": next(iter(currencies)) if complete else None,
+                "final_net_pnl_at": max((row.exit_time for row in rows if row.exit_time), default=None) if complete else None,
+            }
 
     def recent_candidate_outcomes(self, limit: int = 200) -> list[CandidateOutcomeRow]:
         with self.sessions() as session:

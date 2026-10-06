@@ -51,29 +51,15 @@ def validate_ai_trade_recommendation(payload: dict[str, Any]) -> AiTradeRecommen
     fields. Those concerns stay with deterministic trading code.
     """
 
-    if not isinstance(payload, dict):
-        raise ValueError("AI trade recommendation must be a JSON object")
-    required = {"decision", "confidence", "reason_codes"}
-    missing = required.difference(payload)
-    extra = set(payload).difference(required)
-    if missing:
-        raise ValueError(f"AI trade recommendation is missing fields: {sorted(missing)}")
-    if extra:
-        raise ValueError(f"AI trade recommendation has unsupported fields: {sorted(extra)}")
+    from fxbot.ai_deliberation import validate_ai_audit_response, AiResponseValidationError
     try:
-        decision = AiTradeDecision(str(payload["decision"]).upper())
-    except ValueError as exc:
-        raise ValueError("decision must be TAKE, WAIT, or SKIP") from exc
-    confidence = payload["confidence"]
-    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
-        raise ValueError("confidence must be numeric")
-    reason_codes = payload["reason_codes"]
-    if not isinstance(reason_codes, list):
-        raise ValueError("reason_codes must be an array")
+        validated = validate_ai_audit_response(payload)
+    except AiResponseValidationError as exc:
+        raise ValueError("unsupported fields or invalid TAKE, WAIT, or SKIP response") from exc
     return AiTradeRecommendation(
-        decision=decision,
-        confidence=float(confidence),
-        reason_codes=tuple(reason_codes),
+        decision=AiTradeDecision(validated.decision),
+        confidence=validated.confidence,
+        reason_codes=tuple(validated.reason_codes),
     )
 
 

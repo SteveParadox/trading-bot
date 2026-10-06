@@ -15,6 +15,7 @@ import argparse
 from dataclasses import asdict, dataclass
 import hashlib
 import json
+from importlib.metadata import version
 from pathlib import Path
 from typing import Any
 
@@ -35,10 +36,11 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder
+from sklearn.preprocessing import OneHotEncoder, FunctionTransformer
 
 from fxbot.chronological_split import ChronologicalSplitConfig, chronological_split
 from fxbot.ai.feature_builder import FEATURE_BUILDER_VERSION
+from fxbot.ai.preprocessing import CATEGORICAL_FEATURES, feature_frame
 from fxbot.training_dataset import FEATURE_COLUMNS
 
 
@@ -52,18 +54,7 @@ SUPPORTED_BINARY_TARGETS = {
     "FAKE_BREAKOUT",
 }
 
-CATEGORICAL_FEATURES = [
-    "symbol",
-    "direction",
-    "strategy_signal",
-    "session",
-    "account_currency",
-    "news_risk",
-    "upcoming_news_currency",
-    "upcoming_news_impact",
-    "recent_news_currency",
-    "news_freshness_state",
-]
+
 
 
 @dataclass(frozen=True)
@@ -161,6 +152,11 @@ def train_xgboost_baseline(
         "forward_used_for_fit": False,
         "random_shuffle": False,
         "model_sha256": model_hash,
+        "dataset_sha256": hashlib.sha256(frame.to_csv(index=False).encode()).hexdigest(),
+        "training_rows_sha256": hashlib.sha256(train.to_csv(index=False).encode()).hexdigest(),
+        "dependency_versions": {name: version(name) for name in ("numpy", "pandas", "scikit-learn", "xgboost", "joblib")},
+        "dataset_versions": sorted(train["dataset_version"].dropna().astype(str).unique()) if "dataset_version" in train else [],
+        "label_versions": sorted(train["label_version"].dropna().astype(str).unique()) if "label_version" in train else [],
         "rows": {
             "train": int(len(train)),
             "validation": int(len(validation)),
@@ -204,10 +200,10 @@ def _pipeline(config: XGBoostBaselineConfig) -> Pipeline:
     numeric = [column for column in FEATURE_COLUMNS if column not in categorical]
 
     numeric_pipeline = Pipeline([
-        ("imputer", SimpleImputer(strategy="median")),
+        ("imputer", SimpleImputer(strategy="median", keep_empty_features=True)),
     ])
     categorical_pipeline = Pipeline([
-        ("imputer", SimpleImputer(strategy="constant", fill_value="UNKNOWN")),
+        ("imputer", SimpleImputer(strategy="constant", fill_value="UNKNOWN", keep_empty_features=True)),
         ("onehot", OneHotEncoder(handle_unknown="ignore")),
     ])
     preprocess = ColumnTransformer(
@@ -233,24 +229,13 @@ def _pipeline(config: XGBoostBaselineConfig) -> Pipeline:
         verbosity=0,
     )
     return Pipeline([
+        ("coerce", FunctionTransformer(feature_frame)),
         ("preprocess", preprocess),
         ("model", classifier),
     ])
 
 
-def _feature_frame(frame: pd.DataFrame) -> pd.DataFrame:
-    missing = [column for column in FEATURE_COLUMNS if column not in frame.columns]
-    if missing:
-        raise ValueError(f"dataset is missing model feature columns: {missing}")
-    features = frame.loc[:, FEATURE_COLUMNS].copy()
-    for column in CATEGORICAL_FEATURES:
-        if column in features:
-            features[column] = features[column].astype("string")
-    for column in features.columns:
-        if column not in CATEGORICAL_FEATURES:
-            features[column] = pd.to_numeric(features[column], errors="coerce")
-    return features
-
+_feature_frame = feature_frame
 
 def _target_ready(frame: pd.DataFrame, target: str) -> pd.DataFrame:
     if target not in frame.columns:

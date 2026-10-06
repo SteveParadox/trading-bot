@@ -69,8 +69,8 @@ def code_version(root: str | Path | None = None) -> str:
         return explicit
     base = Path(root or Path(__file__).resolve().parents[1])
     digest = hashlib.sha256()
-    for path in sorted(base.glob("fxbot/*.py")):
-        digest.update(path.name.encode("utf-8"))
+    for path in sorted(base.glob("fxbot/**/*.py")):
+        digest.update(str(path.relative_to(base)).encode("utf-8"))
         digest.update(path.read_bytes())
     return digest.hexdigest()[:16]
 
@@ -180,4 +180,3 @@ class SlidingWindowRateLimiter:
             if len(self._requests) > 2048:
                 self._requests = {name: values for name, values in self._requests.items() if values}
             return True
-

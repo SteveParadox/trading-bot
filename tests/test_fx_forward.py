@@ -621,7 +621,7 @@ class ForwardWorkerTests(unittest.TestCase):
                 self.assertIsNotNone(candidate.momentum)
                 self.assertGreater(candidate.trend_strength, 0)
                 self.assertEqual(candidate.strategy_signal, "signal_confirmed")
-                self.assertEqual(candidate.news_risk["freshness"]["stale"], False)
+                self.assertEqual(candidate.news_risk["freshness"]["stale"], True)  # No authoritative feed configured.
                 self.assertTrue(candidate.executed)
                 self.assertEqual(candidate.status, "executed")
                 self.assertIsNone(candidate.rejection_reason)

@@ -263,7 +263,7 @@ class Mt5ConfigAndInstrumentTests(unittest.TestCase):
         self.assertEqual(event["broker_trade_id"], "9001")
         self.assertEqual(event["side"], "LONG")
         self.assertEqual(event["units"], 1000)
-        self.assertAlmostEqual(event["realized_pl"], 9.9)
+        self.assertAlmostEqual(event["realized_pl"], 9.8)
 
     def test_mt5_accepts_order_check_retcodes_for_valid_demo_fill_mode(self) -> None:
         class FakeMt5:

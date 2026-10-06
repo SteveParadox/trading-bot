@@ -68,6 +68,7 @@ TARGET_COLUMNS = [
 ]
 
 AUXILIARY_OUTCOME_COLUMNS = [
+    "label_end_timestamp",
     "tp_hit", "sl_hit", "return_1m_pips", "return_5m_pips",
     "return_15m_pips", "return_30m_pips",
     "net_return_5m_pips", "net_return_15m_pips", "net_return_30m_pips",
@@ -228,7 +229,7 @@ def _feature_row(candidate: TradeCandidateRow, outcome: CandidateOutcomeRow) -> 
     freshness = news.get("freshness") or {}
     sessions = snapshot.get("session") or []
 
-    pip_size = _finite_or_none((outcome.payload or {}).get("pip_size"))
+    pip_size = _finite_or_none(payload.get("pip_size"))
     if pip_size is None or pip_size <= 0:
         pip_size = FxInstrument(candidate.symbol).pip_size
     atr_price = _first_finite(snapshot.get("atr"), candidate.atr)
@@ -244,11 +245,7 @@ def _feature_row(candidate: TradeCandidateRow, outcome: CandidateOutcomeRow) -> 
     risk_payload = payload.get("risk") or {}
     risk_metadata = risk_payload.get("metadata") or {}
     execution_cost_price = _finite_or_none(risk_metadata.get("execution_cost_price"))
-    execution_cost_pips = (
-        execution_cost_price / pip_size
-        if execution_cost_price is not None and pip_size > 0
-        else _finite_or_none(payload.get("execution_cost_pips_round_trip"))
-    )
+    execution_cost_pips = _finite_or_none(payload.get("execution_cost_pips_round_trip"))
 
     return {
         "dataset_version": TRAINING_DATASET_VERSION,
@@ -283,8 +280,8 @@ def _feature_row(candidate: TradeCandidateRow, outcome: CandidateOutcomeRow) -> 
         "resistance_distance_pips": _finite_or_none(snapshot.get("resistance_distance_pips")),
         "risk_reward": risk_reward,
         "proposed_entry": float(candidate.entry),
-        "stop_loss": _finite_or_none(candidate.stop_loss),
-        "take_profit": _finite_or_none(candidate.take_profit),
+        "stop_loss": _finite_or_none(snapshot.get("stop_loss", candidate.stop_loss)),
+        "take_profit": _finite_or_none(snapshot.get("take_profit", candidate.take_profit)),
         "open_positions": _finite_or_none(exposure.get("open_positions")),
         "portfolio_risk": _finite_or_none(exposure.get("portfolio_risk")),
         "gross_exposure": _finite_or_none(exposure.get("gross_exposure")),
@@ -364,6 +361,7 @@ def _target_row(
 
     return {
         "label_version": str((outcome.payload or {}).get("label_version") or "unknown"),
+        "label_end_timestamp": _utc(outcome.completed_at).isoformat() if outcome.completed_at else None,
         "TP_BEFORE_SL": _bool_int(tp_before_sl),
         "PROFITABLE_WITHIN_5_MIN": int(net_return_5m > 0.0),
         "PROFITABLE_WITHIN_15_MIN": int(net_return_15m > 0.0),
@@ -461,6 +459,7 @@ def _immediate_adverse_label(
     return_1m = _finite_or_none(outcome.return_1m_pips)
     adverse_at_one_minute = (
         return_1m is not None
+        and float((outcome.payload or {}).get("horizon_observed_seconds", {}).get("return_1m_pips", 60)) <= config.immediate_adverse_window_seconds
         and return_1m <= -config.immediate_adverse_min_pips
     )
     adverse_excursion_inside_window = (

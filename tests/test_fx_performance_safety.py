@@ -362,9 +362,10 @@ def test_same_signal_on_later_scan_cannot_submit_twice(worker):
         min_atr_pips=.1, max_atr_pips=30, require_volume_confirmation=False))
     worker.risk = FxRiskManager(worker.settings.risk, worker.settings.strategy)
     worker.journal.set_state(BotRunState.RUNNING)
-    for now in (FIXED_NOW, FIXED_NOW + timedelta(seconds=10)):
-        worker._scan_instrument(now, FxInstrument("EUR_USD"), worker.client.price,
-                               FxPortfolioState(10000, 10000, 0, 0), {}, None)
+    with patch("fxbot.forward.datetime", FixedDatetime):
+        for now in (FIXED_NOW, FIXED_NOW + timedelta(seconds=10)):
+            worker._scan_instrument(now, FxInstrument("EUR_USD"), worker.client.price,
+                                   FxPortfolioState(10000, 10000, 0, 0), {}, NewsSnapshot(events=[], stale=False))
     assert len(worker.client.created_orders) == 1
 
 

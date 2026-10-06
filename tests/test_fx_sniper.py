@@ -246,7 +246,7 @@ def test_revalidation_blocks_stale_quote_and_new_news_event(tmp_path):
     from types import SimpleNamespace
     from fxbot.models import FxPortfolioState
     config = replace(settings(tmp_path, "enforce"), sniper=SniperSettings(mode="enforce", cost_filter=False))
-    client = FakeMt5Client()
+    client = FakeMt5Client(entry_frame=trending_frame(1.08, .00025), htf_frame=trending_frame(1.06, .0005))
     instrument = FxInstrument("EUR_USD")
     snap = qualify_entry(frame(), Side.LONG, 1.10005, config.sniper).snapshot
     intent = FxSignalIntent("EUR_USD", Side.LONG, FIXED_NOW, client.price.ask, {"atr": .001}, metadata={"sniper": snap})
