@@ -69,6 +69,46 @@ class Mt5ConfigAndInstrumentTests(unittest.TestCase):
         self.assertEqual(quote.time, expected)
         self.assertEqual(candles.index[0].to_pydatetime(), expected)
 
+    def test_mt5_historical_ranges_apply_same_timestamp_offset_and_preserve_spread(self) -> None:
+        class FakeMt5:
+            TIMEFRAME_M15 = 15
+            COPY_TICKS_INFO = 1
+
+            def initialize(self, *args, **kwargs): return True
+            def account_info(self): return SimpleNamespace(currency="USD", trade_mode=0)
+            def symbol_info(self, symbol): return SimpleNamespace(name=symbol, visible=True)
+            def copy_rates_range(self, symbol, timeframe, start, end):
+                return [{
+                    "time": 1_700_010_800,
+                    "open": 1.1,
+                    "high": 1.2,
+                    "low": 1.0,
+                    "close": 1.15,
+                    "tick_volume": 10,
+                    "spread": 12,
+                }]
+            def copy_ticks_range(self, symbol, start, end, flags):
+                return [
+                    {"time_msc": 1_700_010_800_000, "bid": 1.1000, "ask": 1.1002},
+                    {"time_msc": 1_700_010_801_000, "bid": 1.1001, "ask": 1.1003},
+                ]
+            def last_error(self): return "ok"
+
+        client = Mt5Client(BrokerSettings(time_offset_seconds=-10_800), module=FakeMt5())
+        start = datetime.fromtimestamp(1_699_999_000, tz=timezone.utc)
+        end = datetime.fromtimestamp(1_700_001_000, tz=timezone.utc)
+
+        candles = client.historical_candles("EUR_USD", "15m", start, end)
+        ticks = client.historical_ticks("EUR_USD", start, end)
+
+        expected = datetime.fromtimestamp(1_700_000_000, tz=timezone.utc)
+        self.assertEqual(candles.index[0].to_pydatetime(), expected)
+        self.assertEqual(candles.iloc[0]["spread_points"], 12)
+        self.assertEqual(ticks.iloc[0]["timestamp"].to_pydatetime(), expected)
+        self.assertEqual(ticks.iloc[0]["instrument"], "EUR_USD")
+        self.assertAlmostEqual(ticks.iloc[0]["bid"], 1.1000)
+        self.assertAlmostEqual(ticks.iloc[0]["ask"], 1.1002)
+
     def test_normalize_rejects_malformed_fx_symbol(self) -> None:
         with self.assertRaises(ValueError):
             normalize_instrument_name("EUR")
@@ -223,7 +263,7 @@ class Mt5ConfigAndInstrumentTests(unittest.TestCase):
         self.assertEqual(event["broker_trade_id"], "9001")
         self.assertEqual(event["side"], "LONG")
         self.assertEqual(event["units"], 1000)
-        self.assertAlmostEqual(event["realized_pl"], 9.9)
+        self.assertAlmostEqual(event["realized_pl"], 9.8)
 
     def test_mt5_accepts_order_check_retcodes_for_valid_demo_fill_mode(self) -> None:
         class FakeMt5:

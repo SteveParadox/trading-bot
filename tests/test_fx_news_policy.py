@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 
 from fxbot.api import _config_payload
-from fxbot.config import FxBotSettings, NewsEvent, StrategySettings
+from fxbot.config import FxBotSettings, MlPredictionSettings, NewsEvent, StrategySettings
 from fxbot.market_hours import can_trade
 from fxbot.news import NewsSnapshot, deduplicate_events
 
@@ -147,3 +147,37 @@ def test_config_endpoint_does_not_expose_news_provider_key() -> None:
     assert payload["strategy"]["news_api_key_configured"] is True
     assert "calendar-secret" not in str(payload)
     assert "news_api_key" not in payload["strategy"]
+
+
+def test_config_endpoint_does_not_expose_ml_artifact_paths() -> None:
+    payload = _config_payload(
+        FxBotSettings(
+            ml_prediction=MlPredictionSettings(
+                mode="shadow",
+                model_path="/private/models/xgb.joblib",
+                metadata_path="/private/models/xgb.metadata.json",
+                entry_model_path="/private/models/entry.joblib",
+                entry_metadata_path="/private/models/entry.metadata.json",
+                immediate_adverse_model_path="/private/models/adverse.joblib",
+                immediate_adverse_metadata_path="/private/models/adverse.metadata.json",
+                continuation_model_path="/private/models/continuation.joblib",
+                continuation_metadata_path="/private/models/continuation.metadata.json",
+                fake_breakout_model_path="/private/models/fake.joblib",
+                fake_breakout_metadata_path="/private/models/fake.metadata.json",
+            )
+        )
+    )
+
+    assert payload["ml_prediction"]["mode"] == "shadow"
+    assert payload["ml_prediction"]["model_path_configured"] is True
+    assert payload["ml_prediction"]["metadata_path_configured"] is True
+    assert payload["ml_prediction"]["entry_model_path_configured"] is True
+    assert payload["ml_prediction"]["entry_metadata_path_configured"] is True
+    assert payload["ml_prediction"]["immediate_adverse_model_configured"] is True
+    assert payload["ml_prediction"]["continuation_model_configured"] is True
+    assert payload["ml_prediction"]["fake_breakout_model_configured"] is True
+    assert "/private/models" not in str(payload)
+    assert "model_path" not in payload["ml_prediction"]
+    assert "metadata_path" not in payload["ml_prediction"]
+    assert "entry_model_path" not in payload["ml_prediction"]
+    assert "entry_metadata_path" not in payload["ml_prediction"]

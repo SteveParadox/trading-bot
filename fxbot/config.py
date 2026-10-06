@@ -512,6 +512,42 @@ class RuntimeSettings:
 
 
 @dataclass(frozen=True)
+class MlPredictionSettings:
+    """Configuration for the local numerical trade-quality predictor."""
+
+    mode: str = "off"
+    model_path: str = ""
+    metadata_path: str = ""
+    target: str = "TP_BEFORE_SL"
+    entry_model_path: str = ""
+    entry_metadata_path: str = ""
+    immediate_adverse_model_path: str = ""
+    immediate_adverse_metadata_path: str = ""
+    continuation_model_path: str = ""
+    continuation_metadata_path: str = ""
+    fake_breakout_model_path: str = ""
+    fake_breakout_metadata_path: str = ""
+    verify_hash: bool = True
+
+    def __post_init__(self) -> None:
+        mode = self.mode.lower().strip()
+        if mode not in {"off", "shadow", "required"}:
+            raise ValueError("ml_prediction.mode must be off, shadow, or required")
+        if self.target not in {
+            "TP_BEFORE_SL",
+            "PROFITABLE_WITHIN_5_MIN",
+            "PROFITABLE_WITHIN_15_MIN",
+            "IMMEDIATE_ADVERSE_MOVEMENT",
+            "CONTINUATION",
+            "FAKE_BREAKOUT",
+        }:
+            raise ValueError("ml_prediction.target is not supported")
+        if mode == "required" and (not self.model_path or not self.metadata_path):
+            raise ValueError("required ML prediction needs model_path and metadata_path")
+        object.__setattr__(self, "mode", mode)
+
+
+@dataclass(frozen=True)
 class AiDeliberationSettings:
     """Configuration for the isolated, optional signal-audit service.
 
@@ -528,7 +564,7 @@ class AiDeliberationSettings:
     timeout_seconds: float = 8.0
     max_output_tokens: int = 1200
     max_retries: int = 1
-    prompt_version: str = "v1"
+    prompt_version: str = "v3"
     fail_policy: str = "fail_closed_if_confirmation_required"
     flag_blocks: bool = False
     reject_blocks: bool = False
@@ -603,10 +639,13 @@ class FxBotSettings:
     risk: RiskSettings = field(default_factory=RiskSettings)
     runtime: RuntimeSettings = field(default_factory=RuntimeSettings)
     ai: AiDeliberationSettings = field(default_factory=AiDeliberationSettings)
+    ml_prediction: MlPredictionSettings = field(default_factory=MlPredictionSettings)
     news_events: list[NewsEvent] = field(default_factory=list)
     sniper: SniperSettings = field(default_factory=SniperSettings)
 
     def __post_init__(self) -> None:
+        if self.ml_prediction.mode != "off" and not self.broker.demo_only:
+            raise ValueError("ML candidate artifacts are demo/research-only; live promotion is not implemented")
         # Provider precedence must match build_news_gateway. An opt-in FF flag
         # must not invalidate a separately configured HTTP or manual provider.
         uses_free_feed = (
@@ -740,6 +779,21 @@ def settings_from_env() -> FxBotSettings:
             live_release_ack=_get_str("FX_LIVE_RELEASE_ACK", ""),
             max_price_age_seconds=_get_int("FX_MAX_PRICE_AGE_SECONDS", 120),
         ),
+        ml_prediction=MlPredictionSettings(
+            mode=_get_str("FX_ML_PREDICTION_MODE", "off"),
+            model_path=_get_str("FX_ML_MODEL_PATH", ""),
+            metadata_path=_get_str("FX_ML_MODEL_METADATA_PATH", ""),
+            target=_get_str("FX_ML_TARGET", "TP_BEFORE_SL").upper(),
+            entry_model_path=_get_str("FX_ML_ENTRY_MODEL_PATH", ""),
+            entry_metadata_path=_get_str("FX_ML_ENTRY_MODEL_METADATA_PATH", ""),
+            immediate_adverse_model_path=_get_str("FX_ML_IMMEDIATE_ADVERSE_MODEL_PATH", ""),
+            immediate_adverse_metadata_path=_get_str("FX_ML_IMMEDIATE_ADVERSE_MODEL_METADATA_PATH", ""),
+            continuation_model_path=_get_str("FX_ML_CONTINUATION_MODEL_PATH", ""),
+            continuation_metadata_path=_get_str("FX_ML_CONTINUATION_MODEL_METADATA_PATH", ""),
+            fake_breakout_model_path=_get_str("FX_ML_FAKE_BREAKOUT_MODEL_PATH", ""),
+            fake_breakout_metadata_path=_get_str("FX_ML_FAKE_BREAKOUT_MODEL_METADATA_PATH", ""),
+            verify_hash=_get_bool("FX_ML_VERIFY_MODEL_HASH", True),
+        ),
         ai=AiDeliberationSettings(
             mode=_get_str("FX_AI_DELIBERATION", "off"),
             provider=_get_str("FX_AI_PROVIDER", "openai_compatible"),
@@ -749,7 +803,7 @@ def settings_from_env() -> FxBotSettings:
             timeout_seconds=_get_float("FX_AI_TIMEOUT_SECONDS", 8.0),
             max_output_tokens=_get_int("FX_AI_MAX_OUTPUT_TOKENS", 1200),
             max_retries=_get_int("FX_AI_MAX_RETRIES", 1),
-            prompt_version=_get_str("AI_DELIBERATION_PROMPT_VERSION", "v1"),
+            prompt_version=_get_str("AI_DELIBERATION_PROMPT_VERSION", "v3"),
             fail_policy=_get_str("FX_AI_FAIL_POLICY", "fail_closed_if_confirmation_required"),
             flag_blocks=_get_bool("FX_AI_FLAG_BLOCKS", False),
             reject_blocks=_get_bool("FX_AI_REJECT_BLOCKS", False),

@@ -12,13 +12,14 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import desc, func, select
+from sqlalchemy import desc, func, select, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, close_all_sessions, sessionmaker
 
 from fxbot.database import (
     AiDeliberationRow,
     BotStateRow,
+    CandidateOutcomeRow,
     CurrentPositionRow,
     EquitySnapshotRow,
     EventLogRow,
@@ -26,12 +27,16 @@ from fxbot.database import (
     PositionSnapshotRow,
     RunManifestRow,
     SignalJournalRow,
+    TradeCandidateRow,
     TradeJournalRow,
     session_factory,
     utc_now,
 )
 from fxbot.models import BotRunState
 from fxbot.security import redact
+
+
+_UNSET = object()
 
 
 class StructuredJournal:
@@ -157,6 +162,271 @@ class StructuredJournal:
             session.expunge(row)
         self.write_jsonl("signal_updated", row)
         return row
+
+    def record_candidate(
+        self,
+        *,
+        candidate_id: str,
+        timestamp: datetime,
+        symbol: str,
+        direction: str,
+        entry: float,
+        spread: float,
+        strategy_signal: str,
+        stop_loss: float | None = None,
+        take_profit: float | None = None,
+        atr: float | None = None,
+        momentum: float | None = None,
+        trend_strength: float | None = None,
+        news_risk: dict[str, Any] | None = None,
+        executed: bool = False,
+        rejection_reason: str | None = None,
+        status: str = "generated",
+        payload: dict[str, Any] | None = None,
+        strategy_hash: str | None = None,
+        code_version: str | None = None,
+        data_hash: str | None = None,
+        experiment_manifest_hash: str | None = None,
+    ) -> tuple[TradeCandidateRow, bool]:
+        """Persist the first observation of a strategy candidate idempotently."""
+
+        with self.sessions() as session:
+            existing = session.get(TradeCandidateRow, candidate_id)
+            if existing is not None:
+                session.expunge(existing)
+                return existing, False
+
+        row = TradeCandidateRow(
+            candidate_id=str(candidate_id),
+            timestamp=_aware(timestamp),
+            symbol=symbol.upper(),
+            direction=str(direction),
+            entry=float(entry),
+            stop_loss=stop_loss,
+            take_profit=take_profit,
+            spread=float(spread),
+            atr=atr,
+            momentum=momentum,
+            trend_strength=trend_strength,
+            news_risk=_jsonable(news_risk or {}),
+            strategy_signal=str(strategy_signal),
+            executed=bool(executed),
+            rejection_reason=rejection_reason,
+            status=str(status),
+            payload=_jsonable(payload or {}),
+            strategy_hash=strategy_hash or self.strategy_hash,
+            code_version=code_version or self.code_version,
+            data_hash=data_hash or self.data_hash,
+            experiment_manifest_hash=experiment_manifest_hash or self.experiment_manifest_hash,
+        )
+        try:
+            with self.sessions.begin() as session:
+                session.add(row)
+                session.flush()
+                session.expunge(row)
+        except IntegrityError:
+            existing = self.find_candidate(candidate_id)
+            if existing is not None:
+                return existing, False
+            raise
+        self.write_jsonl("candidate", row)
+        return row, True
+
+    def update_candidate(
+        self,
+        candidate_id: str,
+        *,
+        status: str | None = None,
+        executed: bool | None = None,
+        rejection_reason: str | None | object = _UNSET,
+        stop_loss: float | None | object = _UNSET,
+        take_profit: float | None | object = _UNSET,
+        payload_update: dict[str, Any] | None = None,
+    ) -> TradeCandidateRow | None:
+        """Update candidate lifecycle fields without replacing first-observation features."""
+
+        with self.sessions.begin() as session:
+            row = session.get(TradeCandidateRow, candidate_id)
+            if row is None:
+                return None
+            if status is not None:
+                row.status = str(status)
+            if executed is not None:
+                row.executed = bool(executed)
+            if rejection_reason is not _UNSET:
+                row.rejection_reason = rejection_reason
+            if stop_loss is not _UNSET:
+                row.stop_loss = stop_loss
+            if take_profit is not _UNSET:
+                row.take_profit = take_profit
+            if payload_update:
+                # Candidate-time features are immutable, including across retries.
+                protected = {"market_snapshot", "signal_score", "signal_time", "execution_cost_pips_round_trip", "pip_size"}
+                updates = {key: value for key, value in payload_update.items() if key not in protected}
+                row.payload = _jsonable({**(row.payload or {}), **updates})
+            row.updated_at = utc_now()
+            session.flush()
+            session.expunge(row)
+        self.write_jsonl("candidate_updated", row)
+        return row
+
+    def find_candidate(self, candidate_id: str) -> TradeCandidateRow | None:
+        with self.sessions() as session:
+            row = session.get(TradeCandidateRow, candidate_id)
+            if row is not None:
+                session.expunge(row)
+            return row
+
+    def recent_candidates(self, limit: int = 200) -> list[TradeCandidateRow]:
+        with self.sessions() as session:
+            rows = list(
+                session.scalars(
+                    select(TradeCandidateRow)
+                    .order_by(desc(TradeCandidateRow.timestamp))
+                    .limit(limit)
+                )
+            )
+            for row in rows:
+                session.expunge(row)
+            return rows
+
+    def pending_outcome_candidates(self, limit: int = 2000) -> list[TradeCandidateRow]:
+        """Bounded backlog, excluding completed rows so restarts make progress."""
+        with self.sessions() as session:
+            rows = list(session.scalars(select(TradeCandidateRow).outerjoin(
+                CandidateOutcomeRow, CandidateOutcomeRow.candidate_id == TradeCandidateRow.candidate_id
+            ).where(or_(CandidateOutcomeRow.candidate_id.is_(None), CandidateOutcomeRow.status == "tracking"))
+                .order_by(TradeCandidateRow.timestamp.asc()).limit(limit)))
+            for row in rows:
+                session.expunge(row)
+            return rows
+
+    def candidates_since(self, start: datetime, limit: int = 500) -> list[TradeCandidateRow]:
+        with self.sessions() as session:
+            rows = list(
+                session.scalars(
+                    select(TradeCandidateRow)
+                    .where(TradeCandidateRow.timestamp >= _aware(start))
+                    .order_by(desc(TradeCandidateRow.timestamp))
+                    .limit(limit)
+                )
+            )
+            for row in rows:
+                session.expunge(row)
+            return rows
+
+    def ensure_candidate_outcome(
+        self,
+        *,
+        candidate_id: str,
+        started_at: datetime,
+        payload: dict[str, Any] | None = None,
+    ) -> tuple[CandidateOutcomeRow, bool]:
+        """Create the forward-outcome row once, preserving first observation."""
+
+        with self.sessions() as session:
+            existing = session.get(CandidateOutcomeRow, candidate_id)
+            if existing is not None:
+                session.expunge(existing)
+                return existing, False
+        row = CandidateOutcomeRow(
+            candidate_id=candidate_id,
+            started_at=_aware(started_at),
+            payload=_jsonable(payload or {}),
+        )
+        try:
+            with self.sessions.begin() as session:
+                session.add(row)
+                session.flush()
+                session.expunge(row)
+        except IntegrityError:
+            existing = self.find_candidate_outcome(candidate_id)
+            if existing is not None:
+                return existing, False
+            raise
+        self.write_jsonl("candidate_outcome", row)
+        return row, True
+
+    def update_candidate_outcome(
+        self,
+        candidate_id: str,
+        *,
+        values: dict[str, Any],
+        payload_update: dict[str, Any] | None = None,
+    ) -> CandidateOutcomeRow | None:
+        """Update only approved outcome fields for a tracked candidate."""
+
+        allowed = {
+            "last_observed_at", "completed_at", "status", "observation_count",
+            "first_touch", "first_touch_at", "tp_hit", "sl_hit", "tp_before_sl",
+            "mfe_pips", "mae_pips", "time_to_mfe_seconds", "time_to_mae_seconds",
+            "time_to_tp_seconds", "time_to_sl_seconds",
+            "time_to_profit_seconds", "time_to_loss_seconds",
+            "return_1m_pips", "return_3m_pips", "return_5m_pips",
+            "return_15m_pips", "return_30m_pips",
+            "wait_30s_improvement_pips", "wait_1m_improvement_pips",
+            "wait_3m_improvement_pips", "wait_5m_improvement_pips",
+            "max_observation_gap_seconds", "data_quality",
+            "final_net_pnl", "final_net_pnl_currency", "final_net_pnl_at",
+        }
+        unsupported = set(values).difference(allowed)
+        if unsupported:
+            raise ValueError(f"unsupported candidate outcome fields: {sorted(unsupported)}")
+        with self.sessions.begin() as session:
+            row = session.get(CandidateOutcomeRow, candidate_id)
+            if row is None:
+                return None
+            prior_status = row.status
+            prior_first_touch = row.first_touch
+            for name, value in values.items():
+                if name.endswith("_at") and isinstance(value, datetime):
+                    value = _aware(value)
+                setattr(row, name, value)
+            if payload_update:
+                row.payload = _jsonable({**(row.payload or {}), **payload_update})
+            row.updated_at = utc_now()
+            session.flush()
+            emit_jsonl = row.status != prior_status or row.first_touch != prior_first_touch
+            session.expunge(row)
+        if emit_jsonl:
+            self.write_jsonl("candidate_outcome_updated", row)
+        return row
+
+    def find_candidate_outcome(self, candidate_id: str) -> CandidateOutcomeRow | None:
+        with self.sessions() as session:
+            row = session.get(CandidateOutcomeRow, candidate_id)
+            if row is not None:
+                session.expunge(row)
+            return row
+
+    def candidate_realized_pnl(self, candidate_id: str) -> dict[str, Any]:
+        """Aggregate all execution legs once, refusing partial/unknown totals."""
+        with self.sessions() as session:
+            rows = list(session.scalars(select(TradeJournalRow).where(
+                TradeJournalRow.payload["strategy_context"]["candidate_id"].as_string() == candidate_id,
+                TradeJournalRow.state != "reconciled_alias",
+            )))
+            currencies = {(row.payload or {}).get("strategy_context", {}).get("account_currency") for row in rows}
+            complete = bool(rows) and all(row.state == "closed" and (row.payload or {}).get("costs_complete", True) for row in rows)
+            complete = complete and len(currencies) == 1 and None not in currencies
+            return {
+                "final_net_pnl": sum(float(row.realized_pl or 0) + float(row.financing or 0) for row in rows) if complete else None,
+                "final_net_pnl_currency": next(iter(currencies)) if complete else None,
+                "final_net_pnl_at": max((row.exit_time for row in rows if row.exit_time), default=None) if complete else None,
+            }
+
+    def recent_candidate_outcomes(self, limit: int = 200) -> list[CandidateOutcomeRow]:
+        with self.sessions() as session:
+            rows = list(
+                session.scalars(
+                    select(CandidateOutcomeRow)
+                    .order_by(desc(CandidateOutcomeRow.started_at))
+                    .limit(limit)
+                )
+            )
+            for row in rows:
+                session.expunge(row)
+            return rows
 
     def record_ai_deliberation(self, *, payload: dict[str, Any]) -> tuple[AiDeliberationRow, bool]:
         """Persist a validated audit or failure idempotently by parent signal."""

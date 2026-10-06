@@ -19,6 +19,7 @@ from fxbot.instruments import (
     PriceSnapshot,
     estimated_daily_financing_home,
     position_value_home,
+    quote_to_home_factor,
 )
 from fxbot.journal import StructuredJournal
 from fxbot.market_hours import active_sessions, can_trade, news_blackout_reason
@@ -46,6 +47,11 @@ from fxbot.ai_deliberation import (
     build_signal_evidence,
     validate_ai_audit_response,
 )
+from fxbot.ai_contract import AiTradeDecision
+from fxbot.ai.predictor import PredictionService, TradePredictor
+from fxbot.ai.schemas import NumericalPrediction, PredictionRequest
+from fxbot.market_snapshot import build_market_snapshot, build_news_context
+from fxbot.outcome_tracker import CandidateOutcomeTracker
 from fxbot.operations import clock_health
 from fxbot.security import code_version, data_hash, experiment_manifest, strategy_config_hash
 from fxbot.sniper import qualify_entry, qualify_execution, exit_reason
@@ -73,6 +79,7 @@ class ForwardTestWorker:
         monitor: OperationalMonitor | None = None,
         news: NewsGateway | None = None,
         deliberator: AiDeliberationService | None = None,
+        predictor: TradePredictor | None = None,
     ) -> None:
         self.settings = settings or settings_from_env()
         ensure_runtime_dirs(self.settings)
@@ -93,10 +100,18 @@ class ForwardTestWorker:
             static_events=self.settings.news_events,
         )
         self.deliberator = deliberator or AiDeliberationService(self.settings.ai)
+        self.predictor = predictor or PredictionService(self.settings.ml_prediction)
         # Feed SQLite lock retries into the operational monitor.
         monitor_ref = self.monitor
         set_lock_retry_callback(monitor_ref.record_db_lock_retry)
         self.risk = FxRiskManager(self.settings.risk, self.settings.strategy)
+        self.outcomes = CandidateOutcomeTracker(
+            self.journal,
+            observation_lag_tolerance_seconds=max(
+                30.0,
+                float(self.settings.runtime.loop_interval_seconds) * 3.0,
+            ),
+        )
         self.strategy_hash = strategy_config_hash(self.settings)
         self.code_version = code_version()
         self.run_id = uuid4().hex
@@ -185,6 +200,21 @@ class ForwardTestWorker:
         prices_ready = self._check_price_freshness(now, prices.prices)
         fresh_prices = {name: price for name, price in prices.prices.items()
                         if freshness(now, price.time, max_age_seconds=self.settings.runtime.max_price_age_seconds)[0]}
+        # Outcome tracking is observation-only and must never destabilize the
+        # execution loop. Only fresh executable quotes are eligible labels.
+        try:
+            self.outcomes.observe_active(
+                prices=fresh_prices,
+                instruments=instruments,
+                observed_at=now,
+            )
+        except Exception as exc:
+            log.exception("candidate outcome tracking failed")
+            self.journal.log_event(
+                "candidate_outcome_tracking_failed",
+                f"Candidate outcome tracking failed: {type(exc).__name__}",
+                level="warning",
+            )
         # Record price freshness for the monitoring dashboard
         for name, price in prices.prices.items():
             self.monitor.record_price(name, price.time)
@@ -365,24 +395,11 @@ class ForwardTestWorker:
         last_close = float(signal_row["close"])
         atr_price = float(signal_row.get("atr") or 0.0)
         spread_price = price.ask - price.bid
-        if atr_price <= 0 or spread_price <= 0:
-            self._skip(now, instrument.name, "volatility_or_spread_unavailable")
-            return
-        spread_atr_ratio = spread_price / atr_price
-        if spread_atr_ratio > self.settings.strategy.max_spread_atr_ratio:
-            self._skip(
-                now,
-                instrument.name,
-                "spread_to_atr_filter",
-                {"spread_atr_ratio": spread_atr_ratio, "max": self.settings.strategy.max_spread_atr_ratio},
-            )
-            return
         executable_entry = executable_entry_price(price, decision.signal)
-        deviation_pips = abs(executable_entry - last_close) / instrument.pip_size
-        if deviation_pips > self.settings.strategy.max_entry_deviation_pips:
-            self._skip(now, instrument.name, "entry_deviation_filter", {"deviation_pips": deviation_pips})
-            return
 
+        # A candidate exists once the strategy has proposed a direction. Build
+        # its durable identity and first-observation record before later
+        # spread/risk/AI filters can reject it.
         intent = build_signal_intent(
             entry_frame,
             htf_frame,
@@ -397,10 +414,165 @@ class ForwardTestWorker:
             return
 
         # Keep order identity stable across scans of the same closed signal bar.
-        # Evaluation uses current UTC so higher-timeframe closure stays accurate.
         signal_time = (signal_row.name + TIMEFRAME_DELTAS[self.settings.strategy.entry_timeframe]).to_pydatetime()
-        intent = replace(intent, timestamp=signal_time, metadata={**intent.metadata, "execution_cost_price":
-            self.settings.strategy.execution_cost_pips_round_trip * instrument.pip_size})
+        intent = replace(
+            intent,
+            timestamp=signal_time,
+            metadata={
+                **intent.metadata,
+                "execution_cost_price": self.settings.strategy.execution_cost_pips_round_trip * instrument.pip_size,
+            },
+        )
+        if self.settings.sniper.mode == "enforce" and self.settings.sniper.slippage_pips_per_side is not None and self.settings.sniper.commission_pips_round_trip is not None:
+            intent = replace(intent, metadata={**intent.metadata, "execution_cost_price": max(
+                intent.metadata["execution_cost_price"], instrument.pip_size * (
+                    2 * self.settings.sniper.slippage_pips_per_side + self.settings.sniper.commission_pips_round_trip))})
+        candidate_id = parent_signal_id_for(intent)
+        ai_decision_space = [candidate_decision.value for candidate_decision in AiTradeDecision]
+        provisional_exit_plan = self.risk.build_exit_plan(intent, instrument)
+        news_context_payload = build_news_context(
+            symbol=instrument.name,
+            events=news_snapshot.events,
+            observed_at=now,
+            stale=news_snapshot.stale,
+            age_seconds=news_snapshot.age_seconds,
+            last_updated=news_snapshot.last_updated,
+            source=news_snapshot.source,
+            before_minutes=self.settings.strategy.news_blackout_before_minutes,
+            after_minutes=self.settings.strategy.news_blackout_after_minutes,
+        ).to_dict()
+        market_snapshot_payload: dict[str, Any] | None = None
+        market_snapshot_failure: str | None = None
+        try:
+            market_snapshot_payload = build_market_snapshot(
+                candidate_id=candidate_id,
+                intent=intent,
+                instrument=instrument,
+                price=price,
+                entry_frame=entry_frame,
+                timeframe=self.settings.strategy.entry_timeframe,
+                portfolio=portfolio,
+                exit_plan=provisional_exit_plan,
+                observed_at=now,
+                sessions=active_sessions(now),
+                news_events=news_snapshot.events,
+                news_stale=news_snapshot.stale,
+                news_age_seconds=news_snapshot.age_seconds,
+                news_last_updated=news_snapshot.last_updated,
+                news_source=news_snapshot.source,
+                news_before_minutes=self.settings.strategy.news_blackout_before_minutes,
+                news_after_minutes=self.settings.strategy.news_blackout_after_minutes,
+            ).to_dict()
+        except Exception as exc:
+            market_snapshot_failure = type(exc).__name__
+        intent = replace(
+            intent,
+            metadata={
+                **intent.metadata,
+                "candidate_id": candidate_id,
+                "market_snapshot": market_snapshot_payload,
+                "news_context": news_context_payload,
+                "ai_decision_space": ai_decision_space,
+            },
+        )
+        candidate_row, candidate_created = self.journal.record_candidate(
+            candidate_id=candidate_id,
+            timestamp=now,
+            symbol=instrument.name,
+            direction=intent.side.value,
+            entry=executable_entry,
+            stop_loss=provisional_exit_plan.stop_loss if provisional_exit_plan else None,
+            take_profit=provisional_exit_plan.take_profit if provisional_exit_plan else None,
+            spread=spread_price,
+            atr=market_snapshot_payload.get("atr") if market_snapshot_payload else atr_price,
+            momentum=market_snapshot_payload.get("momentum") if market_snapshot_payload else None,
+            trend_strength=market_snapshot_payload.get("trend_strength") if market_snapshot_payload else float(signal_row.get("adx") or 0.0),
+            news_risk=news_context_payload,
+            strategy_signal=str(intent.metadata.get("decision") or decision.reason),
+            status="generated",
+            payload={
+                "market_snapshot": market_snapshot_payload,
+                "ai_decision_space": ai_decision_space,
+                "hard_news_gate": "passed",
+                "signal_score": intent.score,
+                "pip_size": instrument.pip_size,
+                "signal_time": intent.timestamp.isoformat(),
+                "execution_cost_pips_round_trip": (
+                    float(intent.metadata.get("execution_cost_price", 0.0)) / instrument.pip_size
+                ),
+            },
+            strategy_hash=self.strategy_hash,
+            code_version=self.code_version,
+            data_hash=data_hash({"instrument": instrument.name, "decision_time": decision_time.isoformat(), "signal": intent.signal_row}),
+            experiment_manifest_hash=self.journal.experiment_manifest_hash,
+        )
+        if candidate_created:
+            try:
+                self.outcomes.seed(
+                    candidate=candidate_row,
+                    price=price,
+                    instrument=instrument,
+                    observed_at=now,
+                )
+            except Exception as exc:
+                log.exception("candidate outcome seed failed for %s", candidate_id)
+                self.journal.log_event(
+                    "candidate_outcome_seed_failed",
+                    f"{instrument.name} candidate outcome seed failed: {type(exc).__name__}",
+                    level="warning",
+                    payload={"candidate_id": candidate_id},
+                )
+
+        if not candidate_created:
+            self.journal.log_event(
+                "candidate_already_executed",
+                f"{candidate_id} already evaluated; duplicate signal-candle scan ignored",
+                payload={"candidate_id": candidate_id},
+            )
+            return False
+        if candidate_created:
+            if market_snapshot_payload is not None:
+                self.journal.log_event(
+                    "candidate_market_snapshot",
+                    f"{instrument.name} {intent.side.value} candidate snapshot captured",
+                    payload={
+                        "candidate_id": candidate_id,
+                        "market_snapshot": market_snapshot_payload,
+                        "ai_decision_space": ai_decision_space,
+                    },
+                )
+            elif market_snapshot_failure is not None:
+                self.journal.log_event(
+                    "candidate_market_snapshot_failed",
+                    f"{instrument.name} candidate snapshot failed: {market_snapshot_failure}",
+                    level="warning",
+                    payload={"candidate_id": candidate_id},
+                )
+
+        if atr_price <= 0 or spread_price <= 0:
+            self.journal.update_candidate(candidate_id, status="rejected", rejection_reason="volatility_or_spread_unavailable")
+            self._skip(now, instrument.name, "volatility_or_spread_unavailable", {"candidate_id": candidate_id})
+            return
+        spread_atr_ratio = spread_price / atr_price
+        if spread_atr_ratio > self.settings.strategy.max_spread_atr_ratio:
+            self.journal.update_candidate(candidate_id, status="rejected", rejection_reason="spread_to_atr_filter")
+            self._skip(
+                now,
+                instrument.name,
+                "spread_to_atr_filter",
+                {"candidate_id": candidate_id, "spread_atr_ratio": spread_atr_ratio, "max": self.settings.strategy.max_spread_atr_ratio},
+            )
+            return
+        deviation_pips = abs(executable_entry - last_close) / instrument.pip_size
+        if deviation_pips > self.settings.strategy.max_entry_deviation_pips:
+            self.journal.update_candidate(candidate_id, status="rejected", rejection_reason="entry_deviation_filter")
+            self._skip(
+                now,
+                instrument.name,
+                "entry_deviation_filter",
+                {"candidate_id": candidate_id, "deviation_pips": deviation_pips},
+            )
+            return
 
         tp_timeframe = self.settings.strategy.tp_timeframe
         if tp_timeframe is not None:
@@ -408,12 +580,14 @@ class ForwardTestWorker:
                 instrument.name, tp_timeframe, self.settings.strategy.candle_limit
             )
             if not candles_are_current(tp_frame, tp_timeframe, now, self.settings.runtime.max_price_age_seconds):
-                self._skip(now, instrument.name, "stale_or_invalid_tp_candles", {"timeframe": tp_timeframe})
+                self.journal.update_candidate(candidate_id, status="rejected", rejection_reason="stale_or_invalid_tp_candles")
+                self._skip(now, instrument.name, "stale_or_invalid_tp_candles", {"candidate_id": candidate_id, "timeframe": tp_timeframe})
                 return
             tp_row = last_closed_row(prepare_indicators(tp_frame), tp_timeframe, timestamp=now)
             tp_atr = float(tp_row.get("atr") or 0.0) if tp_row is not None else 0.0
             if not math.isfinite(tp_atr) or tp_atr <= 0:
-                self._skip(now, instrument.name, "tp_atr_unavailable", {"timeframe": tp_timeframe})
+                self.journal.update_candidate(candidate_id, status="rejected", rejection_reason="tp_atr_unavailable")
+                self._skip(now, instrument.name, "tp_atr_unavailable", {"candidate_id": candidate_id, "timeframe": tp_timeframe})
                 return
             intent = replace(intent, metadata={**intent.metadata, "tp_atr": tp_atr,
                                               "tp_timeframe": tp_timeframe,
@@ -454,6 +628,30 @@ class ForwardTestWorker:
             now=now,
         )
         if not risk.allowed or risk.exit_plan is None:
+            self.journal.update_candidate(
+                candidate_id,
+                status="rejected",
+                rejection_reason=risk.reason,
+                stop_loss=risk.exit_plan.stop_loss if risk.exit_plan else None,
+                take_profit=risk.exit_plan.take_profit if risk.exit_plan else None,
+                payload_update={
+                    "risk": asdict(risk),
+                    "execution_cost_pips_round_trip": (
+                        float(risk.metadata.get("execution_cost_price", intent.metadata.get("execution_cost_price", 0.0)))
+                        / instrument.pip_size
+                    ),
+                },
+            )
+            if risk.exit_plan is not None:
+                self.journal.update_candidate_outcome(
+                    candidate_id,
+                    values={},
+                    payload_update={
+                        "final_stop_loss": risk.exit_plan.stop_loss,
+                        "final_take_profit": risk.exit_plan.take_profit,
+                        "final_risk_reward": risk.exit_plan.risk_reward,
+                    },
+                )
             self.journal.record_signal(
                 timestamp=now,
                 instrument=instrument.name,
@@ -467,6 +665,43 @@ class ForwardTestWorker:
             )
             return
 
+        if market_snapshot_payload is not None:
+            market_snapshot_payload = {
+                **market_snapshot_payload,
+                "stop_loss": risk.exit_plan.stop_loss,
+                "take_profit": risk.exit_plan.take_profit,
+                "risk_reward": risk.exit_plan.risk_reward,
+            }
+            intent = replace(
+                intent,
+                metadata={**intent.metadata, "market_snapshot": market_snapshot_payload},
+            )
+        self.journal.update_candidate(
+            candidate_id,
+            status="risk_accepted",
+            rejection_reason=None,
+            stop_loss=risk.exit_plan.stop_loss,
+            take_profit=risk.exit_plan.take_profit,
+            payload_update={
+                "risk": asdict(risk),
+                "market_snapshot": market_snapshot_payload,
+                "execution_cost_pips_round_trip": (
+                    float(risk.metadata.get("execution_cost_price", intent.metadata.get("execution_cost_price", 0.0)))
+                    / instrument.pip_size
+                ),
+            },
+        )
+
+        self.journal.update_candidate_outcome(
+            candidate_id,
+            values={},
+            payload_update={
+                "final_stop_loss": risk.exit_plan.stop_loss,
+                "final_take_profit": risk.exit_plan.take_profit,
+                "final_risk_reward": risk.exit_plan.risk_reward,
+            },
+        )
+
         if sniper is not None:
             sniper = qualify_execution(intent.metadata["sniper"], reward=risk.exit_plan.reward_distance,
                                        spread=spread_price, pip_size=instrument.pip_size, settings=self.settings.sniper)
@@ -476,6 +711,7 @@ class ForwardTestWorker:
                 "would_allow": sniper.allowed, "snapshot": sniper.snapshot,
                 "baseline_risk": asdict(risk), "shadow_only": self.settings.sniper.mode == "shadow"})
             if self.settings.sniper.mode == "enforce" and not sniper.allowed:
+                self.journal.update_candidate(candidate_id, status="rejected", rejection_reason=sniper.reason)
                 self.journal.record_signal(timestamp=now, instrument=instrument.name, status="rejected",
                                            reason=sniper.reason, side=intent.side.value, score=intent.score,
                                            entry_price=executable_entry, payload={"intent": asdict(intent), "risk": asdict(risk)})
@@ -490,6 +726,15 @@ class ForwardTestWorker:
             self.settings.strategy.min_reward_to_spread_ratio,
         ):
             ratio = risk.exit_plan.reward_distance / spread_price if spread_price > 0 else 0.0
+            self.journal.update_candidate(
+                candidate_id,
+                status="rejected",
+                rejection_reason="target_cost_filter",
+                payload_update={
+                    "reward_to_spread_ratio": ratio,
+                    "required_reward_to_spread_ratio": self.settings.strategy.min_reward_to_spread_ratio,
+                },
+            )
             self.journal.record_signal(
                 timestamp=now,
                 instrument=instrument.name,
@@ -511,6 +756,92 @@ class ForwardTestWorker:
             )
             return
 
+        self.journal.update_candidate(
+            candidate_id,
+            status="eligible",
+            rejection_reason=None,
+            stop_loss=risk.exit_plan.stop_loss,
+            take_profit=risk.exit_plan.take_profit,
+        )
+
+        # Serving features must be identical to the candidate-time snapshot
+        # used by training_dataset.py. Final deterministic risk values belong
+        # in candidate_trade/risk_context for the LLM, not in model features.
+        prediction_snapshot = dict((candidate_row.payload or {}).get("market_snapshot") or {})
+        try:
+            if not market_snapshot_payload:
+                prediction = NumericalPrediction(
+                    status="unavailable",
+                    error="market_snapshot_unavailable",
+                )
+            else:
+                prediction = self.predictor.predict(
+                    PredictionRequest(
+                        candidate_id=candidate_id,
+                        candidate_trade={
+                            "candidate_id": candidate_id,
+                            "symbol": instrument.name,
+                            "direction": intent.side.value,
+                            "entry": executable_entry,
+                            "stop_loss": risk.exit_plan.stop_loss,
+                            "take_profit": risk.exit_plan.take_profit,
+                            "risk_reward": risk.exit_plan.risk_reward,
+                        },
+                        market_snapshot=prediction_snapshot,
+                        strategy_signal=str(intent.metadata.get("decision") or decision.reason),
+                        strategy_score=float(intent.score),
+                        execution_cost_pips_round_trip=float(candidate_row.payload["execution_cost_pips_round_trip"]),
+                        pip_size=instrument.pip_size,
+                    )
+                )
+        except Exception as exc:
+            prediction = NumericalPrediction(status="error", error=type(exc).__name__)
+        try:
+            self.journal.update_candidate(
+                candidate_id,
+                payload_update={
+                    "prediction_market_snapshot": prediction_snapshot,
+                    "numerical_prediction": prediction.to_dict(),
+                },
+            )
+            if self.settings.ml_prediction.mode != "off":
+                self.journal.log_event(
+                    "candidate_ml_prediction",
+                    f"{instrument.name} candidate numerical prediction {prediction.status}",
+                    payload={
+                        "candidate_id": candidate_id,
+                        "prediction": prediction.to_dict(),
+                    },
+                )
+        except Exception as exc:
+            log.warning("ML audit persistence failed: %s", type(exc).__name__)
+            if self.settings.ml_prediction.mode == "required":
+                prediction = NumericalPrediction(status="error", error="prediction_persistence_failed")
+        if self.settings.ml_prediction.mode == "required" and not prediction.successful:
+            self.journal.update_candidate(
+                candidate_id,
+                status="rejected",
+                rejection_reason="ml_prediction_required_unavailable",
+            )
+            self.journal.record_signal(
+                timestamp=now,
+                instrument=instrument.name,
+                status="rejected",
+                reason="ml_prediction_required_unavailable",
+                side=intent.side.value,
+                score=intent.score,
+                entry_price=executable_entry,
+                stop_loss=risk.exit_plan.stop_loss,
+                take_profit=risk.exit_plan.take_profit,
+                risk_amount=risk.risk_amount,
+                payload={
+                    "risk": asdict(risk),
+                    "intent": asdict(intent),
+                    "numerical_prediction": prediction.to_dict(),
+                },
+            )
+            return
+
         signal_row = self.journal.record_signal(
             timestamp=now,
             instrument=instrument.name,
@@ -529,79 +860,107 @@ class ForwardTestWorker:
         # its partial exit legs. It is intentionally independent of SQLite's
         # surrogate signal-row id so a restarted scan cannot create another AI
         # deliberation for the same closed candle.
-        parent_signal_id = parent_signal_id_for(intent)
+        parent_signal_id = candidate_id
         ai_result: AiDeliberationResult | None = None
         ai_row = None
         if self.settings.ai.mode != "off":
-            ai_row = self.journal.find_ai_deliberation(parent_signal_id)
-            if ai_row is not None:
-                ai_result = _ai_result_from_row(ai_row)
-            else:
-                evidence = build_signal_evidence(
-                    signal_id=parent_signal_id,
-                    intent=intent,
-                    instrument=instrument,
-                    price=price,
-                    portfolio=portfolio,
-                    risk=risk,
-                    strategy=self.settings.strategy,
-                    news_events=news_snapshot.events,
-                    news_stale=news_snapshot.stale,
-                    active_sessions=active_sessions(intent.timestamp),
-                    now=now,
-                    demo_only=self.settings.broker.demo_only,
-                )
-                ai_result = self.deliberator.deliberate(evidence)
-                try:
-                    ai_row, _ = self.journal.record_ai_deliberation(
-                        payload=_ai_journal_payload(
-                            signal_id=parent_signal_id,
-                            timestamp=now,
-                            instrument=instrument.name,
-                            side=intent.side.value,
-                            settings=self.settings.ai,
-                            evidence=evidence.to_dict(),
-                            evidence_hash=evidence.evidence_hash(),
-                            result=ai_result,
+            try:
+                ai_row = self.journal.find_ai_deliberation(parent_signal_id)
+                if ai_row is not None:
+                    ai_result = _ai_result_from_row(ai_row)
+                else:
+                    evidence = build_signal_evidence(
+                        signal_id=parent_signal_id,
+                        intent=intent,
+                        instrument=instrument,
+                        price=price,
+                        portfolio=portfolio,
+                        risk=risk,
+                        strategy=self.settings.strategy,
+                        news_events=news_snapshot.events,
+                        news_stale=news_snapshot.stale,
+                        active_sessions=active_sessions(intent.timestamp),
+                        now=now,
+                        demo_only=self.settings.broker.demo_only,
+                        market_snapshot=prediction_snapshot,
+                        numerical_prediction=prediction.to_dict(),
+                    )
+                    ai_result = self.deliberator.deliberate(evidence)
+                    try:
+                        ai_row, _ = self.journal.record_ai_deliberation(
+                            payload=_ai_journal_payload(
+                                signal_id=parent_signal_id,
+                                timestamp=now,
+                                instrument=instrument.name,
+                                side=intent.side.value,
+                                settings=self.settings.ai,
+                                evidence=evidence.to_dict(),
+                                evidence_hash=evidence.evidence_hash(),
+                                result=ai_result,
+                            )
                         )
+                    except Exception as exc:
+                        # An optional audit persistence issue must not stop the
+                        # deterministic shadow path. Advisory confirmation treats
+                        # it as a failed AI result below, never as an accidental
+                        # allow. Core signal/order journaling has already occurred.
+                        log.exception("AI deliberation persistence failed for %s", parent_signal_id)
+                        ai_result = AiDeliberationResult(
+                            response=None,
+                            latency_ms=ai_result.latency_ms,
+                            failure_reason=f"ai_persistence_failed:{type(exc).__name__}",
+                        )
+                    response = ai_result.response
+                    log.info(
+                        "ai_deliberation signal_id=%s pair=%s direction=%s score=%.2f mode=%s decision=%s confidence=%s reason_codes=%s latency_ms=%s failure=%s",
+                        parent_signal_id, instrument.name, intent.side.value, intent.score, self.settings.ai.mode,
+                        response.decision if response else None, response.confidence if response else None,
+                        response.reason_codes if response else None,
+                        ai_result.latency_ms, ai_result.failure_reason,
                     )
-                except Exception as exc:
-                    # An optional audit persistence issue must not stop the
-                    # deterministic shadow path. Advisory confirmation treats
-                    # it as a failed AI result below, never as an accidental
-                    # allow. Core signal/order journaling has already occurred.
-                    log.exception("AI deliberation persistence failed for %s", parent_signal_id)
-                    ai_result = AiDeliberationResult(
-                        response=None,
-                        latency_ms=ai_result.latency_ms,
-                        failure_reason=f"ai_persistence_failed:{type(exc).__name__}",
-                    )
-                response = ai_result.response
-                log.info(
-                    "ai_deliberation signal_id=%s pair=%s direction=%s score=%.2f mode=%s decision=%s confidence=%s reasoning=%s context=%s latency_ms=%s failure=%s",
-                    parent_signal_id, instrument.name, intent.side.value, intent.score, self.settings.ai.mode,
-                    response.decision if response else None, response.confidence if response else None,
-                    response.reasoning_audit["status"] if response else None,
-                    response.market_context["status"] if response else None,
-                    ai_result.latency_ms, ai_result.failure_reason,
-                )
+            except Exception as exc:
+                log.warning("AI evaluation failed: %s", type(exc).__name__)
+                ai_result = AiDeliberationResult(response=None, latency_ms=0, failure_reason=type(exc).__name__)
         policy = apply_ai_execution_policy(
             hard_safety_allowed=risk.allowed and risk.exit_plan is not None,
             settings=self.settings.ai,
             result=ai_result,
         )
         if self.settings.ai.mode != "off":
-            self.journal.update_signal(
-                signal_row.id,
-                status="accepted" if policy.allowed else "advisory_blocked",
-                reason="signal_and_risk_accepted" if policy.allowed else policy.reason,
-                payload_update={
-                    "parent_signal_id": parent_signal_id,
-                    "ai_deliberation_id": ai_row.id if ai_row is not None else None,
-                    "ai_execution_policy": asdict(policy),
-                },
-            )
+            try:
+                self.journal.update_signal(
+                    signal_row.id,
+                    status="accepted" if policy.allowed else "advisory_blocked",
+                    reason="signal_and_risk_accepted" if policy.allowed else policy.reason,
+                    payload_update={
+                        "parent_signal_id": parent_signal_id,
+                        "ai_deliberation_id": ai_row.id if ai_row is not None else None,
+                        "ai_execution_policy": asdict(policy),
+                    },
+                )
+            except Exception:
+                if self.settings.ai.mode != "shadow":
+                    raise
+                log.warning("Shadow AI signal annotation failed")
             if not policy.allowed:
+                if policy.reason == "ai_advisory_wait":
+                    self.journal.update_candidate(
+                        candidate_id,
+                        status="delayed",
+                        rejection_reason=None,
+                        payload_update={"ai_delay_reason": policy.reason},
+                    )
+                    self.journal.update_signal(
+                        signal_row.id,
+                        status="advisory_wait",
+                        reason=policy.reason,
+                    )
+                else:
+                    self.journal.update_candidate(
+                        candidate_id,
+                        status="rejected",
+                        rejection_reason=policy.reason,
+                    )
                 return
             intent = replace(
                 intent,
@@ -612,13 +971,31 @@ class ForwardTestWorker:
                     "ai_deliberation_id": ai_row.id if ai_row is not None else None,
                 },
             )
-        if self.settings.sniper.mode == "enforce" and not self._revalidate_sniper_execution(intent, instrument, risk):
-            self.journal.update_signal(signal_row.id, status="rejected", reason="SNIPER_REJECT_REVALIDATION")
+        if not self._revalidate_sniper_execution(intent, instrument, risk):
+            self.journal.update_candidate(candidate_id, status="rejected", rejection_reason="execution_revalidation_failed")
+            self.journal.update_signal(signal_row.id, status="rejected", reason="execution_revalidation_failed")
             return
         if self.settings.strategy.tp_timeframe is not None and not self._tp_candle_still_current(intent, instrument):
+            self.journal.update_candidate(candidate_id, status="rejected", rejection_reason="tp_candle_expired")
             self.journal.update_signal(signal_row.id, status="rejected", reason="tp_candle_expired")
             return
-        return self._submit_idempotent(intent, instrument, risk)
+        try:
+            submitted = self._submit_idempotent(intent, instrument, risk)
+        except Mt5Error as exc:
+            self.journal.update_candidate(
+                candidate_id,
+                status="execution_failed",
+                executed=False,
+                rejection_reason=f"mt5_execution_failed:{type(exc).__name__}",
+            )
+            raise
+        self.journal.update_candidate(
+            candidate_id,
+            status="executed" if submitted else "not_executed",
+            executed=submitted,
+            rejection_reason=None if submitted else "execution_not_submitted",
+        )
+        return submitted
 
     def _tp_candle_still_current(self, intent: FxSignalIntent, instrument: FxInstrument) -> bool:
         timeframe = self.settings.strategy.tp_timeframe
@@ -635,7 +1012,16 @@ class ForwardTestWorker:
             return False
 
     def _revalidate_sniper_execution(self, intent: FxSignalIntent, instrument: FxInstrument, risk: FxRiskDecision) -> bool:
-        """Never let an AI delay grandfather expired deterministic approval."""
+        """Revalidate all modes; sniper-specific checks apply only in enforce."""
+        try:
+            return self._revalidate_execution(intent, instrument, risk)
+        except Exception as exc:
+            log.warning("execution revalidation failed: %s", type(exc).__name__)
+            return False
+
+    def _revalidate_execution(self, intent: FxSignalIntent, instrument: FxInstrument, risk: FxRiskDecision) -> bool:
+        if not risk.allowed or risk.exit_plan is None:
+            return False
         now = datetime.now(timezone.utc)
         if self.journal.get_state().state != BotRunState.RUNNING.value:
             return False
@@ -644,8 +1030,9 @@ class ForwardTestWorker:
         if not self.settings.broker.demo_only and not self.settings.runtime.live_release_approved:
             return False
         prices = self.client.pricing(self.settings.instruments)
+        now = datetime.now(timezone.utc)
         price = prices.prices.get(instrument.name)
-        if price is None or not self._check_price_freshness(now, prices.prices):
+        if price is None or set(self.settings.instruments) - prices.prices.keys() or not self._check_price_freshness(now, prices.prices):
             return False
         if not all(math.isfinite(v) and v > 0 for v in (price.bid, price.ask)) or price.ask <= price.bid:
             return False
@@ -653,6 +1040,10 @@ class ForwardTestWorker:
             return False  # Do not increase approved stop risk after price movement.
         if (now - intent.timestamp).total_seconds() > TIMEFRAME_DELTAS[self.settings.strategy.entry_timeframe].total_seconds():
             return False
+        for timeframe in (self.settings.strategy.entry_timeframe, self.settings.strategy.htf_timeframe):
+            frame = self.client.candles(instrument.name, timeframe, self.settings.strategy.candle_limit)
+            if not candles_are_current(frame, timeframe, now, self.settings.runtime.max_price_age_seconds):
+                return False
         portfolio = self._portfolio_from_broker(now, self._load_instruments(), prices.prices, prices.conversion_rates,
                                                account=self.client.account_summary(), positions=self.client.open_positions())
         if portfolio.pair_exposures.get(instrument.name, 0) > 0:
@@ -674,11 +1065,13 @@ class ForwardTestWorker:
             return False
         if not reward_covers_spread(risk.exit_plan, spread, self.settings.strategy.min_reward_to_spread_ratio):
             return False
+        if self.settings.sniper.mode != "enforce":
+            return True
         return qualify_execution(intent.metadata["sniper"], reward=risk.exit_plan.reward_distance,
                                  spread=spread, pip_size=instrument.pip_size, settings=self.settings.sniper).allowed
 
     def _submit_idempotent(self, intent: FxSignalIntent, instrument: FxInstrument, risk: FxRiskDecision) -> bool:
-        if risk.exit_plan is None:
+        if not risk.allowed or risk.exit_plan is None:
             return False
         submitted = False
         legs = self._order_legs(intent, risk, instrument)
@@ -747,10 +1140,10 @@ class ForwardTestWorker:
                     take_profit=take_profit,
                     client_order_id=client_id,
                     comment=f"{intent.side.value} {instrument.name} {leg_name}",
-                    **({"approved_entry_price": intent.entry_price,
+                    **{"approved_entry_price": intent.entry_price,
+                        "max_quote_age_seconds": self.settings.runtime.max_price_age_seconds,
                         "max_spread_price": min(self.settings.strategy.max_spread_pips * instrument.pip_size,
-                                                self.settings.strategy.max_spread_atr_ratio * intent.signal_row["atr"])}
-                       if self.settings.sniper.mode == "enforce" else {}),
+                                                self.settings.strategy.max_spread_atr_ratio * intent.signal_row["atr"])},
                 )
                 submitted = True
                 broker_order_id, broker_trade_id = extract_order_ids(response)
@@ -831,17 +1224,18 @@ class ForwardTestWorker:
             instrument = instruments.get(name)
             price = prices.get(name)
             if instrument is None or price is None:
-                continue
+                raise Mt5Error("Cannot allocate risk with an unpriced open position")
             long_units = float((position.get("long") or {}).get("units") or 0.0)
             short_units = float((position.get("short") or {}).get("units") or 0.0)
             net_units = long_units + short_units
-            if abs(net_units) <= 0:
+            gross_units = abs(long_units) + abs(short_units)
+            if gross_units <= 0:
                 continue
             active_instruments.add(name)
             side = Side.LONG if net_units > 0 else Side.SHORT
             exposure = position_value_home(
                 instrument,
-                abs(net_units),
+                gross_units,
                 price.mid,
                 self.settings.risk.account_currency,
                 conversions,
@@ -849,8 +1243,9 @@ class ForwardTestWorker:
             )
             gross_exposure += exposure
             pair_exposures[name] = pair_exposures.get(name, 0.0) + exposure
-            currency_exposures[instrument.base_currency] = currency_exposures.get(instrument.base_currency, 0.0) + exposure * side.sign
-            currency_exposures[instrument.quote_currency] = currency_exposures.get(instrument.quote_currency, 0.0) - exposure * side.sign
+            net_exposure = exposure * net_units / gross_units
+            currency_exposures[instrument.base_currency] = currency_exposures.get(instrument.base_currency, 0.0) + net_exposure
+            currency_exposures[instrument.quote_currency] = currency_exposures.get(instrument.quote_currency, 0.0) - net_exposure
             financing_estimate = estimated_daily_financing_home(
                 instrument,
                 side=side.value,
@@ -876,14 +1271,29 @@ class ForwardTestWorker:
         self.journal.mark_current_positions_closed(active_instruments, now)
         equity = float(account.get("NAV") or account.get("balance") or 0.0)
         balance = float(account.get("balance") or equity)
+        broker_risk = 0.0
+        for trade in self.client.open_trades():
+            name = str(trade.get("instrument") or "").upper()
+            inst, mark = instruments.get(name), prices.get(name)
+            stop = _nested_price(trade.get("stopLossOrder"))
+            if inst is None or mark is None or stop is None or not math.isfinite(stop) or stop <= 0:
+                raise Mt5Error("Open position has unknown quote or stop risk")
+            units = float(trade.get("currentUnits") or trade.get("initialUnits") or 0)
+            if not math.isfinite(units):
+                raise Mt5Error("Open position units are invalid")
+            liquidation = mark.bid if units > 0 else mark.ask
+            distance = max(0.0, (liquidation - stop) * (1 if units > 0 else -1))
+            factor = quote_to_home_factor(inst, self.settings.risk.account_currency, mark.mid,
+                conversion_rates=conversions, snapshot_factor=mark.quote_to_home_factor)
+            broker_risk += abs(units) * (distance + self.settings.strategy.execution_cost_pips_round_trip * inst.pip_size) * factor
         return FxPortfolioState(
             equity=equity,
             balance=balance,
             margin_used=float(account.get("marginUsed") or 0.0),
             open_positions=int(account.get("openPositionCount") or 0),
             account_currency=str(account.get("currency") or self.settings.risk.account_currency).upper(),
-            portfolio_risk=self.journal.open_risk_amount(),
-            gross_exposure=float(account.get("positionValue") or gross_exposure),
+            portfolio_risk=max(self.journal.open_risk_amount(), broker_risk),
+            gross_exposure=max(float(account.get("positionValue") or 0), gross_exposure),
             pair_exposures=pair_exposures,
             currency_exposures=currency_exposures,
         )
@@ -977,10 +1387,14 @@ class ForwardTestWorker:
             since = min(since, *entry_times)
         try:
             closed_trades = self.client.closed_trades_since(since, now)
+            get_open = getattr(self.client, "open_trades", None)
+            still_open_ids = {str(row.get("id")) for row in get_open()} if callable(get_open) else set()
         except Mt5Error as exc:
             self.journal.log_event("trade_history_sync_failed", str(exc), level="warning")
             return
         for trade in closed_trades:
+            if str(trade.get("broker_trade_id")) in still_open_ids:
+                continue  # Partial OUT deals are not a completed position.
             self._record_closed_trade(trade)
 
         # Repair journals written by older releases that used an MT5 opening
@@ -1021,7 +1435,21 @@ class ForwardTestWorker:
         trade_id = str(trade.get("broker_trade_id") or "")
         if not trade_id:
             return
-        self.journal.upsert_trade(
+        candidate_id = None
+        account_currency = None
+        existing = self.journal.find_trade(trade_id)
+        if existing is not None:
+            context = (existing.payload or {}).get("strategy_context", {})
+            candidate_id = context.get("candidate_id")
+            account_currency = context.get("account_currency")
+        if candidate_id is None and alias_trade_id is not None:
+            alias = self.journal.find_trade(alias_trade_id)
+            if alias is not None:
+                context = (alias.payload or {}).get("strategy_context", {})
+                candidate_id = context.get("candidate_id")
+                account_currency = context.get("account_currency")
+
+        closed_row = self.journal.upsert_trade(
             broker_trade_id=trade_id,
             instrument=str(trade.get("instrument") or ""),
             side=str(trade.get("side") or ""),
@@ -1034,6 +1462,29 @@ class ForwardTestWorker:
             exit_reason=str(trade.get("exit_reason") or "mt5_history_deal"),
             payload=trade,
         )
+        if candidate_id is None:
+            context = (closed_row.payload or {}).get("strategy_context", {})
+            candidate_id = context.get("candidate_id")
+            account_currency = account_currency or context.get("account_currency")
+        if candidate_id:
+            candidate = self.journal.find_candidate(str(candidate_id))
+            if candidate is not None and self.journal.find_candidate_outcome(str(candidate_id)) is None:
+                self.journal.ensure_candidate_outcome(
+                    candidate_id=str(candidate_id),
+                    started_at=candidate.timestamp,
+                    payload={
+                        "label_version": "v2",
+                        "recovered_for_realized_pnl": True,
+                    },
+                )
+            self.journal.update_candidate_outcome(
+                str(candidate_id),
+                values=self.journal.candidate_realized_pnl(str(candidate_id)),
+                payload_update={
+                    "final_net_pnl_source": "mt5_realized_pl_plus_financing",
+                    "broker_trade_id": trade_id,
+                },
+            )
         self.journal.reconcile_duplicate_open_trade(
             canonical_trade_id=trade_id,
             instrument=str(trade.get("instrument") or ""),
@@ -1074,6 +1525,10 @@ class ForwardTestWorker:
                     "strategy_decision": intent.metadata.get("decision"),
                     "signal_features": intent.metadata.get("score_details", {}),
                     "entry_price_source": intent.metadata.get("entry_price_source"),
+                    "candidate_id": intent.metadata.get("candidate_id"),
+                    "account_currency": (
+                        ((intent.metadata.get("market_snapshot") or {}).get("current_exposure") or {}).get("account_currency")
+                    ),
                     "parent_signal_id": intent.metadata.get("parent_signal_id"),
                     "parent_signal_row_id": intent.metadata.get("parent_signal_row_id"),
                     "ai_deliberation_id": intent.metadata.get("ai_deliberation_id"),
@@ -1499,8 +1954,7 @@ def _ai_journal_payload(
     result: AiDeliberationResult,
 ) -> dict[str, Any]:
     response = result.response.to_dict() if result.response else None
-    reasoning = (response or {}).get("reasoning_audit", {})
-    context = (response or {}).get("market_context", {})
+    reason_codes = (response or {}).get("reason_codes", [])
     output_hash = data_hash(response) if response is not None else None
     return {
         "signal_id": signal_id,
@@ -1513,15 +1967,15 @@ def _ai_journal_payload(
         "status": "completed" if response else "failed",
         "decision": response.get("decision") if response else None,
         "confidence": response.get("confidence") if response else None,
-        "reasoning_audit_status": reasoning.get("status"),
-        "reasoning_issues": reasoning.get("issues", []),
-        "reasoning_supporting_factors": reasoning.get("supporting_factors", []),
-        "market_context_status": context.get("status"),
-        "market_context_issues": context.get("issues", []),
-        "market_context_supporting_factors": context.get("supporting_factors", []),
-        "contradictions": response.get("contradictions", []) if response else [],
-        "recommended_action": response.get("recommended_action") if response else None,
-        "summary": response.get("summary", "") if response else "",
+        "reasoning_audit_status": "STRUCTURED_V2" if response else None,
+        "reasoning_issues": [],
+        "reasoning_supporting_factors": reason_codes,
+        "market_context_status": "EMBEDDED_IN_EVIDENCE" if response else None,
+        "market_context_issues": [],
+        "market_context_supporting_factors": [],
+        "contradictions": [],
+        "recommended_action": response.get("decision") if response else None,
+        "summary": ",".join(reason_codes) if response else "",
         "evidence_hash": evidence_hash,
         "output_hash": output_hash,
         "latency_ms": result.latency_ms,
@@ -1536,7 +1990,10 @@ def _ai_result_from_row(row: Any) -> AiDeliberationResult:
     if not isinstance(response, dict):
         return AiDeliberationResult(None, int(row.latency_ms or 0), row.failure_reason or "previous_ai_failure")
     try:
-        audit = validate_ai_audit_response(response)
+        audit = validate_ai_audit_response(
+            response,
+            allow_legacy_stored_response=True,
+        )
     except Exception:
         return AiDeliberationResult(None, int(row.latency_ms or 0), "stored_ai_response_invalid")
     return AiDeliberationResult(audit, int(row.latency_ms or 0), row.failure_reason)

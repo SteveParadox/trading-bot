@@ -182,9 +182,16 @@ Useful endpoints:
 | `GET /api/positions` | Current open MT5 positions |
 | `GET /api/trades` | Trade history with `instrument`, `state`, `outcome`, date filters |
 | `GET /api/equity` | Equity snapshots for the chart |
+| `GET /api/ai-evaluation` | Research-only AI decision attribution and baseline-vs-AI candidate metrics |
 | `GET /api/performance` | Win rate, P&L, profit factor, drawdown, Sharpe/Sortino |
 | `GET /api/config` | Sanitized strategy/risk/runtime config |
 | `WS /ws/live` | Live dashboard snapshots |
+
+The candidate ML, entry-timing, and strict TAKE/WAIT/SKIP deliberation pipeline
+is documented in [docs/FX_AI_ML_PIPELINE.md](docs/FX_AI_ML_PIPELINE.md). New
+models are research artifacts only: the default ML and AI modes are `off`,
+SHADOW is the recommended evaluation mode, and deterministic market, news,
+risk, exposure, account, and release gates remain authoritative.
 
 ## Run The Dashboard
 

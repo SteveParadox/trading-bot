@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Generator
 
-from sqlalchemy import JSON, DateTime, Float, Integer, String, Text, UniqueConstraint, create_engine, event, inspect, text
+from sqlalchemy import Boolean, JSON, DateTime, Float, Integer, String, Text, UniqueConstraint, create_engine, event, inspect, text
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
@@ -57,6 +57,84 @@ class SignalJournalRow(Base):
     code_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     data_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
     experiment_manifest_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+
+
+class TradeCandidateRow(Base):
+    """One durable row per strategy-generated candidate setup."""
+
+    __tablename__ = "trade_candidates"
+
+    candidate_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    timestamp: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
+    symbol: Mapped[str] = mapped_column(String(32), index=True, nullable=False)
+    direction: Mapped[str] = mapped_column(String(16), nullable=False)
+    entry: Mapped[float] = mapped_column(Float, nullable=False)
+    stop_loss: Mapped[float | None] = mapped_column(Float, nullable=True)
+    take_profit: Mapped[float | None] = mapped_column(Float, nullable=True)
+    spread: Mapped[float] = mapped_column(Float, nullable=False)
+    atr: Mapped[float | None] = mapped_column(Float, nullable=True)
+    momentum: Mapped[float | None] = mapped_column(Float, nullable=True)
+    trend_strength: Mapped[float | None] = mapped_column(Float, nullable=True)
+    news_risk: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    strategy_signal: Mapped[str] = mapped_column(String(128), nullable=False)
+    executed: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False, index=True)
+    rejection_reason: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String(32), default="generated", nullable=False, index=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    strategy_hash: Mapped[str | None] = mapped_column(String(64), nullable=True, index=True)
+    code_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    data_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    experiment_manifest_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False, onupdate=utc_now)
+
+
+class CandidateOutcomeRow(Base):
+    """Forward-observed market outcome for one strategy-generated candidate.
+
+    Values are derived only from quotes observed after candidate creation.
+    Sampling-quality metadata prevents scan-sampled labels from being mistaken
+    for tick-perfect market paths.
+    """
+
+    __tablename__ = "candidate_outcomes"
+
+    candidate_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True, nullable=False)
+    last_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="tracking", nullable=False, index=True)
+    observation_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    first_touch: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    first_touch_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    tp_hit: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    sl_hit: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    tp_before_sl: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    mfe_pips: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    mae_pips: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    time_to_mfe_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    time_to_mae_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    time_to_tp_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    time_to_sl_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    time_to_profit_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    time_to_loss_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    return_1m_pips: Mapped[float | None] = mapped_column(Float, nullable=True)
+    return_3m_pips: Mapped[float | None] = mapped_column(Float, nullable=True)
+    return_5m_pips: Mapped[float | None] = mapped_column(Float, nullable=True)
+    return_15m_pips: Mapped[float | None] = mapped_column(Float, nullable=True)
+    return_30m_pips: Mapped[float | None] = mapped_column(Float, nullable=True)
+    wait_30s_improvement_pips: Mapped[float | None] = mapped_column(Float, nullable=True)
+    wait_1m_improvement_pips: Mapped[float | None] = mapped_column(Float, nullable=True)
+    wait_3m_improvement_pips: Mapped[float | None] = mapped_column(Float, nullable=True)
+    wait_5m_improvement_pips: Mapped[float | None] = mapped_column(Float, nullable=True)
+    max_observation_gap_seconds: Mapped[float] = mapped_column(Float, default=0.0, nullable=False)
+    data_quality: Mapped[str] = mapped_column(String(32), default="good", nullable=False, index=True)
+    final_net_pnl: Mapped[float | None] = mapped_column(Float, nullable=True)
+    final_net_pnl_currency: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    final_net_pnl_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False, onupdate=utc_now)
 
 
 class OrderJournalRow(Base):
@@ -241,8 +319,7 @@ def session_factory(database_url: str) -> sessionmaker[Session]:
     else:
         engine = create_engine(database_url)
     Base.metadata.create_all(engine)
-    if database_url.startswith("sqlite:///"):
-        _ensure_sqlite_columns(engine)
+    _ensure_schema_columns(engine)
     return sessionmaker(engine, expire_on_commit=False)
 
 
@@ -318,7 +395,7 @@ def sqlite_retry_operation(
     raise last_exc  # type: ignore[misc]
 
 
-def _ensure_sqlite_columns(engine: Any) -> None:
+def _ensure_schema_columns(engine: Any) -> None:
     existing = {column["name"] for column in inspect(engine).get_columns("bot_state")}
     additions = {
         "daily_start_day": "ALTER TABLE bot_state ADD COLUMN daily_start_day VARCHAR(16)",
@@ -329,6 +406,20 @@ def _ensure_sqlite_columns(engine: Any) -> None:
         for name, ddl in additions.items():
             if name not in existing:
                 connection.execute(text(ddl))
+    if "candidate_outcomes" in inspect(engine).get_table_names():
+        existing_outcomes = {column["name"] for column in inspect(engine).get_columns("candidate_outcomes")}
+        outcome_additions = {
+            "time_to_profit_seconds": "ALTER TABLE candidate_outcomes ADD COLUMN time_to_profit_seconds FLOAT",
+            "time_to_loss_seconds": "ALTER TABLE candidate_outcomes ADD COLUMN time_to_loss_seconds FLOAT",
+            "final_net_pnl": "ALTER TABLE candidate_outcomes ADD COLUMN final_net_pnl FLOAT",
+            "final_net_pnl_currency": "ALTER TABLE candidate_outcomes ADD COLUMN final_net_pnl_currency VARCHAR(16)",
+            "final_net_pnl_at": "ALTER TABLE candidate_outcomes ADD COLUMN final_net_pnl_at TIMESTAMP",
+        }
+        with engine.begin() as connection:
+            for name, ddl in outcome_additions.items():
+                if name not in existing_outcomes:
+                    connection.execute(text(ddl))
+
     for table in ("signal_journal", "order_journal", "trade_journal"):
         existing = {column["name"] for column in inspect(engine).get_columns(table)}
         additions = {

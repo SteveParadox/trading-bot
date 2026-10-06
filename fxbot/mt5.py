@@ -65,6 +65,7 @@ class Mt5Client:
         if account is None:
             self._mark_disconnected()
             raise Mt5Error(f"MT5 account_info failed: {mt5.last_error()}")
+        self._assert_demo_account(account)
         payload = _as_dict(account)
         positions = self._positions()
         return {
@@ -138,6 +139,98 @@ class Mt5Client:
         return frame.dropna(subset=["open", "high", "low", "close"]).set_index("timestamp")[
             ["open", "high", "low", "close", "volume"]
         ].sort_index()
+
+    def historical_candles(
+        self,
+        instrument: str,
+        timeframe: str,
+        start: datetime,
+        end: datetime,
+    ) -> pd.DataFrame:
+        """Fetch historical MT5 bars for a corrected UTC interval.
+
+        Returned timestamps use the same explicit broker time correction as the
+        live candle path. Spread points are preserved for audit, but historical
+        candidate execution should prefer bid/ask ticks when available.
+        """
+
+        self._ensure_connected()
+        mt5 = self._module()
+        timeframe_value = self._timeframe(timeframe)
+        name = normalize_instrument_name(instrument)
+        symbol = self.settings.broker_symbol_for(name)
+        self._select_symbol(symbol)
+        start_utc = _coerce_utc(start)
+        end_utc = _coerce_utc(end)
+        if end_utc <= start_utc:
+            raise ValueError("historical candle end must be after start")
+        offset = timedelta(seconds=self.settings.time_offset_seconds)
+        rates = mt5.copy_rates_range(symbol, timeframe_value, start_utc - offset, end_utc - offset)
+        if rates is None:
+            self._mark_disconnected()
+            raise Mt5Error(f"MT5 copy_rates_range failed for {symbol}: {mt5.last_error()}")
+        frame = pd.DataFrame(rates)
+        if frame.empty:
+            return pd.DataFrame(columns=["open", "high", "low", "close", "volume", "spread_points"])
+        frame["timestamp"] = pd.to_datetime(
+            frame["time"] + self.settings.time_offset_seconds,
+            unit="s",
+            utc=True,
+        )
+        volume_column = "tick_volume" if "tick_volume" in frame.columns else "real_volume"
+        frame["volume"] = pd.to_numeric(frame.get(volume_column, 0), errors="coerce")
+        frame["spread_points"] = pd.to_numeric(frame.get("spread", 0), errors="coerce")
+        for column in ["open", "high", "low", "close"]:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+        result = frame.dropna(subset=["open", "high", "low", "close"]).set_index("timestamp")[
+            ["open", "high", "low", "close", "volume", "spread_points"]
+        ].sort_index()
+        return result.loc[(result.index >= pd.Timestamp(start_utc)) & (result.index <= pd.Timestamp(end_utc))]
+
+    def historical_ticks(
+        self,
+        instrument: str,
+        start: datetime,
+        end: datetime,
+    ) -> pd.DataFrame:
+        """Fetch historical executable bid/ask ticks for one corrected UTC interval."""
+
+        self._ensure_connected()
+        mt5 = self._module()
+        name = normalize_instrument_name(instrument)
+        symbol = self.settings.broker_symbol_for(name)
+        self._select_symbol(symbol)
+        start_utc = _coerce_utc(start)
+        end_utc = _coerce_utc(end)
+        if end_utc <= start_utc:
+            raise ValueError("historical tick end must be after start")
+        offset = timedelta(seconds=self.settings.time_offset_seconds)
+        flags = _constant(mt5, "COPY_TICKS_INFO", _constant(mt5, "COPY_TICKS_ALL", 0))
+        ticks = mt5.copy_ticks_range(symbol, start_utc - offset, end_utc - offset, flags)
+        if ticks is None:
+            self._mark_disconnected()
+            raise Mt5Error(f"MT5 copy_ticks_range failed for {symbol}: {mt5.last_error()}")
+        frame = pd.DataFrame(ticks)
+        if frame.empty:
+            return pd.DataFrame(columns=["timestamp", "instrument", "bid", "ask"])
+        if "time_msc" in frame.columns:
+            raw_time = pd.to_numeric(frame["time_msc"], errors="coerce") + self.settings.time_offset_seconds * 1000
+            frame["timestamp"] = pd.to_datetime(raw_time, unit="ms", utc=True)
+        else:
+            raw_time = pd.to_numeric(frame["time"], errors="coerce") + self.settings.time_offset_seconds
+            frame["timestamp"] = pd.to_datetime(raw_time, unit="s", utc=True)
+        frame["bid"] = pd.to_numeric(frame.get("bid"), errors="coerce")
+        frame["ask"] = pd.to_numeric(frame.get("ask"), errors="coerce")
+        frame["instrument"] = name
+        result = frame.dropna(subset=["timestamp", "bid", "ask"])[
+            ["timestamp", "instrument", "bid", "ask"]
+        ]
+        result = result[(result["bid"] > 0) & (result["ask"] > result["bid"])]
+        result = result.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
+        return result.loc[
+            (result["timestamp"] >= pd.Timestamp(start_utc))
+            & (result["timestamp"] <= pd.Timestamp(end_utc))
+        ].reset_index(drop=True)
 
     def open_positions(self) -> list[dict[str, Any]]:
         self._ensure_connected()
@@ -215,7 +308,21 @@ class Mt5Client:
         if deals is None:
             self._mark_disconnected()
             raise Mt5Error(f"MT5 history_deals_get failed: {mt5.last_error()}")
-        return self._closed_trade_events(deals)
+        events = self._closed_trade_events(deals)
+        result = []
+        for event in events:
+            try:
+                full_history = mt5.history_deals_get(position=int(event["broker_trade_id"]))
+            except (TypeError, ValueError):
+                full_history = None
+            if full_history is not None:
+                matching = [row for row in self._closed_trade_events(full_history)
+                            if row["broker_trade_id"] == event["broker_trade_id"]]
+                if matching:
+                    event = matching[0]
+            event["costs_complete"] = full_history is not None
+            result.append(event)
+        return result
 
     def closed_trade_for_references(
         self,
@@ -318,9 +425,16 @@ class Mt5Client:
         comment: str,
         approved_entry_price: float | None = None,
         max_spread_price: float | None = None,
+        max_quote_age_seconds: float | None = None,
     ) -> dict[str, Any]:
         self._ensure_connected()
         mt5 = self._module()
+        account = mt5.account_info()
+        if account is None:
+            raise Mt5Error("MT5 account unavailable before order")
+        self._assert_demo_account(account)
+        if _as_dict(account).get("trade_allowed") is False or _as_dict(account).get("trade_expert") is False:
+            raise Mt5RejectedError("MT5 account trading disabled")
         symbol = instrument.broker_symbol or self.settings.broker_symbol_for(instrument.name)
         self._select_symbol(symbol)
         tick = mt5.symbol_info_tick(symbol)
@@ -328,8 +442,15 @@ class Mt5Client:
             self._mark_disconnected()
             raise Mt5Error(f"MT5 symbol_info_tick failed for {symbol}: {mt5.last_error()}")
         tick_payload = _as_dict(tick)
+        if max_quote_age_seconds is not None:
+            snapshot = PriceSnapshot.from_mt5(instrument.name, tick, time_offset_seconds=self.settings.time_offset_seconds)
+            age = (datetime.now(timezone.utc) - snapshot.time).total_seconds()
+            if not 0 <= age <= max_quote_age_seconds:
+                raise Mt5RejectedError("Stale or future MT5 order quote")
         side = Side.LONG if signed_units > 0 else Side.SHORT
         price = _safe_float(tick_payload.get("ask" if side is Side.LONG else "bid"))
+        if not math.isfinite(stop_loss) or stop_loss <= 0 or (price - stop_loss) * side.sign <= 0:
+            raise Mt5RejectedError("Required protective stop is invalid")
         if approved_entry_price is not None:
             bid, ask = _safe_float(tick_payload.get("bid")), _safe_float(tick_payload.get("ask"))
             if not all(math.isfinite(v) for v in (bid, ask, approved_entry_price)) or bid <= 0 or ask <= bid or (price - approved_entry_price) * side.sign > 0:
@@ -499,7 +620,7 @@ class Mt5Client:
         mt5 = self._module()
         trade_mode = _safe_int(_as_dict(account).get("trade_mode"), -1)
         real_mode = _constant(mt5, "ACCOUNT_TRADE_MODE_REAL", 2)
-        if trade_mode == real_mode:
+        if trade_mode not in {_constant(mt5, "ACCOUNT_TRADE_MODE_DEMO", 0), _constant(mt5, "ACCOUNT_TRADE_MODE_CONTEST", 1)}:
             raise Mt5CredentialsMissing("MT5_DEMO_ONLY=true refuses to run against a real MT5 account")
 
     def _select_symbol(self, symbol: str) -> Any:
@@ -709,6 +830,14 @@ class Mt5Client:
                 event["exit_time"] = deal_time
                 event["exit_price"] = _safe_float(payload.get("price"), event["exit_price"])
             event["deals"].append(payload)
+        # Opening commissions/fees are also part of realized net P&L.
+        for deal in deals:
+            payload = _as_dict(deal)
+            if _safe_int(payload.get("entry"), -1) != _constant(mt5, "DEAL_ENTRY_IN", 0):
+                continue
+            trade_id = str(payload.get("position_id") or "")
+            if trade_id in grouped:
+                grouped[trade_id]["realized_pl"] += _safe_float(payload.get("commission")) + _safe_float(payload.get("fee"))
         return list(grouped.values())
 
     def _module(self) -> Any:
@@ -847,3 +976,9 @@ def _naive_utc(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value
     return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _coerce_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)

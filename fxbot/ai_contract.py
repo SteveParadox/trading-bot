@@ -1,0 +1,82 @@
+"""Typed contract for AI evaluation of strategy-generated FX candidates.
+
+The AI is deliberately constrained to evaluating an existing candidate. It is
+not a signal generator, position sizer, risk authority, or broker interface.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
+import math
+from typing import Any, Callable, Mapping
+
+
+class AiTradeDecision(str, Enum):
+    """The only decisions the candidate-evaluation AI may return."""
+
+    TAKE = "TAKE"
+    WAIT = "WAIT"
+    SKIP = "SKIP"
+
+
+@dataclass(frozen=True)
+class AiTradeRecommendation:
+    """Structured, non-executing recommendation for one strategy candidate."""
+
+    decision: AiTradeDecision
+    confidence: float
+    reason_codes: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.confidence) or not 0.0 <= self.confidence <= 1.0:
+            raise ValueError("confidence must be finite and between 0 and 1")
+        if not self.reason_codes:
+            raise ValueError("reason_codes must contain at least one code")
+        if any(not isinstance(value, str) or not value.strip() for value in self.reason_codes):
+            raise ValueError("reason_codes must contain non-empty strings")
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "decision": self.decision.value,
+            "confidence": self.confidence,
+            "reason_codes": list(self.reason_codes),
+        }
+
+
+def validate_ai_trade_recommendation(payload: dict[str, Any]) -> AiTradeRecommendation:
+    """Validate an LLM response against the constrained TAKE/WAIT/SKIP schema.
+
+    This function intentionally accepts no order, sizing, stop, target, or risk
+    fields. Those concerns stay with deterministic trading code.
+    """
+
+    from fxbot.ai_deliberation import validate_ai_audit_response, AiResponseValidationError
+    try:
+        validated = validate_ai_audit_response(payload)
+    except AiResponseValidationError as exc:
+        raise ValueError("unsupported fields or invalid TAKE, WAIT, or SKIP response") from exc
+    return AiTradeRecommendation(
+        decision=AiTradeDecision(validated.decision),
+        confidence=validated.confidence,
+        reason_codes=tuple(validated.reason_codes),
+    )
+
+
+AiCandidateProvider = Callable[[dict[str, Any]], dict[str, Any]]
+
+
+class AiCandidateEvaluator:
+    """Evaluate an existing candidate snapshot without any execution authority.
+
+    The provider sees only a structured snapshot and must return the strict
+    TAKE/WAIT/SKIP schema. This service has no strategy, risk, position-sizing,
+    or broker dependency by design.
+    """
+
+    def __init__(self, provider: AiCandidateProvider) -> None:
+        self.provider = provider
+
+    def evaluate(self, snapshot: Mapping[str, Any]) -> AiTradeRecommendation:
+        payload = self.provider(dict(snapshot))
+        return validate_ai_trade_recommendation(payload)

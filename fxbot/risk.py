@@ -79,6 +79,12 @@ class FxRiskManager:
         snapshot_quote_factor: float | None = None,
         now: datetime | None = None,
     ) -> FxRiskDecision:
+        if portfolio.account_currency.upper() != self.risk.account_currency.upper():
+            return FxRiskDecision(False, "account_currency_mismatch")
+        numbers = [portfolio.equity, portfolio.balance, portfolio.margin_used, portfolio.portfolio_risk,
+                   portfolio.gross_exposure, *portfolio.pair_exposures.values(), *portfolio.currency_exposures.values()]
+        if any(not math.isfinite(value) for value in numbers):
+            return FxRiskDecision(False, "invalid_portfolio_values")
         self.peak_equity = max(self.peak_equity, portfolio.equity)
         hard_stop = self._hard_stop(portfolio, now or intent.timestamp)
         if hard_stop:

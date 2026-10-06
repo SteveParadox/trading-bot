@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import inspect
+import json
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -9,6 +10,8 @@ from pathlib import Path
 from fxbot.ai_deliberation import (
     AiDeliberationService,
     AiDeliberationResult,
+    HttpxAiProvider,
+    strict_ai_response_format,
     apply_ai_execution_policy,
     build_signal_evidence,
     deterministic_reasoning_audit,
@@ -25,6 +28,14 @@ NOW = datetime(2026, 9, 15, 14, 0, tzinfo=timezone.utc)
 
 
 def valid_response() -> dict:
+    return {
+        "decision": "WAIT",
+        "confidence": 0.9,
+        "reason_codes": ["news_risk", "pullback_risk"],
+    }
+
+
+def legacy_response() -> dict:
     return {
         "decision": "FLAG",
         "confidence": 0.9,
@@ -50,6 +61,12 @@ def intent() -> FxSignalIntent:
             "entry_price_source": "broker_executable_bid_ask",
             "details": {"di_edge": 13, "directional_ma28_slope_atr": 0.2, "entry_extension_atr": 0.4, "htf": {"signal": "LONG", "ma7": 1.2, "ma14": 1.1, "ma28": 1.0, "di_plus": 20, "di_minus": 5, "open": 1.1, "close": 1.2}},
             "score_details": {"score": 70.0, "adx_points": 20, "di_points": 30, "volume_points": 0},
+            "news_context": {
+                "upcoming_event": {"name": "FOMC", "impact_level": "HIGH", "currency": "USD", "minutes_until_event": 12},
+                "event_just_occurred": False,
+                "freshness": {"state": "FRESH", "stale": False, "age_seconds": 25.0, "source": "forexfactory"},
+                "risk_level": "HIGH",
+            },
         },
     )
 
@@ -69,12 +86,38 @@ def test_off_policy_does_not_require_or_consult_ai() -> None:
 
 
 def test_hard_safety_gate_always_wins_over_ai_confirm() -> None:
-    service = AiDeliberationService(AiDeliberationSettings(mode="advisory"), provider=lambda *_: valid_response() | {"decision": "CONFIRM", "recommended_action": "ALLOW"})
+    service = AiDeliberationService(AiDeliberationSettings(mode="advisory"), provider=lambda *_: valid_response() | {"decision": "TAKE", "reason_codes": ["trend_alignment"]})
     result = service.deliberate(_evidence())
     policy = apply_ai_execution_policy(hard_safety_allowed=False, settings=AiDeliberationSettings(mode="advisory", reject_blocks=True), result=result)
     assert result.successful is True
     assert policy.allowed is False
     assert policy.reason == "hard_safety_gate_blocked"
+
+
+def test_shadow_take_wait_skip_are_all_nonblocking() -> None:
+    settings = AiDeliberationSettings(mode="shadow")
+    for decision, reason_codes in (
+        ("TAKE", ["trend_alignment"]),
+        ("WAIT", ["pullback_risk"]),
+        ("SKIP", ["weak_tp_probability"]),
+    ):
+        service = AiDeliberationService(
+            settings,
+            provider=lambda *_args, decision=decision, reason_codes=reason_codes: {
+                "decision": decision,
+                "confidence": 0.99,
+                "reason_codes": reason_codes,
+            },
+        )
+        result = service.deliberate(_evidence())
+        policy = apply_ai_execution_policy(
+            hard_safety_allowed=True,
+            settings=settings,
+            result=result,
+        )
+        assert result.successful is True
+        assert policy.allowed is True
+        assert policy.reason == "deterministic_execution_authoritative"
 
 
 def test_shadow_provider_failure_is_recordable_and_nonblocking() -> None:
@@ -87,7 +130,7 @@ def test_shadow_provider_failure_is_recordable_and_nonblocking() -> None:
 
 
 def test_advisory_reject_requires_explicit_opt_in_and_confidence() -> None:
-    service = AiDeliberationService(AiDeliberationSettings(mode="advisory"), provider=lambda *_: valid_response() | {"decision": "REJECT", "recommended_action": "REJECT"})
+    service = AiDeliberationService(AiDeliberationSettings(mode="advisory"), provider=lambda *_: valid_response() | {"decision": "SKIP", "reason_codes": ["weak_tp_probability"]})
     result = service.deliberate(_evidence())
     default = apply_ai_execution_policy(hard_safety_allowed=True, settings=AiDeliberationSettings(mode="advisory"), result=result)
     opt_in = apply_ai_execution_policy(hard_safety_allowed=True, settings=AiDeliberationSettings(mode="advisory", reject_blocks=True), result=result)
@@ -95,14 +138,181 @@ def test_advisory_reject_requires_explicit_opt_in_and_confidence() -> None:
     assert opt_in.allowed is False
 
 
-def test_inconsistent_decision_and_action_is_rejected() -> None:
-    malformed = valid_response() | {"decision": "CONFIRM", "recommended_action": "REJECT"}
+def test_advisory_wait_can_only_suppress_when_explicitly_enabled() -> None:
+    service = AiDeliberationService(
+        AiDeliberationSettings(mode="advisory"),
+        provider=lambda *_: valid_response(),
+    )
+    result = service.deliberate(_evidence())
+    default = apply_ai_execution_policy(
+        hard_safety_allowed=True,
+        settings=AiDeliberationSettings(mode="advisory"),
+        result=result,
+    )
+    blocking = apply_ai_execution_policy(
+        hard_safety_allowed=True,
+        settings=AiDeliberationSettings(mode="advisory", flag_blocks=True),
+        result=result,
+    )
+    assert default.allowed is True
+    assert blocking.allowed is False
+    assert blocking.reason == "ai_advisory_wait"
+
+
+def test_strict_response_format_allows_only_take_wait_skip_confidence_and_reason_codes() -> None:
+    response_format = strict_ai_response_format()
+    assert response_format["type"] == "json_schema"
+    contract = response_format["json_schema"]
+    assert contract["strict"] is True
+    schema = contract["schema"]
+    assert schema["additionalProperties"] is False
+    assert schema["required"] == ["decision", "confidence", "reason_codes"]
+    assert schema["properties"]["decision"]["enum"] == ["TAKE", "WAIT", "SKIP"]
+    assert schema["properties"]["confidence"]["minimum"] == 0.0
+    assert schema["properties"]["confidence"]["maximum"] == 1.0
+    assert schema["properties"]["reason_codes"]["minItems"] == 1
+    assert schema["properties"]["reason_codes"]["uniqueItems"] is True
+
+
+def test_http_provider_requests_strict_json_schema() -> None:
+    settings = AiDeliberationSettings(
+        mode="shadow",
+        endpoint="https://example.test/v1",
+        model="test-model",
+        api_key="secret",
+        max_retries=0,
+    )
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps({
+                                "decision": "TAKE",
+                                "confidence": 0.83,
+                                "reason_codes": ["trend_alignment"],
+                            })
+                        }
+                    }
+                ]
+            }
+
+    class Client:
+        def __init__(self) -> None:
+            self.kwargs = None
+
+        def post(self, *args, **kwargs):
+            self.kwargs = kwargs
+            return Response()
+
+    client = Client()
+    provider = HttpxAiProvider(settings, client=client)
+    result = provider("system", {"candidate": True})
+
+    assert result["decision"] == "TAKE"
+    response_format = client.kwargs["json"]["response_format"]
+    assert response_format["type"] == "json_schema"
+    assert response_format["json_schema"]["strict"] is True
+    assert client.kwargs["json"]["temperature"] == 0
+
+
+def test_free_form_provider_content_is_not_a_decision() -> None:
+    settings = AiDeliberationSettings(
+        mode="shadow",
+        endpoint="https://example.test/v1",
+        model="test-model",
+        max_retries=0,
+    )
+
+    class Response:
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self):
+            return {
+                "choices": [
+                    {"message": {"content": "Hmm, this trade looks pretty good..."}}
+                ]
+            }
+
+    class Client:
+        def post(self, *args, **kwargs):
+            return Response()
+
+    service = AiDeliberationService(
+        settings,
+        provider=HttpxAiProvider(settings, client=Client()),
+    )
+    result = service.deliberate(_evidence())
+    assert result.successful is False
+    assert result.failure_reason and "AiResponseValidationError" in result.failure_reason
+
+
+def test_extra_response_fields_are_rejected() -> None:
+    malformed = valid_response() | {"commentary": "looks good"}
     try:
         validate_ai_audit_response(malformed)
     except Exception as exc:
         assert type(exc).__name__ == "AiResponseValidationError"
     else:
-        raise AssertionError("inconsistent AI output was accepted")
+        raise AssertionError("AI response with extra fields was accepted")
+
+
+def test_duplicate_reason_codes_are_rejected() -> None:
+    malformed = valid_response() | {"reason_codes": ["news_risk", "news_risk"]}
+    try:
+        validate_ai_audit_response(malformed)
+    except Exception as exc:
+        assert type(exc).__name__ == "AiResponseValidationError"
+    else:
+        raise AssertionError("duplicate AI reason codes were accepted")
+
+
+def test_unsupported_reason_code_is_rejected() -> None:
+    malformed = valid_response() | {"reason_codes": ["make_money_now"]}
+    try:
+        validate_ai_audit_response(malformed)
+    except Exception as exc:
+        assert type(exc).__name__ == "AiResponseValidationError"
+    else:
+        raise AssertionError("unsupported AI reason code was accepted")
+
+
+def test_live_provider_rejects_legacy_response_schema() -> None:
+    service = AiDeliberationService(
+        AiDeliberationSettings(mode="shadow"),
+        provider=lambda *_: legacy_response(),
+    )
+    result = service.deliberate(_evidence())
+    assert result.successful is False
+    assert result.failure_reason and "AiResponseValidationError" in result.failure_reason
+
+
+def test_legacy_stored_response_maps_to_take_wait_skip() -> None:
+    migrated = validate_ai_audit_response(
+        legacy_response(),
+        allow_legacy_stored_response=True,
+    )
+    assert migrated.decision == "WAIT"
+    assert migrated.reason_codes == ["legacy_flag"]
+
+
+def test_inconsistent_legacy_decision_and_action_is_rejected() -> None:
+    malformed = legacy_response() | {"decision": "CONFIRM", "recommended_action": "REJECT"}
+    try:
+        validate_ai_audit_response(
+            malformed,
+            allow_legacy_stored_response=True,
+        )
+    except Exception as exc:
+        assert type(exc).__name__ == "AiResponseValidationError"
+    else:
+        raise AssertionError("inconsistent legacy AI output was accepted")
 
 
 def test_deterministic_audit_catches_numeric_reasoning_contradictions() -> None:
@@ -125,6 +335,55 @@ def test_evidence_uses_executable_ask_and_authoritative_calendar_metadata() -> N
     assert event["currency"] == "USD"
     assert event["time_until_event_seconds"] == 720
     assert "description" not in event
+    news_context = payload["external_context"]["candidate_news_context"]
+    assert news_context["upcoming_event"]["currency"] == "USD"
+    assert news_context["freshness"]["state"] == "FRESH"
+    assert news_context["freshness"]["age_seconds"] == 25.0
+    assert payload["candidate_trade"]["symbol"] == "EUR_USD"
+    assert payload["candidate_trade"]["direction"] == "LONG"
+    assert payload["risk_context"]["risk_allowed"] is True
+    assert payload["risk_context"]["portfolio_equity"] == 10_000
+    assert payload["numerical_model_prediction"]["status"] == "unavailable"
+
+
+def test_llm_evidence_contains_market_snapshot_numerical_prediction_news_and_risk() -> None:
+    prediction = {
+        "status": "ok",
+        "tp_before_sl_probability": 0.83,
+        "model_name": "XGBoost",
+        "model_version": "xgb_tp_before_sl_v1",
+    }
+    snapshot = {
+        "candidate_id": "fxsig-EURUSD-abc",
+        "symbol": "EUR_USD",
+        "direction": "LONG",
+        "timestamp": NOW.isoformat(),
+        "trend_strength": 25.0,
+        "momentum": 0.7,
+        "news_context": {"risk_level": "LOW"},
+    }
+    evidence = build_signal_evidence(
+        signal_id="fxsig-EURUSD-abc",
+        intent=intent(),
+        instrument=FxInstrument("EUR_USD"),
+        price=PriceSnapshot("EUR_USD", bid=1.1008, ask=1.1010, time=NOW),
+        portfolio=FxPortfolioState(10_000, 10_000, 0, 1, portfolio_risk=15.0),
+        risk=risk(),
+        strategy=StrategySettings(),
+        news_events=[],
+        news_stale=False,
+        active_sessions={"new_york"},
+        now=NOW,
+        demo_only=True,
+        market_snapshot=snapshot,
+        numerical_prediction=prediction,
+    )
+    payload = evidence.to_dict()
+    assert payload["candidate_trade"]["entry"] == 1.1010
+    assert payload["market_snapshot"]["trend_strength"] == 25.0
+    assert payload["numerical_model_prediction"]["tp_before_sl_probability"] == 0.83
+    assert payload["external_context"]["candidate_news_context"]["risk_level"] == "HIGH"
+    assert payload["risk_context"]["portfolio_risk"] == 15.0
 
 
 def test_persistence_is_idempotent_per_parent_signal() -> None:
@@ -132,7 +391,7 @@ def test_persistence_is_idempotent_per_parent_signal() -> None:
         with closing(StructuredJournal(f"sqlite:///{Path(tmp) / 'journal.db'}")) as journal:
             payload = {
                 "signal_id": "fxsig-EURUSD-abc", "timestamp": NOW, "instrument": "EUR_USD", "side": "LONG", "model": "test",
-                "prompt_version": "v1", "mode": "shadow", "status": "completed", "decision": "FLAG", "confidence": 0.9,
+                "prompt_version": "v1", "mode": "shadow", "status": "completed", "decision": "WAIT", "confidence": 0.9,
                 "reasoning_audit_status": "CONSISTENT", "reasoning_issues": [], "reasoning_supporting_factors": [],
                 "market_context_status": "MATERIAL_CONTRADICTION", "market_context_issues": [], "market_context_supporting_factors": [],
                 "contradictions": [], "recommended_action": "FLAG", "summary": "test", "evidence_hash": "a", "output_hash": "b",

@@ -11,8 +11,18 @@ from unittest.mock import Mock, patch
 
 import pandas as pd
 
-from fxbot.config import BrokerSettings, FxBotSettings, RiskSettings, RuntimeSettings, StrategySettings
+from fxbot.config import (
+    AiDeliberationSettings,
+    BrokerSettings,
+    FxBotSettings,
+    MlPredictionSettings,
+    RiskSettings,
+    RuntimeSettings,
+    StrategySettings,
+)
 from fxbot.forward import ForwardTestWorker, client_order_id, executable_entry_price
+from fxbot.ai.schemas import NumericalPrediction
+from fxbot.ai_deliberation import AiAuditResponse, AiDeliberationResult
 from fxbot.instruments import FxInstrument, PriceSnapshot
 from fxbot.journal import StructuredJournal
 from fxbot.models import BotRunState, FxSignalIntent, Side
@@ -172,6 +182,58 @@ class FakeMt5Client:
         return self.entry_frame.copy()
 
 
+class CapturingPredictor:
+    def __init__(self, result: NumericalPrediction | None = None) -> None:
+        self.requests = []
+        self.result = result or NumericalPrediction(
+            status="ok",
+            tp_before_sl_probability=0.83,
+            model_name="XGBoost",
+            model_version="xgb_tp_before_sl_v1",
+            model_hash="abc123",
+            target="TP_BEFORE_SL",
+            feature_version="v1",
+            feature_hash="feature123",
+            latency_ms=2,
+        )
+
+    def predict(self, request):
+        self.requests.append(request)
+        return self.result
+
+
+class CapturingDeliberator:
+    def __init__(
+        self,
+        *,
+        decision: str = "TAKE",
+        confidence: float = 0.83,
+        reason_codes: list[str] | None = None,
+    ) -> None:
+        self.evidence = None
+        self.decision = decision
+        self.confidence = confidence
+        self.reason_codes = reason_codes or [
+            "trend_alignment",
+            "strong_entry_quality",
+            "high_tp_probability",
+        ]
+
+    def deliberate(self, evidence):
+        self.evidence = evidence
+        return AiDeliberationResult(
+            response=AiAuditResponse(
+                decision=self.decision,
+                confidence=self.confidence,
+                reason_codes=self.reason_codes,
+            ),
+            latency_ms=3,
+        )
+
+    def close(self) -> None:
+        return None
+
+
 class ForwardWorkerTests(unittest.TestCase):
     def test_free_news_blocks_before_strategy_or_order_submission(self) -> None:
         scenarios = (
@@ -208,7 +270,275 @@ class ForwardWorkerTests(unittest.TestCase):
                         worker.scan_once()
                     scan.assert_not_called()
                     self.assertEqual(client.created_orders, [])
+                    self.assertEqual(journal.recent_candidates(), [])
                     self.assertTrue(journal.recent_signals(limit=1)[0].reason.startswith(reason))
+
+    def test_required_ml_prediction_failure_blocks_before_llm_or_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            entry = trending_frame(1.08, 0.00025)
+            htf = trending_frame(1.06, 0.0005)
+            settings = FxBotSettings(
+                instruments=["EUR_USD"],
+                broker=BrokerSettings(),
+                strategy=StrategySettings(
+                    partial_tp_enabled=False,
+                    trade_sessions_utc=(),
+                    avoid_rollover_minutes=0,
+                    require_volume_confirmation=False,
+                    min_atr_pips=0.1,
+                    max_atr_pips=30,
+                    adx_min=10,
+                    htf_adx_min=10,
+                ),
+                risk=RiskSettings(
+                    risk_per_trade_pct=0.01,
+                    max_units_per_trade=1_000_000,
+                    max_pair_exposure_pct=10.0,
+                    max_gross_exposure_pct=10.0,
+                    max_currency_exposure_pct=10.0,
+                ),
+                runtime=RuntimeSettings(
+                    database_url=f"sqlite:///{Path(tmp) / 'journal.db'}",
+                    log_jsonl_path=str(Path(tmp) / "j.jsonl"),
+                ),
+                ml_prediction=MlPredictionSettings(
+                    mode="required",
+                    model_path="required.joblib",
+                    metadata_path="required.metadata.json",
+                ),
+                ai=AiDeliberationSettings(mode="shadow", provider="none"),
+            )
+            predictor = CapturingPredictor(
+                NumericalPrediction(status="error", error="model_unavailable")
+            )
+            deliberator = CapturingDeliberator()
+            with closing(StructuredJournal(settings.runtime.database_url, settings.runtime.log_jsonl_path)) as journal:
+                client = FakeMt5Client(entry_frame=entry, htf_frame=htf)
+                worker = ForwardTestWorker(
+                    settings,
+                    client=client,
+                    journal=journal,
+                    predictor=predictor,
+                    deliberator=deliberator,
+                )
+                journal.set_state(BotRunState.RUNNING, "test required ML failure")
+                with patch("fxbot.forward.datetime", FixedDatetime):
+                    worker.scan_once()
+
+                self.assertEqual(len(predictor.requests), 1)
+                self.assertIsNone(deliberator.evidence)
+                self.assertEqual(client.created_orders, [])
+                candidate = journal.find_candidate(predictor.requests[0].candidate_id)
+                self.assertEqual(candidate.status, "rejected")
+                self.assertEqual(candidate.rejection_reason, "ml_prediction_required_unavailable")
+
+
+    def test_shadow_ml_prediction_failure_does_not_block_deterministic_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            entry = trending_frame(1.08, 0.00025)
+            htf = trending_frame(1.06, 0.0005)
+            settings = FxBotSettings(
+                instruments=["EUR_USD"],
+                broker=BrokerSettings(),
+                strategy=StrategySettings(
+                    partial_tp_enabled=False,
+                    trade_sessions_utc=(),
+                    avoid_rollover_minutes=0,
+                    require_volume_confirmation=False,
+                    min_atr_pips=0.1,
+                    max_atr_pips=30,
+                    adx_min=10,
+                    htf_adx_min=10,
+                ),
+                risk=RiskSettings(
+                    risk_per_trade_pct=0.01,
+                    max_units_per_trade=1_000_000,
+                    max_pair_exposure_pct=10.0,
+                    max_gross_exposure_pct=10.0,
+                    max_currency_exposure_pct=10.0,
+                ),
+                runtime=RuntimeSettings(
+                    database_url=f"sqlite:///{Path(tmp) / 'journal.db'}",
+                    log_jsonl_path=str(Path(tmp) / "j.jsonl"),
+                ),
+                ml_prediction=MlPredictionSettings(
+                    mode="shadow",
+                    model_path="shadow.joblib",
+                    metadata_path="shadow.metadata.json",
+                ),
+                ai=AiDeliberationSettings(mode="off"),
+            )
+            predictor = CapturingPredictor(
+                NumericalPrediction(status="error", error="model_unavailable")
+            )
+            with closing(StructuredJournal(settings.runtime.database_url, settings.runtime.log_jsonl_path)) as journal:
+                client = FakeMt5Client(entry_frame=entry, htf_frame=htf)
+                worker = ForwardTestWorker(
+                    settings,
+                    client=client,
+                    journal=journal,
+                    predictor=predictor,
+                )
+                journal.set_state(BotRunState.RUNNING, "test shadow ML failure")
+                with patch("fxbot.forward.datetime", FixedDatetime):
+                    worker.scan_once()
+
+                self.assertEqual(len(predictor.requests), 1)
+                self.assertEqual(len(client.created_orders), 1)
+                candidate = journal.find_candidate(predictor.requests[0].candidate_id)
+                self.assertEqual(candidate.status, "executed")
+                self.assertEqual(candidate.payload["numerical_prediction"]["status"], "error")
+
+
+    def test_advisory_wait_is_journaled_as_delayed_not_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            entry = trending_frame(1.08, 0.00025)
+            htf = trending_frame(1.06, 0.0005)
+            settings = FxBotSettings(
+                instruments=["EUR_USD"],
+                broker=BrokerSettings(),
+                strategy=StrategySettings(
+                    partial_tp_enabled=False,
+                    trade_sessions_utc=(),
+                    avoid_rollover_minutes=0,
+                    require_volume_confirmation=False,
+                    min_atr_pips=0.1,
+                    max_atr_pips=30,
+                    adx_min=10,
+                    htf_adx_min=10,
+                ),
+                risk=RiskSettings(
+                    risk_per_trade_pct=0.01,
+                    max_units_per_trade=1_000_000,
+                    max_pair_exposure_pct=10.0,
+                    max_gross_exposure_pct=10.0,
+                    max_currency_exposure_pct=10.0,
+                ),
+                runtime=RuntimeSettings(
+                    database_url=f"sqlite:///{Path(tmp) / 'journal.db'}",
+                    log_jsonl_path=str(Path(tmp) / "j.jsonl"),
+                ),
+                ml_prediction=MlPredictionSettings(
+                    mode="shadow",
+                    model_path="ignored.joblib",
+                    metadata_path="ignored.metadata.json",
+                ),
+                ai=AiDeliberationSettings(
+                    mode="advisory",
+                    provider="none",
+                    flag_blocks=True,
+                ),
+            )
+            predictor = CapturingPredictor()
+            deliberator = CapturingDeliberator(
+                decision="WAIT",
+                confidence=0.91,
+                reason_codes=["pullback_risk"],
+            )
+            with closing(StructuredJournal(settings.runtime.database_url, settings.runtime.log_jsonl_path)) as journal:
+                client = FakeMt5Client(entry_frame=entry, htf_frame=htf)
+                worker = ForwardTestWorker(
+                    settings,
+                    client=client,
+                    journal=journal,
+                    predictor=predictor,
+                    deliberator=deliberator,
+                )
+                journal.set_state(BotRunState.RUNNING, "test AI wait")
+                with patch("fxbot.forward.datetime", FixedDatetime):
+                    worker.scan_once()
+
+                self.assertEqual(client.created_orders, [])
+                candidate = journal.find_candidate(predictor.requests[0].candidate_id)
+                self.assertEqual(candidate.status, "delayed")
+                self.assertIsNone(candidate.rejection_reason)
+                self.assertEqual(candidate.payload["ai_delay_reason"], "ai_advisory_wait")
+                signal = journal.recent_signals(limit=1)[0]
+                self.assertEqual(signal.status, "advisory_wait")
+                self.assertEqual(signal.reason, "ai_advisory_wait")
+
+
+    def test_prediction_is_passed_to_llm_before_existing_execution_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            entry = trending_frame(1.08, 0.00025)
+            htf = trending_frame(1.06, 0.0005)
+            settings = FxBotSettings(
+                instruments=["EUR_USD"],
+                broker=BrokerSettings(),
+                strategy=StrategySettings(
+                    partial_tp_enabled=False,
+                    trade_sessions_utc=(),
+                    avoid_rollover_minutes=0,
+                    require_volume_confirmation=False,
+                    min_atr_pips=0.1,
+                    max_atr_pips=30,
+                    adx_min=10,
+                    htf_adx_min=10,
+                ),
+                risk=RiskSettings(
+                    risk_per_trade_pct=0.01,
+                    max_units_per_trade=1_000_000,
+                    max_pair_exposure_pct=10.0,
+                    max_gross_exposure_pct=10.0,
+                    max_currency_exposure_pct=10.0,
+                ),
+                runtime=RuntimeSettings(
+                    database_url=f"sqlite:///{Path(tmp) / 'journal.db'}",
+                    log_jsonl_path=str(Path(tmp) / "j.jsonl"),
+                ),
+                ml_prediction=MlPredictionSettings(
+                    mode="shadow",
+                    model_path="ignored.joblib",
+                    metadata_path="ignored.metadata.json",
+                ),
+                ai=AiDeliberationSettings(
+                    mode="shadow",
+                    provider="none",
+                ),
+            )
+            predictor = CapturingPredictor()
+            deliberator = CapturingDeliberator()
+            with closing(StructuredJournal(settings.runtime.database_url, settings.runtime.log_jsonl_path)) as journal:
+                client = FakeMt5Client(entry_frame=entry, htf_frame=htf)
+                worker = ForwardTestWorker(
+                    settings,
+                    client=client,
+                    journal=journal,
+                    predictor=predictor,
+                    deliberator=deliberator,
+                )
+                journal.set_state(BotRunState.RUNNING, "test prediction integration")
+
+                with patch("fxbot.forward.datetime", FixedDatetime):
+                    worker.scan_once()
+
+                self.assertEqual(len(predictor.requests), 1)
+                request = predictor.requests[0]
+                self.assertEqual(request.candidate_trade["symbol"], "EUR_USD")
+                self.assertEqual(request.market_snapshot["symbol"], "EUR_USD")
+                self.assertGreater(request.candidate_trade["risk_reward"], 0)
+
+                self.assertIsNotNone(deliberator.evidence)
+                evidence = deliberator.evidence.to_dict()
+                self.assertEqual(
+                    evidence["numerical_model_prediction"]["tp_before_sl_probability"],
+                    0.83,
+                )
+                self.assertEqual(evidence["candidate_trade"]["symbol"], "EUR_USD")
+                self.assertIn("news_context", evidence["market_snapshot"])
+                self.assertTrue(evidence["risk_context"]["risk_allowed"])
+
+                # Shadow AI/ML can observe but cannot bypass or replace execution.
+                self.assertEqual(len(client.created_orders), 1)
+                ai_rows = journal.recent_ai_deliberations(limit=10)
+                self.assertEqual(len(ai_rows), 1)
+                self.assertEqual(ai_rows[0].decision, "TAKE")
+                candidate = journal.find_candidate(request.candidate_id)
+                self.assertEqual(
+                    candidate.payload["numerical_prediction"]["tp_before_sl_probability"],
+                    0.83,
+                )
+
 
     def test_scan_once_places_market_order_from_confirmed_indicator_signal(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -259,6 +589,57 @@ class ForwardWorkerTests(unittest.TestCase):
                 self.assertEqual(signal.reason, "signal_and_risk_accepted")
                 self.assertEqual(signal.side, Side.LONG.value)
 
+                metadata = signal.payload["intent"]["metadata"]
+                self.assertTrue(metadata["candidate_id"].startswith("fxsig-"))
+                self.assertEqual(metadata["ai_decision_space"], ["TAKE", "WAIT", "SKIP"])
+                snapshot = metadata["market_snapshot"]
+                self.assertEqual(snapshot["symbol"], "EUR_USD")
+                self.assertEqual(snapshot["direction"], "LONG")
+                self.assertEqual(snapshot["proposed_entry"], signal.entry_price)
+                self.assertEqual(snapshot["stop_loss"], signal.stop_loss)
+                self.assertEqual(snapshot["take_profit"], signal.take_profit)
+                self.assertGreater(len(snapshot["recent_candles"]), 0)
+                self.assertIn("rsi", snapshot)
+                self.assertIn("momentum", snapshot)
+                self.assertIn("current_exposure", snapshot)
+                candidate_events = [
+                    event for event in journal.recent_events(limit=100)
+                    if event.event_type == "candidate_market_snapshot"
+                ]
+                self.assertEqual(len(candidate_events), 1)
+                self.assertEqual(candidate_events[0].payload["candidate_id"], metadata["candidate_id"])
+
+                candidate = journal.find_candidate(metadata["candidate_id"])
+                self.assertIsNotNone(candidate)
+                self.assertEqual(candidate.symbol, "EUR_USD")
+                self.assertEqual(candidate.direction, Side.LONG.value)
+                self.assertEqual(candidate.entry, signal.entry_price)
+                self.assertEqual(candidate.stop_loss, signal.stop_loss)
+                self.assertEqual(candidate.take_profit, signal.take_profit)
+                self.assertGreater(candidate.spread, 0)
+                self.assertGreater(candidate.atr, 0)
+                self.assertIsNotNone(candidate.momentum)
+                self.assertGreater(candidate.trend_strength, 0)
+                self.assertEqual(candidate.strategy_signal, "signal_confirmed")
+                self.assertEqual(candidate.news_risk["freshness"]["stale"], True)  # No authoritative feed configured.
+                self.assertTrue(candidate.executed)
+                self.assertEqual(candidate.status, "executed")
+                self.assertIsNone(candidate.rejection_reason)
+                outcome = journal.find_candidate_outcome(metadata["candidate_id"])
+                self.assertIsNotNone(outcome)
+                self.assertEqual(outcome.status, "tracking")
+                self.assertEqual(outcome.observation_count, 1)
+
+                # Rescanning the same closed-candle setup must not create a
+                # duplicate trade or downgrade an already executed candidate.
+                with patch("fxbot.forward.datetime", FixedDatetime):
+                    worker.scan_once()
+                self.assertEqual(len(client.created_orders), 1)
+                candidate_after_rescan = journal.find_candidate(metadata["candidate_id"])
+                self.assertTrue(candidate_after_rescan.executed)
+                self.assertEqual(candidate_after_rescan.status, "executed")
+                self.assertIsNone(candidate_after_rescan.rejection_reason)
+
                 order = journal.recent_orders(limit=1)[0]
                 self.assertEqual(order.status, "filled")
                 self.assertEqual(order.instrument, "EUR_USD")
@@ -270,6 +651,105 @@ class ForwardWorkerTests(unittest.TestCase):
                 self.assertEqual(trade.state, "open")
                 self.assertEqual(trade.instrument, "EUR_USD")
                 self.assertEqual(trade.side, Side.LONG.value)
+
+    def test_candidate_snapshot_failure_does_not_change_deterministic_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = FxBotSettings(
+                instruments=["EUR_USD"],
+                broker=BrokerSettings(),
+                strategy=StrategySettings(
+                    partial_tp_enabled=False,
+                    trade_sessions_utc=(),
+                    avoid_rollover_minutes=0,
+                    require_volume_confirmation=False,
+                    min_atr_pips=0.1,
+                    max_atr_pips=30,
+                    adx_min=10,
+                    htf_adx_min=10,
+                ),
+                risk=RiskSettings(
+                    risk_per_trade_pct=0.01,
+                    max_units_per_trade=1_000_000,
+                    max_pair_exposure_pct=10.0,
+                    max_gross_exposure_pct=10.0,
+                    max_currency_exposure_pct=10.0,
+                ),
+                runtime=RuntimeSettings(database_url=f"sqlite:///{Path(tmp) / 'journal.db'}"),
+            )
+            with closing(StructuredJournal(settings.runtime.database_url)) as journal:
+                client = FakeMt5Client(
+                    entry_frame=trending_frame(1.08, 0.00025),
+                    htf_frame=trending_frame(1.06, 0.0005),
+                )
+                worker = ForwardTestWorker(settings, client=client, journal=journal)
+                journal.set_state(BotRunState.RUNNING, "snapshot failure test")
+                with (
+                    patch("fxbot.forward.datetime", FixedDatetime),
+                    patch("fxbot.forward.build_market_snapshot", side_effect=RuntimeError("boom")),
+                ):
+                    worker.scan_once()
+
+                self.assertEqual(len(client.created_orders), 1)
+                signal = journal.recent_signals(limit=1)[0]
+                self.assertIsNone(signal.payload["intent"]["metadata"]["market_snapshot"])
+                failures = [
+                    event for event in journal.recent_events(limit=100)
+                    if event.event_type == "candidate_market_snapshot_failed"
+                ]
+                self.assertEqual(len(failures), 1)
+                candidates = journal.recent_candidates()
+                self.assertEqual(len(candidates), 1)
+                self.assertTrue(candidates[0].executed)
+                self.assertIsNone(candidates[0].payload["market_snapshot"])
+
+    def test_rejected_strategy_candidate_is_still_journaled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = FxBotSettings(
+                instruments=["EUR_USD"],
+                broker=BrokerSettings(),
+                strategy=StrategySettings(
+                    partial_tp_enabled=False,
+                    trade_sessions_utc=(),
+                    avoid_rollover_minutes=0,
+                    require_volume_confirmation=False,
+                    min_atr_pips=0.1,
+                    max_atr_pips=30,
+                    adx_min=10,
+                    htf_adx_min=10,
+                    max_spread_atr_ratio=0.00001,
+                ),
+                risk=RiskSettings(
+                    risk_per_trade_pct=0.01,
+                    max_units_per_trade=1_000_000,
+                    max_pair_exposure_pct=10.0,
+                    max_gross_exposure_pct=10.0,
+                    max_currency_exposure_pct=10.0,
+                ),
+                runtime=RuntimeSettings(database_url=f"sqlite:///{Path(tmp) / 'journal.db'}"),
+            )
+            with closing(StructuredJournal(settings.runtime.database_url)) as journal:
+                client = FakeMt5Client(
+                    entry_frame=trending_frame(1.08, 0.00025),
+                    htf_frame=trending_frame(1.06, 0.0005),
+                )
+                worker = ForwardTestWorker(settings, client=client, journal=journal)
+                journal.set_state(BotRunState.RUNNING, "candidate rejection test")
+                with patch("fxbot.forward.datetime", FixedDatetime):
+                    worker.scan_once()
+
+                self.assertEqual(client.created_orders, [])
+                candidates = journal.recent_candidates()
+                self.assertEqual(len(candidates), 1)
+                candidate = candidates[0]
+                self.assertFalse(candidate.executed)
+                self.assertEqual(candidate.status, "rejected")
+                self.assertEqual(candidate.rejection_reason, "spread_to_atr_filter")
+                self.assertEqual(candidate.strategy_signal, "signal_confirmed")
+                self.assertIn("freshness", candidate.news_risk)
+                outcome = journal.find_candidate_outcome(candidate.candidate_id)
+                self.assertIsNotNone(outcome)
+                self.assertEqual(outcome.status, "tracking")
+                self.assertEqual(outcome.observation_count, 1)
 
     def test_idempotent_submit_does_not_duplicate_reserved_order(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
