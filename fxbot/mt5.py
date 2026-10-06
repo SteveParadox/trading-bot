@@ -140,6 +140,7 @@ class Mt5Client:
             ["open", "high", "low", "close", "volume"]
         ].sort_index()
 
+
     def historical_candles(
         self,
         instrument: str,
@@ -149,9 +150,10 @@ class Mt5Client:
     ) -> pd.DataFrame:
         """Fetch historical MT5 bars for a corrected UTC interval.
 
-        Returned timestamps use the same explicit broker time correction as the
-        live candle path. Spread points are preserved for audit, but historical
-        candidate execution should prefer bid/ask ticks when available.
+        MT5 can reject very large copy_rates_range requests even when every
+        smaller sub-range is valid. Fetch bounded chunks and de-duplicate the
+        inclusive chunk boundaries before applying the configured broker-time
+        correction.
         """
 
         self._ensure_connected()
@@ -164,14 +166,41 @@ class Mt5Client:
         end_utc = _coerce_utc(end)
         if end_utc <= start_utc:
             raise ValueError("historical candle end must be after start")
+
         offset = timedelta(seconds=self.settings.time_offset_seconds)
-        rates = mt5.copy_rates_range(symbol, timeframe_value, start_utc - offset, end_utc - offset)
-        if rates is None:
-            self._mark_disconnected()
-            raise Mt5Error(f"MT5 copy_rates_range failed for {symbol}: {mt5.last_error()}")
-        frame = pd.DataFrame(rates)
-        if frame.empty:
-            return pd.DataFrame(columns=["open", "high", "low", "close", "volume", "spread_points"])
+        request_start = start_utc - offset
+        request_end = end_utc - offset
+        chunk_size = timedelta(days=30)
+        cursor = request_start
+        frames: list[pd.DataFrame] = []
+
+        while cursor < request_end:
+            chunk_end = min(cursor + chunk_size, request_end)
+            rates = mt5.copy_rates_range(symbol, timeframe_value, cursor, chunk_end)
+            if rates is None:
+                error = mt5.last_error()
+                self._mark_disconnected()
+                raise Mt5Error(
+                    "MT5 copy_rates_range failed for "
+                    f"{symbol} [{timeframe}] "
+                    f"{cursor.isoformat()} -> {chunk_end.isoformat()}: {error}"
+                )
+            if len(rates):
+                frames.append(pd.DataFrame(rates))
+            cursor = chunk_end
+
+        if not frames:
+            return pd.DataFrame(
+                columns=["open", "high", "low", "close", "volume", "spread_points"]
+            )
+
+        frame = pd.concat(frames, ignore_index=True)
+        if "time" in frame.columns:
+            frame = (
+                frame.drop_duplicates(subset=["time"], keep="last")
+                .sort_values("time")
+                .reset_index(drop=True)
+            )
         frame["timestamp"] = pd.to_datetime(
             frame["time"] + self.settings.time_offset_seconds,
             unit="s",
@@ -185,7 +214,10 @@ class Mt5Client:
         result = frame.dropna(subset=["open", "high", "low", "close"]).set_index("timestamp")[
             ["open", "high", "low", "close", "volume", "spread_points"]
         ].sort_index()
-        return result.loc[(result.index >= pd.Timestamp(start_utc)) & (result.index <= pd.Timestamp(end_utc))]
+        return result.loc[
+            (result.index >= pd.Timestamp(start_utc))
+            & (result.index <= pd.Timestamp(end_utc))
+        ]
 
     def historical_ticks(
         self,
@@ -193,7 +225,14 @@ class Mt5Client:
         start: datetime,
         end: datetime,
     ) -> pd.DataFrame:
-        """Fetch historical executable bid/ask ticks for one corrected UTC interval."""
+        """Fetch historical executable bid/ask ticks for one corrected UTC interval.
+
+        Older MT5 tick history may exist on the broker server without being
+        synchronized into the terminal's local tick database. A bounded range
+        request can fail in that state even though copy_ticks_from succeeds.
+        Prime the old history, retry the exact range, then fall back to bounded
+        copy_ticks_from pagination before treating the request as failed.
+        """
 
         self._ensure_connected()
         mt5 = self._module()
@@ -204,20 +243,84 @@ class Mt5Client:
         end_utc = _coerce_utc(end)
         if end_utc <= start_utc:
             raise ValueError("historical tick end must be after start")
+
         offset = timedelta(seconds=self.settings.time_offset_seconds)
-        flags = _constant(mt5, "COPY_TICKS_INFO", _constant(mt5, "COPY_TICKS_ALL", 0))
-        ticks = mt5.copy_ticks_range(symbol, start_utc - offset, end_utc - offset, flags)
+        request_start = start_utc - offset
+        request_end = end_utc - offset
+        info_flags = _constant(
+            mt5,
+            "COPY_TICKS_INFO",
+            _constant(mt5, "COPY_TICKS_ALL", 0),
+        )
+        all_flags = _constant(mt5, "COPY_TICKS_ALL", info_flags)
+
+        ticks = mt5.copy_ticks_range(
+            symbol,
+            request_start,
+            request_end,
+            info_flags,
+        )
+        initial_error: Any | None = None
+        retry_error: Any | None = None
+        fallback_error: Any | None = None
+        prime_count: int | None = None
+
         if ticks is None:
-            self._mark_disconnected()
-            raise Mt5Error(f"MT5 copy_ticks_range failed for {symbol}: {mt5.last_error()}")
+            initial_error = mt5.last_error()
+            copy_ticks_from = getattr(mt5, "copy_ticks_from", None)
+
+            if copy_ticks_from is not None:
+                prime = copy_ticks_from(
+                    symbol,
+                    request_start,
+                    1_000,
+                    all_flags,
+                )
+                if prime is not None:
+                    prime_count = len(prime)
+
+            ticks = mt5.copy_ticks_range(
+                symbol,
+                request_start,
+                request_end,
+                info_flags,
+            )
+
+            if ticks is None:
+                retry_error = mt5.last_error()
+                ticks, fallback_error = self._copy_ticks_from_window(
+                    symbol=symbol,
+                    start=request_start,
+                    end=request_end,
+                    flags=info_flags,
+                )
+
+            if ticks is None:
+                self._mark_disconnected()
+                raise Mt5Error(
+                    "MT5 historical tick request failed after synchronization "
+                    f"for {symbol} "
+                    f"{start_utc.isoformat()} -> {end_utc.isoformat()}; "
+                    f"initial_error={initial_error}; "
+                    f"retry_error={retry_error}; "
+                    f"fallback_error={fallback_error}; "
+                    f"prime_count={prime_count}"
+                )
+
         frame = pd.DataFrame(ticks)
         if frame.empty:
             return pd.DataFrame(columns=["timestamp", "instrument", "bid", "ask"])
         if "time_msc" in frame.columns:
-            raw_time = pd.to_numeric(frame["time_msc"], errors="coerce") + self.settings.time_offset_seconds * 1000
+            raw_time = (
+                pd.to_numeric(frame["time_msc"], errors="coerce")
+                + self.settings.time_offset_seconds * 1000
+            )
             frame["timestamp"] = pd.to_datetime(raw_time, unit="ms", utc=True)
         else:
-            raw_time = pd.to_numeric(frame["time"], errors="coerce") + self.settings.time_offset_seconds
+            raw_time = (
+                pd.to_numeric(frame["time"], errors="coerce")
+                + self.settings.time_offset_seconds
+            )
             frame["timestamp"] = pd.to_datetime(raw_time, unit="s", utc=True)
         frame["bid"] = pd.to_numeric(frame.get("bid"), errors="coerce")
         frame["ask"] = pd.to_numeric(frame.get("ask"), errors="coerce")
@@ -226,11 +329,102 @@ class Mt5Client:
             ["timestamp", "instrument", "bid", "ask"]
         ]
         result = result[(result["bid"] > 0) & (result["ask"] > result["bid"])]
-        result = result.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
+        result = result.sort_values("timestamp").drop_duplicates(
+            subset=["timestamp"],
+            keep="last",
+        )
         return result.loc[
             (result["timestamp"] >= pd.Timestamp(start_utc))
             & (result["timestamp"] <= pd.Timestamp(end_utc))
         ].reset_index(drop=True)
+
+    def _copy_ticks_from_window(
+        self,
+        *,
+        symbol: str,
+        start: datetime,
+        end: datetime,
+        flags: int,
+        batch_size: int = 50_000,
+        max_batches: int = 32,
+    ) -> tuple[pd.DataFrame | None, Any | None]:
+        """Bounded fallback for MT5 terminals that reject old range requests."""
+
+        mt5 = self._module()
+        copy_ticks_from = getattr(mt5, "copy_ticks_from", None)
+        if copy_ticks_from is None:
+            return None, "copy_ticks_from unavailable"
+
+        cursor = start
+        frames: list[pd.DataFrame] = []
+
+        for _ in range(max_batches):
+            batch = copy_ticks_from(symbol, cursor, batch_size, flags)
+            if batch is None:
+                return None, mt5.last_error()
+
+            frame = pd.DataFrame(batch)
+            if frame.empty:
+                break
+
+            if "time_msc" in frame.columns:
+                raw = pd.to_numeric(frame["time_msc"], errors="coerce")
+                valid = raw.dropna()
+                if valid.empty:
+                    return None, "copy_ticks_from returned no valid time_msc values"
+                raw_times = pd.to_datetime(raw, unit="ms", utc=True)
+                last_raw = int(valid.iloc[-1])
+                last_time = datetime.fromtimestamp(last_raw / 1000, tz=timezone.utc)
+                next_cursor = datetime.fromtimestamp(
+                    (last_raw + 1) / 1000,
+                    tz=timezone.utc,
+                )
+            elif "time" in frame.columns:
+                raw = pd.to_numeric(frame["time"], errors="coerce")
+                valid = raw.dropna()
+                if valid.empty:
+                    return None, "copy_ticks_from returned no valid time values"
+                raw_times = pd.to_datetime(raw, unit="s", utc=True)
+                last_raw = int(valid.iloc[-1])
+                last_time = datetime.fromtimestamp(last_raw, tz=timezone.utc)
+                next_cursor = last_time + timedelta(seconds=1)
+            else:
+                return None, "copy_ticks_from returned ticks without time/time_msc"
+
+            mask = (
+                (raw_times >= pd.Timestamp(start))
+                & (raw_times <= pd.Timestamp(end))
+            )
+            selected = frame.loc[mask]
+            if not selected.empty:
+                frames.append(selected)
+
+            if last_time >= end:
+                break
+            if next_cursor <= cursor:
+                return None, "copy_ticks_from pagination did not advance"
+            cursor = next_cursor
+        else:
+            return None, (
+                "copy_ticks_from exceeded bounded pagination "
+                f"({max_batches} batches x {batch_size} ticks)"
+            )
+
+        if not frames:
+            return pd.DataFrame(), None
+
+        combined = pd.concat(frames, ignore_index=True)
+        dedupe_columns = [
+            column
+            for column in ("time_msc", "time", "bid", "ask")
+            if column in combined.columns
+        ]
+        if dedupe_columns:
+            combined = combined.drop_duplicates(
+                subset=dedupe_columns,
+                keep="last",
+            )
+        return combined.reset_index(drop=True), None
 
     def open_positions(self) -> list[dict[str, Any]]:
         self._ensure_connected()
