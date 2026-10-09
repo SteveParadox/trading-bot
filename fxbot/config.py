@@ -560,6 +560,7 @@ class ExitAiSettings:
     metadata_path: str = ""
     verify_hash: bool = True
     evaluation_interval_seconds: int = 60
+    registry_path: str = "data/models/registry"
 
     def __post_init__(self) -> None:
         mode = self.mode.lower().strip()
@@ -815,6 +816,7 @@ def settings_from_env() -> FxBotSettings:
             metadata_path=_get_str("FX_EXIT_MODEL_METADATA_PATH", ""),
             verify_hash=_get_bool("FX_EXIT_VERIFY_MODEL_HASH", True),
             evaluation_interval_seconds=_get_int("FX_EXIT_EVALUATION_INTERVAL_SECONDS", 60),
+            registry_path=_get_str("FX_MODEL_REGISTRY_PATH", "data/models/registry"),
         ),
         ml_prediction=MlPredictionSettings(
             mode=_get_str("FX_ML_PREDICTION_MODE", "off"),
