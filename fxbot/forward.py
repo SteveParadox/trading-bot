@@ -803,12 +803,26 @@ class ForwardTestWorker:
                 )
         except Exception as exc:
             prediction = NumericalPrediction(status="error", error=type(exc).__name__)
+        entry_prediction_trace = {
+            "prediction_id": uuid4().hex,
+            "decision_timestamp": now.isoformat(),
+            "candidate_id": candidate_id,
+            "model_version": prediction.model_version,
+            "feature_version": prediction.feature_version,
+            "prompt_version": None,  # Pure numerical inference is not LLM prompting.
+            "strategy_version": self.strategy_hash,
+            "model_sha256": prediction.model_hash,
+            "feature_sha256": prediction.feature_hash,
+            "code_version": self.code_version,
+            "ai_mode": self.settings.ml_prediction.mode,
+        }
         try:
             self.journal.update_candidate(
                 candidate_id,
                 payload_update={
                     "prediction_market_snapshot": prediction_snapshot,
                     "numerical_prediction": prediction.to_dict(),
+                    "ml_prediction_trace": entry_prediction_trace,
                 },
             )
             if self.settings.ml_prediction.mode != "off":
@@ -818,6 +832,7 @@ class ForwardTestWorker:
                     payload={
                         "candidate_id": candidate_id,
                         "prediction": prediction.to_dict(),
+                        "version_trace": entry_prediction_trace,
                     },
                 )
         except Exception as exc:
