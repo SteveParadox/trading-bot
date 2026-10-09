@@ -1317,11 +1317,13 @@ class ForwardTestWorker:
         except Mt5Error as exc:
             self.journal.log_event("open_trade_sync_failed", str(exc), level="warning")
             return
+        active_trade_tickets: set[str] = set()
         for trade in trades:
             trade_id = str(trade.get("id") or "")
             instrument_name = str(trade.get("instrument") or "").upper()
             if not trade_id or not instrument_name:
                 continue
+            active_trade_tickets.add(trade_id)
             units = _safe_float(trade.get("currentUnits") or trade.get("initialUnits"))
             side = Side.LONG if units >= 0 else Side.SHORT
             instrument = instruments.get(instrument_name)
@@ -1366,6 +1368,11 @@ class ForwardTestWorker:
                 units=abs(units),
                 payload={**trade, "source": "mt5_reconciliation"},
             )
+        # Bound per-worker throttle bookkeeping to positions still held.
+        self._exit_last_observed = {
+            ticket: observed_at for ticket, observed_at in self._exit_last_observed.items()
+            if ticket in active_trade_tickets
+        }
 
     def _observe_exit_shadow(
         self,
