@@ -125,8 +125,8 @@ class ModelRegistry:
             store = self._read()
             existing = store["models"].get(model_id)
             if existing is not None:
-                if {k: v for k, v in existing.items() if k != "status"} != {
-                    k: v for k, v in record.items() if k != "status"
+                if {k: v for k, v in existing.items() if k not in {"status", "registered_at"}} != {
+                    k: v for k, v in record.items() if k not in {"status", "registered_at"}
                 }:
                     raise RegistryError("immutable model identity is already registered")
                 return existing
