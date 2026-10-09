@@ -1359,9 +1359,9 @@ class ForwardTestWorker:
                 if not closing:
                     self._maybe_move_stop_to_breakeven(trade, instrument, price)
                     self._maybe_update_trailing_stop(trade, instrument, price)
-                # Exit AI observes after deterministic protective management.
-                # It has no reference to the MT5 client and cannot place orders.
-                self._observe_exit_shadow(now, trade, instrument, price)
+                    # Never sample a position for AI after a sniper close attempt.
+                    # AI observations cannot interfere with deterministic exits.
+                    self._observe_exit_shadow(now, trade, instrument, price)
             self.journal.upsert_trade(
                 broker_trade_id=trade_id,
                 instrument=instrument_name,
