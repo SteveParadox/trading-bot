@@ -216,5 +216,10 @@ class ModelRegistry:
             "models": [{key: value for key, value in row.items()
                         if key not in {"model_path", "metadata_path"}}
                        for row in store["models"].values()],
-            "history": list(store["history"]),
+            # Approval evidence may contain private review URLs/notes;
+            # never expose it through the read-only monitoring API.
+            "history": [
+                {key: event.get(key) for key in ("at", "event", "model_id", "previous") if key in event}
+                for event in store["history"]
+            ],
         }
