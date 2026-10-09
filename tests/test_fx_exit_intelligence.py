@@ -160,3 +160,46 @@ def test_exit_model_paths_are_private_in_config_api():
     serialised = json.dumps(result)
     assert "/private/" not in serialised
     assert "exit.metadata.json" not in serialised
+
+
+def test_worker_shadow_observation_does_not_touch_broker():
+    from unittest.mock import Mock
+    from fxbot.forward import ForwardTestWorker
+    from fxbot.config import FxBotSettings
+    now, trade, quote, instrument = _inputs()
+    journal = Mock()
+    journal.find_trade.return_value = None
+    broker = Mock()
+    worker = SimpleNamespace(
+        settings=FxBotSettings(exit_ai=ExitAiSettings(mode="shadow")),
+        strategy_hash="strategy-v1",
+        code_version="code-v1",
+        journal=journal,
+        client=broker,
+        exit_predictor=ExitPredictionService(),
+        _exit_last_observed={},
+    )
+    ForwardTestWorker._observe_exit_shadow(worker, now, trade, instrument, quote)
+    assert journal.log_event.call_count == 1
+    assert journal.log_event.call_args.args[0] == "exit_ai_observation"
+    payload = journal.log_event.call_args.kwargs["payload"]
+    assert payload["execution_attempted"] is False
+    assert payload["prediction"]["decision"] is None
+    assert payload["prediction"]["status"] == "unavailable"
+    broker.close_position.assert_not_called()
+    broker.set_trade_dependent_orders.assert_not_called()
+    ForwardTestWorker._observe_exit_shadow(worker, now + timedelta(seconds=1), trade, instrument, quote)
+    assert journal.log_event.call_count == 1
+
+
+def test_worker_exit_off_preserves_old_path_without_observation():
+    from unittest.mock import Mock
+    from fxbot.forward import ForwardTestWorker
+    from fxbot.config import FxBotSettings
+    now, trade, quote, instrument = _inputs()
+    worker = SimpleNamespace(
+        settings=FxBotSettings(exit_ai=ExitAiSettings(mode="off")),
+        journal=Mock(),
+    )
+    ForwardTestWorker._observe_exit_shadow(worker, now, trade, instrument, quote)
+    worker.journal.log_event.assert_not_called()
