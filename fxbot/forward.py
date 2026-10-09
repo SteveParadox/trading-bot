@@ -1374,7 +1374,7 @@ class ForwardTestWorker:
         instrument: FxInstrument,
         price: PriceSnapshot,
     ) -> None:
-        if self.settings.exit_ai.mode == "off":
+        if self.settings.exit_ai.mode == "off" or not self.settings.broker.demo_only:
             return
         ticket = str(trade.get("id") or "")
         if not ticket:
