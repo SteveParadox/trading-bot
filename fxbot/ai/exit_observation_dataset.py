@@ -14,6 +14,7 @@ import csv
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import math
 from pathlib import Path
 import tempfile
 from typing import Any, Iterable
@@ -64,9 +65,11 @@ def build_observed_exit_rows(
             quote_at = _utc(snapshot["quote_timestamp"])
             if quote_at > captured_at or (captured_at - quote_at).total_seconds() > 120:
                 continue
+            pip = float(snapshot["pip_size"])
+            mark = float(snapshot["liquidation_price"])
             if (snapshot.get("direction") not in {"BUY", "SELL"}
-                    or float(snapshot["pip_size"]) <= 0
-                    or not 0 < float(snapshot["liquidation_price"])):
+                    or not math.isfinite(pip) or pip <= 0
+                    or not math.isfinite(mark) or mark <= 0):
                 continue
             exit_features(snapshot)  # Reject malformed decision-time feature inputs.
             ticket = str(snapshot.get("position_id") or "")
@@ -110,7 +113,11 @@ def build_observed_exit_rows(
                         continue
                     if (future_at - required).total_seconds() > max_lag_seconds:
                         break
-                    if future_quote_at <= quote_at:
+                    # The actual quote, not merely scan time, must have been
+                    # observed at or after the horizon and within its lag budget.
+                    if (future_quote_at < required
+                            or (future_quote_at - required).total_seconds() > max_lag_seconds
+                            or future_quote_at <= quote_at):
                         continue
                     if (future.get("direction") != snapshot.get("direction")
                             or future.get("entry_timestamp") != snapshot.get("entry_timestamp")
@@ -121,7 +128,7 @@ def build_observed_exit_rows(
                     future_mark = float(future["liquidation_price"])
                     sign = 1 if snapshot["direction"] == "BUY" else -1
                     record[target] = sign * (future_mark - base_mark) / float(snapshot["pip_size"])
-                    last_target_at = future_at if last_target_at is None else max(last_target_at, future_at)
+                    last_target_at = future_quote_at if last_target_at is None else max(last_target_at, future_quote_at)
                     break
             record["label_end_timestamp"] = last_target_at.isoformat() if last_target_at else None
             rows.append(record)
