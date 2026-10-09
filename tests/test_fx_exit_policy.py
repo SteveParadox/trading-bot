@@ -56,7 +56,8 @@ def test_hold_does_not_change_position_and_defensive_exit_not_auto_approved():
     snapshot, prediction = _sample("HOLD")
     result = _evaluate(snapshot, prediction)
     assert result.eligible and result.suggested_stop is None and result.reduction_volume is None
-    _, defensive = _sample("EXIT")
+    from dataclasses import replace
+    defensive = replace(prediction, decision="EXIT")
     assert _evaluate(snapshot, defensive).reason == "defensive_exit_not_validated"
 
 
