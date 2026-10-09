@@ -811,7 +811,7 @@ def settings_from_env() -> FxBotSettings:
             max_price_age_seconds=_get_int("FX_MAX_PRICE_AGE_SECONDS", 120),
         ),
         exit_ai=ExitAiSettings(
-            mode=_get_str("FX_EXIT_AI_MODE", "shadow"),
+            mode=_get_str("FX_EXIT_AI_MODE", "shadow" if demo_only else "off"),
             model_path=_get_str("FX_EXIT_MODEL_PATH", ""),
             metadata_path=_get_str("FX_EXIT_MODEL_METADATA_PATH", ""),
             verify_hash=_get_bool("FX_EXIT_VERIFY_MODEL_HASH", True),
