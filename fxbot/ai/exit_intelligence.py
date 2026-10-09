@@ -148,6 +148,7 @@ def build_exit_snapshot(
         "entry_timestamp": opened.isoformat(),
         "entry_price": entry,
         "units": units,
+        "pip_size": pip_size,
         "liquidation_price": liquidation,
         "bid": bid,
         "ask": ask,
