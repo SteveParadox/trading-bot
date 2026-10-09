@@ -18,6 +18,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from fxbot.ai_evaluation import AiEvaluationConfig, ai_value_report
+from fxbot.ai.model_registry import ModelRegistry
 from fxbot.analytics import live_snapshot, performance_summary
 from fxbot.config import FxBotSettings, ensure_runtime_dirs, settings_from_env
 from fxbot.forward import ForwardTestWorker
@@ -225,6 +226,31 @@ def create_app(settings: FxBotSettings | None = None) -> FastAPI:
             "worker_task_running": bool(controller.task and not controller.task.done()),
             "demo_only": resolved_settings.broker.demo_only,
             "live_release_approved": resolved_settings.runtime.live_release_approved,
+        }
+
+    @app.get("/api/exit-ai", dependencies=[Depends(require_api_key)])
+    def exit_ai_status(
+        limit: int = Query(default=25, ge=1, le=100),
+    ) -> dict[str, Any]:
+        """Read-only, authenticated shadow observations and registry metadata."""
+        events = [
+            row_to_dict(row)
+            for row in journal.recent_events(limit=1000)
+            if row.event_type in {"exit_ai_observation", "exit_ai_observation_failed"}
+        ][:limit]
+        try:
+            registry = ModelRegistry(resolved_settings.exit_ai.registry_path).status()
+        except (OSError, ValueError, RuntimeError) as exc:
+            registry = {"status": "unavailable", "error": type(exc).__name__}
+        return {
+            "mode": resolved_settings.exit_ai.mode,
+            "execution_enabled": False,
+            "model_configured": bool(resolved_settings.exit_ai.model_path),
+            "model_integrity_check": resolved_settings.exit_ai.verify_hash,
+            "feature_version": "exit-v1",
+            "evaluation_interval_seconds": resolved_settings.exit_ai.evaluation_interval_seconds,
+            "registry": registry,
+            "recent_observations": events,
         }
 
     @app.get("/api/positions", dependencies=[Depends(require_api_key)])
