@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import math
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
@@ -566,7 +566,8 @@ class ExitAiSettings:
         mode = self.mode.lower().strip()
         if mode not in {"off", "shadow"}:
             raise ValueError("exit AI currently supports only off/shadow; advisory broker actions are not approved")
-        if self.evaluation_interval_seconds < 1:
+        if (not isinstance(self.evaluation_interval_seconds, int)
+                or not 1 <= self.evaluation_interval_seconds <= 86400):
             raise ValueError("exit AI evaluation interval must be positive")
         if bool(self.model_path) != bool(self.metadata_path):
             raise ValueError("exit model path and metadata path must both be configured")
@@ -673,6 +674,8 @@ class FxBotSettings:
     exit_ai: ExitAiSettings = field(default_factory=ExitAiSettings)
 
     def __post_init__(self) -> None:
+        if not self.broker.demo_only and self.exit_ai.mode != "off":
+            object.__setattr__(self, "exit_ai", replace(self.exit_ai, mode="off"))
         if self.ml_prediction.mode != "off" and not self.broker.demo_only:
             raise ValueError("ML candidate artifacts are demo/research-only; live promotion is not implemented")
         # Provider precedence must match build_news_gateway. An opt-in FF flag

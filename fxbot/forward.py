@@ -51,6 +51,7 @@ from fxbot.ai_contract import AiTradeDecision
 from fxbot.ai.predictor import PredictionService, TradePredictor
 from fxbot.ai.schemas import NumericalPrediction, PredictionRequest
 from fxbot.ai.exit_intelligence import ExitPredictionService, build_exit_snapshot
+from fxbot.ai.exit_observer import ExitObservationQueue
 from fxbot.market_snapshot import build_market_snapshot, build_news_context
 from fxbot.outcome_tracker import CandidateOutcomeTracker
 from fxbot.operations import clock_health
@@ -108,6 +109,7 @@ class ForwardTestWorker:
             verify_hash=self.settings.exit_ai.verify_hash,
         )
         self._exit_last_observed: dict[str, datetime] = {}
+        self._exit_observer = ExitObservationQueue(self._observe_exit_shadow)
         # Feed SQLite lock retries into the operational monitor.
         monitor_ref = self.monitor
         set_lock_retry_callback(monitor_ref.record_db_lock_retry)
@@ -182,6 +184,7 @@ class ForwardTestWorker:
         self._stop.set()
 
     def close(self) -> None:
+        self._exit_observer.close()
         shutdown = getattr(self.client, "shutdown", None)
         if shutdown is not None:
             shutdown()
@@ -234,9 +237,23 @@ class ForwardTestWorker:
             self.monitor.record_clock_health(clock_health(
                 now, max(price.time for price in prices.prices.values()), max_skew_seconds=300.0))
         self._sync_trade_history(now)
-        self._sync_open_trades(now, instruments, fresh_prices, prices.conversion_rates)
+        exit_observations = self._sync_open_trades(now, instruments, fresh_prices, prices.conversion_rates)
         news_snapshot = self.news.ensure_current(now)
         self._protect_positions_for_news(now, instruments, fresh_prices, news_snapshot.events)
+        # All deterministic position protection completes before optional work.
+        # During protective-news windows, skip pre-protection broker snapshots.
+        if self.settings.exit_ai.mode == "shadow" and self.settings.broker.demo_only:
+            for trade, instrument, price in exit_observations if isinstance(exit_observations, list) else []:
+                if (self.settings.strategy.news_risk_action != "block_entries"
+                        and news_blackout_reason(instrument.name, news_snapshot.events, now,
+                            self.settings.strategy.news_blackout_before_minutes,
+                            self.settings.strategy.news_blackout_after_minutes,
+                            impact_score_min=self.settings.strategy.news_blackout_impact_score_min)):
+                    continue
+                try:
+                    self._exit_observer.submit(str(trade["id"]), (now, trade, instrument, price))
+                except Exception:
+                    log.exception("optional exit observation dispatch failed")
         # Never size new risk from incomplete/stale portfolio marks. Protection
         # above still runs for positions with a usable quote.
         if not prices_ready or set(self.settings.instruments) - fresh_prices.keys():
@@ -808,13 +825,19 @@ class ForwardTestWorker:
             "decision_timestamp": now.isoformat(),
             "candidate_id": candidate_id,
             "model_version": prediction.model_version,
+            "model_name": prediction.model_name,
             "feature_version": prediction.feature_version,
+            "feature_builder_version": prediction.feature_version,
             "prompt_version": None,  # Pure numerical inference is not LLM prompting.
             "strategy_version": self.strategy_hash,
             "model_sha256": prediction.model_hash,
             "feature_sha256": prediction.feature_hash,
             "code_version": self.code_version,
             "ai_mode": self.settings.ml_prediction.mode,
+            "entry_timing_model_version": prediction.entry_model_version,
+            "entry_timing_model_sha256": prediction.entry_model_hash,
+            "auxiliary_models": prediction.auxiliary_models,
+            "inference_status": prediction.status,
         }
         try:
             self.journal.update_candidate(
@@ -1326,19 +1349,18 @@ class ForwardTestWorker:
         instruments: dict[str, FxInstrument],
         prices: dict[str, PriceSnapshot],
         conversions: dict[str, float],
-    ) -> None:
+    ) -> list[tuple[dict[str, Any], FxInstrument, PriceSnapshot]] | None:
         try:
             trades = self.client.open_trades()
         except Mt5Error as exc:
             self.journal.log_event("open_trade_sync_failed", str(exc), level="warning")
             return
-        active_trade_tickets: set[str] = set()
+        exit_observations = []
         for trade in trades:
             trade_id = str(trade.get("id") or "")
             instrument_name = str(trade.get("instrument") or "").upper()
             if not trade_id or not instrument_name:
                 continue
-            active_trade_tickets.add(trade_id)
             units = _safe_float(trade.get("currentUnits") or trade.get("initialUnits"))
             side = Side.LONG if units >= 0 else Side.SHORT
             instrument = instruments.get(instrument_name)
@@ -1361,7 +1383,8 @@ class ForwardTestWorker:
                     self._maybe_update_trailing_stop(trade, instrument, price)
                     # Never sample a position for AI after a sniper close attempt.
                     # AI observations cannot interfere with deterministic exits.
-                    self._observe_exit_shadow(now, trade, instrument, price)
+                    if self.settings.exit_ai.mode == "shadow" and self.settings.broker.demo_only:
+                        exit_observations.append((trade.copy(), instrument, price))
             self.journal.upsert_trade(
                 broker_trade_id=trade_id,
                 instrument=instrument_name,
@@ -1383,11 +1406,7 @@ class ForwardTestWorker:
                 units=abs(units),
                 payload={**trade, "source": "mt5_reconciliation"},
             )
-        # Bound per-worker throttle bookkeeping to positions still held.
-        self._exit_last_observed = {
-            ticket: observed_at for ticket, observed_at in self._exit_last_observed.items()
-            if ticket in active_trade_tickets
-        }
+        return exit_observations
 
     def _observe_exit_shadow(
         self,
@@ -1401,18 +1420,37 @@ class ForwardTestWorker:
         ticket = str(trade.get("id") or "")
         if not ticket:
             return
-        last = self._exit_last_observed.get(ticket)
+        # Throttle distinct lifetimes rather than recycled broker tickets.
+        key = f"{ticket}:{trade.get('openTime')}:{trade.get('price')}:{_safe_float(trade.get('currentUnits')) > 0}"
+        last = self._exit_last_observed.get(key)
         if last is not None and (now - last).total_seconds() < self.settings.exit_ai.evaluation_interval_seconds:
             return
+        # Failed observations are throttled too; a DB outage must not flood logs.
+        self._exit_last_observed[key] = now
+        if len(self._exit_last_observed) > 512:
+            del self._exit_last_observed[min(self._exit_last_observed, key=self._exit_last_observed.get)]
         try:
             recorded = self.journal.find_trade(ticket)
+            recorded_payload = recorded.payload if recorded is not None else {}
+            # Reused tickets/netting entry changes must not inherit old candidate
+            # context or retrospective excursion samples from another lifetime.
+            if recorded is not None and (
+                    _safe_float(recorded.entry_price) != _safe_float(trade.get("price"))
+                    or _parse_broker_time(recorded.entry_time) != _parse_broker_time(trade.get("openTime"))):
+                recorded_payload = {}
+            context = (recorded_payload or {}).get("strategy_context") or {}
             snapshot = build_exit_snapshot(
                 trade, price, instrument, now,
-                recorded_payload=(recorded.payload if recorded is not None else {}),
-                strategy_version=self.strategy_hash,
+                recorded_payload=recorded_payload,
+                strategy_version=(context.get("strategy_hash") or getattr(recorded, "strategy_hash", None))
+                    if context.get("candidate_id") else None,
+                maximum_quote_age_seconds=self.settings.runtime.max_price_age_seconds,
             )
             prediction = self.exit_predictor.predict(snapshot)
-            # Journal first; never mark an observation successful before it is durable.
+            observer = getattr(self, "_exit_observer", None)
+            if observer is not None and observer.closed:
+                return
+            # This is a historical capture, never a claim the position is still open.
             self.journal.log_event(
                 "exit_ai_observation",
                 f"Shadow exit evaluation of {ticket}",
@@ -1420,13 +1458,15 @@ class ForwardTestWorker:
                     "mode": "shadow",
                     "applied_action": None,
                     "execution_attempted": False,
+                    "policy_result": "advisory_execution_not_released",
+                    "execution_result": "not_attempted",
                     "snapshot": snapshot,
                     "prediction": prediction.to_dict(),
                     "strategy_version": self.strategy_hash,
+                    "position_state": "historical_capture_not_revalidated_for_execution",
                     "code_version": self.code_version,
                 },
             )
-            self._exit_last_observed[ticket] = now
         except Exception as exc:
             # Failure to observe an optional ML suggestion must not interrupt
             # reconciliation or established stop/exit management.
@@ -1610,6 +1650,8 @@ class ForwardTestWorker:
                     "signal_features": intent.metadata.get("score_details", {}),
                     "entry_price_source": intent.metadata.get("entry_price_source"),
                     "candidate_id": intent.metadata.get("candidate_id"),
+                    "strategy_hash": self.strategy_hash,
+                    "code_version": self.code_version,
                     "account_currency": (
                         ((intent.metadata.get("market_snapshot") or {}).get("current_exposure") or {}).get("account_currency")
                     ),

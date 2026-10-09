@@ -8,6 +8,7 @@ training is held until decision-level counterfactual labels are trustworthy.
 from __future__ import annotations
 
 import argparse
+import hashlib
 from datetime import datetime, timezone
 import json
 import os
@@ -20,20 +21,18 @@ from fxbot.ai.model_registry import ModelRegistry, RegistryError, exclusive_file
 
 def _atomic_json(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", prefix=".run-",
-                                     encoding="utf-8", dir=path.parent, delete=False) as handle:
-        name = Path(handle.name)
-        try:
+    name = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", prefix=".run-",
+                                         encoding="utf-8", dir=path.parent, delete=False) as handle:
+            name = Path(handle.name)
             json.dump(data, handle, indent=2, sort_keys=True, allow_nan=False)
             handle.flush()
             os.fsync(handle.fileno())
-        except Exception:
-            name.unlink(missing_ok=True)
-            raise
-    try:
         os.replace(name, path)
     finally:
-        name.unlink(missing_ok=True)
+        if name is not None:
+            name.unlink(missing_ok=True)
 
 
 def train_challenger(
@@ -53,8 +52,8 @@ def train_challenger(
         raise ValueError("min_new_samples must be positive")
     # Optional heavy imports stay out of live worker startup.
     import pandas as pd
-    from fxbot.baseline_model import XGBoostBaselineConfig, train_xgboost_baseline
-    from fxbot.chronological_split import ChronologicalSplitConfig
+    from fxbot.baseline_model import XGBoostBaselineConfig, train_xgboost_baseline, _target_ready
+    from fxbot.chronological_split import ChronologicalSplitConfig, chronological_split
     from fxbot.training_dataset import FEATURE_COLUMNS
 
     artifacts_root.mkdir(parents=True, exist_ok=True)
@@ -65,15 +64,41 @@ def train_challenger(
         missing = required - set(frame)
         if missing:
             raise ValueError(f"required dataset columns missing: {sorted(missing)}")
-        if frame.empty or frame["candidate_id"].isna().any() or frame["candidate_id"].duplicated().any():
+        if (frame.empty or frame["candidate_id"].isna().any()
+                or frame["candidate_id"].astype(str).str.strip().eq("").any()
+                or frame["candidate_id"].astype(str).duplicated().any()):
             raise ValueError("dataset is empty or contains duplicate/invalid candidate IDs")
+        XGBoostBaselineConfig(target=target).validate()
+        numeric_targets = pd.to_numeric(frame[target], errors="coerce")
+        if (frame[target].notna() & ~numeric_targets.isin([0, 1])).any():
+            raise ValueError("invalid binary target values")
+        if "label_end_timestamp" not in frame:
+            raise ValueError("label_end_timestamp required to verify causal coverage")
         timestamps = pd.to_datetime(frame["timestamp"], utc=True, errors="raise")
         if timestamps.isna().any():
             raise ValueError("dataset timestamp missing")
+        ends = pd.to_datetime(frame["label_end_timestamp"], utc=True, errors="coerce")
+        frame = frame.loc[ends.notna() & (ends >= timestamps)].copy()
+        split = ChronologicalSplitConfig(train_start=train_start,
+                                          validation_start=validation_start,
+                                          test_start=test_start,
+                                          forward_start=forward_start)
+        splits = chronological_split(frame, config=split)
+        train = _target_ready(splits.train, target)
+        # Count only rows eligible to fit, including late-completing labels at
+        # old timestamps. Holdouts and incomplete outcomes cannot trigger a run.
+        fingerprints = {
+            str(row["candidate_id"]): hashlib.sha256(
+                row[["candidate_id", "timestamp", "label_end_timestamp", target, *FEATURE_COLUMNS]]
+                .to_json().encode()).hexdigest()
+            for _, row in train.iterrows()
+        }
         state_path = artifacts_root / "retraining_state.json"
         state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
-        last_timestamp = state.get("last_timestamp")
-        count_new = int((timestamps > pd.Timestamp(last_timestamp)).sum()) if last_timestamp else len(frame)
+        if not isinstance(state, dict) or not isinstance(state.get("fit_samples", {}), dict):
+            raise ValueError("invalid retraining state")
+        previous = state.get("fit_samples", {}) if state.get("target") == target else {}
+        count_new = sum(previous.get(key) != digest for key, digest in fingerprints.items())
         if count_new < min_new_samples:
             raise ValueError(f"only {count_new} new records, requires {min_new_samples}")
         now = datetime.now(timezone.utc)
@@ -82,10 +107,6 @@ def train_challenger(
         destination = artifacts_root / run_id
         moved = False
         try:
-            split = ChronologicalSplitConfig(train_start=train_start,
-                                              validation_start=validation_start,
-                                              test_start=test_start,
-                                              forward_start=forward_start)
             artifacts = train_xgboost_baseline(
                 frame, stage,
                 split_config=split,
@@ -111,6 +132,7 @@ def train_challenger(
                 "run_id": run_id,
                 "candidate_model_id": record["model_id"],
                 "new_records": count_new,
+                "new_records_basis": "eligible_train_rows_only",
                 "validation_metrics": artifacts.validation_metrics,
                 "test_metrics": artifacts.test_metrics,
                 "champion_comparison": "not_evaluated",
@@ -121,6 +143,8 @@ def train_challenger(
             # Advance only after a candidate was durably registered.
             _atomic_json(state_path, {
                 "last_timestamp": timestamps.max().isoformat(),
+                "target": target,
+                "fit_samples": fingerprints,
                 "last_run_id": run_id,
                 "dataset_path": str(dataset),
             })

@@ -19,9 +19,12 @@ MT5 entry -> `_sync_open_trades` -> sniper failure/time exits -> breakeven and
 ATR trailing stop -> broker close/history reconciliation -> trade journal and
 candidate outcome tracker.
 
-This change adds an observation **after** the existing deterministic protection
-functions in `_sync_open_trades`. That observation runs in a try/catch
-boundary and has no reference to the MT5 order adapter. Unavailable models and
+The worker collects historical captures after deterministic stop management,
+finishes news protection, then submits optional observations to a single daemon
+worker with a bounded queue (64 waiting captures, one in progress). Queue
+submission does not wait for inference or SQL. Positions inside a protective
+news blackout are skipped because their pre-news broker state may have changed.
+The observer has no broker execution path. Unavailable models and
 storage errors cannot authorize an exit or suppress the existing position
 manager. `FX_EXIT_AI_MODE=off` returns to original behavior. Existing entry
 AI / ML and live trading modes are untouched.
@@ -37,8 +40,9 @@ AI / ML and live trading modes are untouched.
   unverified net profit, stop widening, missing broker lot sizes, and unapproved
   defensive exits. An actual advisory execution coordinator is **not wired**.
 - `fxbot/forward.py`: journal `exit_ai_observation` (or a failure event)
-  through the existing SQL + JSONL event infrastructure, at most once per
-  configured evaluation interval per position per worker process.
+  through the existing SQL + JSONL event infrastructure, throttled per
+  configured evaluation interval per position lifetime per worker process,
+  including failed attempts. Throttle state is capped at 512 lifetimes.
 - `fxbot/ai/model_registry.py`: append-only audit history in an atomically
   replaced JSON manifest, immutable model identifiers, SHA-256 checks, explicit
   reviewer approval, candidate versus active metadata pointers and rollback.
@@ -62,9 +66,13 @@ decision/outcome table remains future work for high-volume studies.
 
 At observation time the worker uses a fresh executable quote (bid to
 liquidate a BUY, ask to liquidate a SELL), the broker position ticket,
-opening time/price, direction, signed broker units, SL/TP, holding time,
+opening time/price, direction, signed broker units (separate from MT5 lots), current SL/TP, holding time,
 unrealized broker P&L, and past sampled MFE/MAE where available. These
 excursions are **sampling lower bounds**, not full intratrade tick paths.
+Missing or noncausal historical telemetry leaves MFE/MAE/drawdown nullable with
+`excursion_quality=historical_excursions_unavailable`. Manual and recovered
+positions are not assigned invented excursions or strategy identities. Initial
+stops are reported separately only when preserved entry context supplies them.
 Unsupported news/ATR/RSI/momentum/partial-close fields remain null and cannot
 be silently filled from future market observations.
 
@@ -75,7 +83,7 @@ TAKE_PROFIT_NOW policy therefore rejects that action rather than inventing
 profitable fills.
 
 A trained exit artifact would need: `target=EXIT_ACTION`,
-`feature_builder_version=exit-v1`, the precise
+`feature_builder_version=exit-v2`, the precise
 `EXIT_FEATURE_COLUMNS` in source order, the complete five-class
 `EXIT_ACTIONS` order, `model_version`, and `model_sha256`. No trustworthy
 exit training artifact is bundled and no strategy backtest performance claims
@@ -114,7 +122,9 @@ The CSV has separate audit identifiers, strictly decision-time exit features,
 and nullable future targets `observed_mark_return_60s_pips`,
 `observed_mark_return_180s_pips`, and
 `observed_mark_return_300s_pips`. It also writes a dataset manifest with
-SHA-256 and horizon coverage. Labels are derived only when the broker quote
+SHA-256 and horizon coverage (`exit-observed-v2`). Base quote age must also
+fit within the exporter lag budget. Changed entry prices and recycled tickets
+are separated by position lifetime; duplicate conflicts resolve deterministically. Labels are derived only when the broker quote
 timestamp is at or after the requested horizon and within the allowed lag.
 Missing observations, reopened tickets, stale quotes, or insufficient coverage
 produce unknown targets instead of fabricated prices.
@@ -144,7 +154,12 @@ having usable examples in every required training/evaluation partition. The
 existing split logic purges overlapping label horizons. The task is repeatable
 but **does not** manufacture sufficient samples or interpolate missing future
 labels. Dataset timestamps and candidate IDs are validated; new rows are
-counted relative to the previous registered job watermark.
+counted by fingerprints of eligible TRAIN rows from the last registered job,
+including old timestamps whose labels completed later. Incomplete rows, purged
+rows, validation/test rows and forward rows cannot trigger a job.
+`label_end_timestamp` is required; missing validation/test periods fail closed.
+The fixed chronological dates intentionally do not assimilate current forward
+rows into training. Adaptive rolling retraining remains unreleased.
 
 Use Windows Task Scheduler or cron to call the command in a separate low-priority
 process, after your export pipeline has completed. For example a monthly cron
@@ -216,3 +231,42 @@ does not authorize execution testing against a real-money account.
 broker-executable exit intelligence does not. This PR should remain in review
 until CI and regression checks pass, and must not be represented as delivering
 all 29 phases of the requested feature.
+
+
+## Audit corrections and operational boundaries (2026-10-09)
+
+See [FX_EXIT_AI_AUDIT_20261009.md](FX_EXIT_AI_AUDIT_20261009.md) for actual checks,
+regressions, CI evidence and release limits. `exit-v1` records remain readable in
+the journal/API but the revised v2 exporter/loader intentionally excludes them;
+there is no automatic conversion that would invent missing historical quality.
+
+Both environment configuration and direct non-demo `FxBotSettings` construction
+resolve exit mode to OFF. Observation intervals must be integers from 1 to 86400.
+Only trusted operator-configured local joblib artifacts may be evaluated; SHA
+checks establish consistency, not pickle safety or approval. Configured models
+are explicitly shadow artifacts. A running predictor pins the bytes it loaded;
+replacing files or changing registry pointers does not switch it. Deploy/restart
+separately after controlled verification. Registry supports candidate, approved,
+active and retired metadata states; separate VALIDATED/SHADOW_TESTED gates are
+not implemented. It prevents cross-target replacement within a model family.
+
+The policy's profit evidence must include executable-price gross P&L, signed
+swap, nonnegative paid/closing commissions and slippage costs, account currency,
+conversion confirmation and matching quote timestamp/price. No runtime cost
+adapter currently supplies this evidence. Partial-close evidence must include
+verified action state, hedging/netting mode, broker minimum and volume step; no
+runtime coordinator supplies it. Trailing validation requires a causal ATR
+timestamp and rejects modification inside the existing stop's freeze zone.
+These are pure proposal checks, not permission to send an order.
+
+A stuck estimator occupies only the optional daemon worker; queue overflow drops
+research captures and `/api/exit-ai` exposes backlog/drop counts. Captures are
+historical, not current-position assertions; pending work is discarded on close.
+There is no hard cancellation of a running estimator, durable queue, exact-once
+restart collection, or automatic observation/artifact retention service. SQL
+shares the existing database and brief write contention remains possible.
+For strict runtime timing use OFF until a process-isolated service is validated.
+The exporter deterministically deduplicates repeated quotes; no missing sample
+is reconstructed after a restart. Interrupted training locks require an operator
+to confirm the old job is gone before deleting the lock. Failed registration may
+leave an inactive run directory for diagnosis, never an active champion change.

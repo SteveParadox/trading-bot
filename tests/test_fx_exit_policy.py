@@ -12,7 +12,7 @@ def _sample(action="TRAIL_STOP", direction="BUY"):
     prediction = ExitPrediction(
         prediction_id="p1", position_id="1", timestamp=timestamp,
         status="ok", decision=action, confidence=.8, reason_codes=("TEST",),
-        model_version="m", feature_version="exit-v1", prompt_version=None,
+        model_version="m", model_sha256="a"*64, feature_version="exit-v2", prompt_version=None,
         strategy_version="s",
         probabilities={key: (.8 if key == action else .2 / 4) for key in EXIT_ACTIONS},
     )
@@ -20,8 +20,10 @@ def _sample(action="TRAIL_STOP", direction="BUY"):
         "position_id": "1", "timestamp": timestamp, "direction": direction,
         "stop_loss": 1.1000 if direction == "BUY" else 1.1100,
         "bid": 1.1060, "ask": 1.1062,
-        "atr_pips": 5.0, "estimated_net_pl": None,
-        "broker_volume_lots": 0.12,
+        "atr_pips": 5.0, "atr_timestamp": timestamp, "estimated_net_pl": None,
+        "broker_volume_lots": 0.12, "broker_volume_min": .01, "broker_volume_step": .01,
+        "partial_close_state_verified": True, "account_mode": "hedging", "pending_partial_close": False,
+        "quote_timestamp": timestamp,
     }
     return snapshot, prediction
 
@@ -49,6 +51,10 @@ def test_take_profit_requires_verified_net_profit():
     snapshot["estimated_net_pl"] = .50
     assert not _evaluate(snapshot, prediction).eligible
     snapshot["estimated_net_pl"] = 1.35
+    snapshot["net_profit_evidence"] = {"gross_liquidation_pl": 2., "swap": -.1,
+        "paid_commission": .1, "closing_commission": .1, "slippage_cost": .1,
+        "costs_in_account_currency": True, "account_currency": "USD",
+        "quote_timestamp": snapshot["quote_timestamp"], "liquidation_price": snapshot["bid"]}
     assert _evaluate(snapshot, prediction).eligible
 
 
@@ -57,7 +63,8 @@ def test_hold_does_not_change_position_and_defensive_exit_not_auto_approved():
     result = _evaluate(snapshot, prediction)
     assert result.eligible and result.suggested_stop is None and result.reduction_volume is None
     from dataclasses import replace
-    defensive = replace(prediction, decision="EXIT")
+    defensive = replace(prediction, decision="EXIT",
+        probabilities={key: (.8 if key == "EXIT" else .05) for key in EXIT_ACTIONS})
     assert _evaluate(snapshot, defensive).reason == "defensive_exit_not_validated"
 
 

@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import tempfile
 from typing import Any, Iterable
@@ -25,10 +26,10 @@ from fxbot.ai.exit_intelligence import EXIT_FEATURE_COLUMNS, EXIT_FEATURE_VERSIO
 HORIZONS_SECONDS = (60, 180, 300)
 TARGET_COLUMNS = tuple(f"observed_mark_return_{sec}s_pips" for sec in HORIZONS_SECONDS)
 AUDIT_COLUMNS = (
-    "position_id", "candidate_id", "timestamp", "quote_timestamp",
+    "position_id", "position_lifetime_id", "candidate_id", "timestamp", "quote_timestamp",
     "prediction_id", "model_version", "feature_version",
     "strategy_version", "prompt_version", "label_end_timestamp",
-    "observation_quality",
+    "observation_quality", "excursion_quality", "model_sha256", "feature_builder_version", "code_version",
 )
 
 
@@ -51,6 +52,9 @@ def build_observed_exit_rows(
         raise ValueError("max lag must be shorter than the smallest horizon")
     grouped: dict[str, list[tuple[datetime, datetime, dict[str, Any], dict[str, Any]]]] = defaultdict(list)
     seen: set[tuple[str, str]] = set()
+    # Duplicate conflicts have stable resolution regardless of query/input order.
+    events = sorted((event for event in events if isinstance(event, dict)),
+                    key=lambda event: json.dumps(event, sort_keys=True, default=str))
     for event in events:
         if not isinstance(event, dict):
             continue
@@ -63,44 +67,62 @@ def build_observed_exit_rows(
                 continue
             captured_at = _utc(snapshot["timestamp"])
             quote_at = _utc(snapshot["quote_timestamp"])
-            if quote_at > captured_at or (captured_at - quote_at).total_seconds() > 120:
+            opened_at = _utc(snapshot["entry_timestamp"])
+            # A stale base quote must not expand a nominal horizon invisibly.
+            if opened_at > quote_at or quote_at > captured_at or (captured_at - quote_at).total_seconds() > max_lag_seconds:
                 continue
             pip = float(snapshot["pip_size"])
             mark = float(snapshot["liquidation_price"])
+            bid, ask = float(snapshot["bid"]), float(snapshot["ask"])
+            entry_price = float(snapshot["entry_price"])
             if (snapshot.get("direction") not in {"BUY", "SELL"}
                     or not math.isfinite(pip) or pip <= 0
-                    or not math.isfinite(mark) or mark <= 0):
+                    or not math.isfinite(mark) or mark <= 0
+                    or not math.isfinite(entry_price) or entry_price <= 0):
                 continue
             exit_features(snapshot)  # Reject malformed decision-time feature inputs.
+            if (not math.isfinite(bid) or not math.isfinite(ask) or bid <= 0 or ask < bid
+                    or mark != (bid if snapshot["direction"] == "BUY" else ask)):
+                continue
             ticket = str(snapshot.get("position_id") or "")
             if not ticket:
                 continue
-            key = (ticket, captured_at.isoformat())
+            lifetime = str(snapshot.get("position_lifetime_id") or json.dumps([
+                ticket, snapshot.get("symbol"), snapshot.get("direction"),
+                snapshot.get("entry_timestamp"), snapshot.get("entry_price")], sort_keys=True))
+            if not snapshot.get("entry_timestamp") or not snapshot.get("entry_price"):
+                continue
+            key = (lifetime, quote_at.isoformat())
             if key in seen:
                 continue
             seen.add(key)
-            grouped[ticket].append((captured_at, quote_at, snapshot, prediction))
+            grouped[lifetime].append((captured_at, quote_at, snapshot, {**prediction, "code_version": event.get("code_version")}))
         except (TypeError, ValueError, OverflowError, KeyError):
             continue
 
     rows: list[dict[str, Any]] = []
-    for ticket, observations in grouped.items():
+    for lifetime, observations in grouped.items():
         observations.sort(key=lambda entry: entry[0])
         for index, (at, quote_at, snapshot, prediction) in enumerate(observations):
             features = exit_features(snapshot)
             record: dict[str, Any] = {
                 **features,
-                "position_id": ticket,
+                "position_id": snapshot["position_id"],
+                "position_lifetime_id": lifetime,
                 "candidate_id": snapshot.get("candidate_id"),
                 "timestamp": at.isoformat(),
                 "quote_timestamp": quote_at.isoformat(),
                 "prediction_id": prediction.get("prediction_id"),
                 "model_version": prediction.get("model_version"),
+                "model_sha256": prediction.get("model_sha256"),
+                "feature_builder_version": prediction.get("feature_builder_version"),
+                "code_version": prediction.get("code_version"),
                 "feature_version": snapshot["schema_version"],
                 "strategy_version": snapshot.get("strategy_version"),
                 "prompt_version": prediction.get("prompt_version"),
                 "label_end_timestamp": None,
                 "observation_quality": "scan_sampled_not_tick_complete",
+                "excursion_quality": snapshot.get("excursion_quality", "unknown"),
             }
             last_target_at: datetime | None = None
             for horizon, target in zip(HORIZONS_SECONDS, TARGET_COLUMNS):
@@ -122,26 +144,31 @@ def build_observed_exit_rows(
                     if (future.get("direction") != snapshot.get("direction")
                             or future.get("entry_timestamp") != snapshot.get("entry_timestamp")
                             or future.get("symbol") != snapshot.get("symbol")
+                            or future.get("entry_price") != snapshot.get("entry_price")
                             or float(future.get("pip_size") or 0) != float(snapshot["pip_size"])):
                         continue
                     base_mark = float(snapshot["liquidation_price"])
                     future_mark = float(future["liquidation_price"])
                     sign = 1 if snapshot["direction"] == "BUY" else -1
-                    record[target] = sign * (future_mark - base_mark) / float(snapshot["pip_size"])
+                    movement = sign * (future_mark - base_mark) / float(snapshot["pip_size"])
+                    if not math.isfinite(movement):
+                        continue
+                    record[target] = movement
                     last_target_at = future_quote_at if last_target_at is None else max(last_target_at, future_quote_at)
                     break
             record["label_end_timestamp"] = last_target_at.isoformat() if last_target_at else None
             rows.append(record)
-    return sorted(rows, key=lambda item: (item["timestamp"], item["position_id"]))
+    return sorted(rows, key=lambda item: (item["timestamp"], item["position_lifetime_id"]))
 
 
 def _atomic_write(path: Path, contents: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", newline="", dir=path.parent,
                                      prefix=".exit-dataset-", delete=False) as stream:
         temp = Path(stream.name)
         stream.write(contents)
         stream.flush()
+        os.fsync(stream.fileno())
     try:
         temp.replace(path)
     finally:
@@ -161,7 +188,7 @@ def export_observed_exit_rows(rows: list[dict[str, Any]], output: Path) -> dict[
     serialized = buffer.getvalue()
     _atomic_write(output, serialized)
     metadata = {
-        "dataset_version": "exit-observed-v1",
+        "dataset_version": "exit-observed-v2",
         "feature_version": EXIT_FEATURE_VERSION,
         "feature_columns": list(EXIT_FEATURE_COLUMNS),
         "target_columns": list(TARGET_COLUMNS),
@@ -195,7 +222,7 @@ def main() -> None:
     try:
         events = [
             event.payload
-            for event in journal.recent_events(limit=args.limit)
+            for event in journal.recent_events(limit=args.limit, event_types=("exit_ai_observation",))
             if event.event_type == "exit_ai_observation"
         ]
     finally:

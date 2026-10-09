@@ -19,7 +19,7 @@ from typing import Any
 from uuid import uuid4
 
 
-EXIT_FEATURE_VERSION = "exit-v1"
+EXIT_FEATURE_VERSION = "exit-v2"
 EXIT_ACTIONS = ("HOLD", "TAKE_PROFIT_NOW", "TRAIL_STOP", "REDUCE_POSITION", "EXIT")
 EXIT_FEATURE_COLUMNS = (
     "direction", "spread_pips", "holding_seconds", "pnl_pips",
@@ -80,12 +80,17 @@ class ExitPrediction:
     model_sha256: str | None = None
     probabilities: dict[str, float] | None = None
     error: str | None = None
+    feature_builder_version: str = EXIT_FEATURE_VERSION
+    model_name: str | None = None
+    model_evaluation: str = "configured_trusted_shadow_artifact"
 
     def __post_init__(self) -> None:
         if self.status not in {"ok", "unavailable", "error"}:
             raise ValueError("invalid prediction status")
         if self.decision is not None and self.decision not in EXIT_ACTIONS:
             raise ValueError("invalid exit decision")
+        if self.status != "ok" and (self.decision is not None or self.confidence is not None or self.probabilities is not None):
+            raise ValueError("failed prediction cannot contain a recommendation")
         if self.status == "ok":
             if self.decision is None or self.confidence is None or not 0 <= self.confidence <= 1:
                 raise ValueError("successful prediction requires valid action/confidence")
@@ -95,6 +100,11 @@ class ExitPrediction:
                 raise ValueError("invalid exit probabilities")
             if not math.isclose(sum(self.probabilities.values()), 1, abs_tol=1e-6):
                 raise ValueError("exit probabilities must sum to one")
+            if (not math.isclose(self.confidence, self.probabilities[self.decision], abs_tol=1e-6)
+                    or self.probabilities[self.decision] != max(self.probabilities.values())):
+                raise ValueError("decision/confidence does not match probabilities")
+            if not self.model_version or not self.model_sha256 or len(self.model_sha256) != 64:
+                raise ValueError("successful prediction requires model attribution")
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -108,11 +118,13 @@ def build_exit_snapshot(
     *,
     recorded_payload: dict[str, Any] | None = None,
     strategy_version: str | None = None,
+    maximum_quote_age_seconds: float = 120,
 ) -> dict[str, Any]:
     """Capture only broker state and observations known as of timestamp."""
     now = _time(timestamp)
     quote_at = _time(price.time)
-    if quote_at > now or (now - quote_at).total_seconds() > 120:
+    if (not math.isfinite(maximum_quote_age_seconds) or maximum_quote_age_seconds <= 0
+            or quote_at > now or (now - quote_at).total_seconds() > maximum_quote_age_seconds):
         raise ValueError("exit snapshot needs a fresh causal quote")
     ticket = str(trade.get("id") or "").strip()
     units = _finite(trade.get("currentUnits"))
@@ -126,6 +138,10 @@ def build_exit_snapshot(
     opened = _time(trade.get("openTime"))
     if opened > now:
         raise ValueError("position timestamp lies in future")
+    if quote_at < opened:
+        raise ValueError("quote predates position entry")
+    if str(trade.get("instrument") or instrument.name) != instrument.name:
+        raise ValueError("position instrument mismatch")
     side = 1 if units > 0 else -1
     liquidation = bid if side == 1 else ask
     move = side * (liquidation - entry) / pip_size
@@ -133,13 +149,21 @@ def build_exit_snapshot(
     take_profit = _order_price(trade.get("takeProfitOrder"))
     recorded = recorded_payload or {}
     excursions = recorded.get("sniper_excursions") or {}
-    mfe = max(0., _finite(excursions.get("mfe")) or 0., move * pip_size) / pip_size
-    mae = max(0., _finite(excursions.get("mae")) or 0., -move * pip_size) / pip_size
+    mfe_raw, mae_raw = _finite(excursions.get("mfe")), _finite(excursions.get("mae"))
+    excursion_at = _time(excursions["last_sample"]) if excursions.get("last_sample") else None
+    observed = (mfe_raw is not None and mae_raw is not None and mfe_raw >= 0 and mae_raw >= 0
+                and excursion_at is not None and opened <= excursion_at <= now)
+    mfe = max(mfe_raw, move * pip_size, 0.) / pip_size if observed else None
+    mae = max(mae_raw, -move * pip_size, 0.) / pip_size if observed else None
     # Sampled excursions are lower bounds, not tick-complete extrema.
     context = recorded.get("strategy_context") or {}
+    lifetime = hashlib.sha256(json.dumps(
+        [ticket, instrument.name, opened.isoformat(), entry, side], separators=(",", ":")
+    ).encode()).hexdigest()
     return {
         "schema_version": EXIT_FEATURE_VERSION,
         "position_id": ticket,
+        "position_lifetime_id": lifetime,
         "candidate_id": context.get("candidate_id"),
         "timestamp": now.isoformat(),
         "quote_timestamp": quote_at.isoformat(),
@@ -148,6 +172,7 @@ def build_exit_snapshot(
         "entry_timestamp": opened.isoformat(),
         "entry_price": entry,
         "units": units,
+        "broker_volume_lots": _finite((trade.get("mt5") or {}).get("volume")),
         "pip_size": pip_size,
         "liquidation_price": liquidation,
         "bid": bid,
@@ -160,14 +185,18 @@ def build_exit_snapshot(
         "estimated_net_pl": None,
         "stop_loss": stop,
         "take_profit": take_profit,
+        "initial_stop_loss": _finite(context.get("initial_stop")),
+        "initial_take_profit": _finite(context.get("initial_take_profit")),
         "distance_to_sl_pips": abs(liquidation - stop) / pip_size if stop is not None else None,
         "distance_to_tp_pips": abs(take_profit - liquidation) / pip_size if take_profit is not None else None,
         "holding_seconds": (now - opened).total_seconds(),
         "mfe_pips": mfe,
         "mae_pips": mae,
-        "drawdown_from_peak_pips": max(0., mfe - move),
+        "drawdown_from_peak_pips": max(0., mfe - move) if mfe is not None else None,
+        "excursion_quality": "sampled_lower_bound" if observed else "historical_excursions_unavailable",
         "sampled_excursions_only": True,
-        "strategy_version": strategy_version,
+        "strategy_version": context.get("strategy_hash") or strategy_version,
+        "quote_max_age_seconds": maximum_quote_age_seconds,
         "atr_pips": None,
         "rsi": None,
         "momentum": None,
@@ -183,6 +212,9 @@ def exit_features(snapshot: dict[str, Any]) -> dict[str, Any]:
     direction = snapshot.get("direction")
     if direction not in {"BUY", "SELL"}:
         raise ValueError("invalid position direction")
+    units = _finite(snapshot.get("units"))
+    if units is None or units == 0 or (units > 0) != (direction == "BUY"):
+        raise ValueError("invalid signed position units")
     values = {
         "direction": direction,
         "spread_pips": snapshot.get("spread_pips"),
@@ -193,7 +225,7 @@ def exit_features(snapshot: dict[str, Any]) -> dict[str, Any]:
         "drawdown_from_peak_pips": snapshot.get("drawdown_from_peak_pips"),
         "distance_to_sl_pips": snapshot.get("distance_to_sl_pips"),
         "distance_to_tp_pips": snapshot.get("distance_to_tp_pips"),
-        "position_units": abs(float(snapshot["units"])),
+        "position_units": abs(units),
         "broker_unrealized_pl": snapshot.get("broker_unrealized_pl"),
         "atr_pips": snapshot.get("atr_pips"),
         "rsi": snapshot.get("rsi"),
@@ -209,6 +241,8 @@ class ExitPredictionService:
     """SHA-checked, lazy local predictor. An absent model never yields HOLD as fake ML."""
 
     def __init__(self, *, model_path: str = "", metadata_path: str = "", verify_hash: bool = True) -> None:
+        if not verify_hash:
+            raise ValueError("exit model integrity verification cannot be disabled")
         self.model_path = Path(model_path) if model_path else None
         self.metadata_path = Path(metadata_path) if metadata_path else None
         self.verify_hash = verify_hash
@@ -228,6 +262,8 @@ class ExitPredictionService:
             raise ValueError("exit model feature-builder mismatch")
         if metadata.get("class_labels") != list(EXIT_ACTIONS):
             raise ValueError("exit model class order mismatch")
+        if not isinstance(metadata.get("model_version"), str) or not metadata["model_version"].strip():
+            raise ValueError("exit model version missing")
         raw = self.model_path.read_bytes()
         digest = hashlib.sha256(raw).hexdigest()
         if self.verify_hash and (not metadata.get("model_sha256") or digest != metadata["model_sha256"]):
@@ -253,11 +289,12 @@ class ExitPredictionService:
         if self.model_path is None or self.metadata_path is None:
             return ExitPrediction(**base, status="unavailable", decision=None,
                                   confidence=None, reason_codes=("MODEL_NOT_CONFIGURED",), model_version=None)
+        metadata, digest = {}, None
         try:
             features = exit_features(snapshot)
             model, metadata, digest = self._load()
             import pandas as pd
-            classes = [int(c) for c in model.classes_]
+            classes = list(model.classes_)
             if classes != list(range(len(EXIT_ACTIONS))):
                 raise ValueError("exit estimator classes mismatch")
             probabilities = [float(v) for v in model.predict_proba(pd.DataFrame([features], columns=EXIT_FEATURE_COLUMNS))[0]]
@@ -268,9 +305,14 @@ class ExitPredictionService:
             return ExitPrediction(**base, status="ok", decision=EXIT_ACTIONS[best_index],
                                   confidence=probabilities[best_index], reason_codes=("MODEL_RECOMMENDATION",),
                                   model_version=str(metadata.get("model_version") or ""),
+                                  model_name=metadata.get("model_name"),
                                   model_sha256=digest, probabilities=distribution)
+        except FileNotFoundError:
+            return ExitPrediction(**base, status="unavailable", decision=None, confidence=None,
+                                  reason_codes=("MODEL_FILE_UNAVAILABLE",), model_version=None)
         except Exception as exc:
             # Do not reveal filesystem paths or model payloads in the journal.
             return ExitPrediction(**base, status="error", decision=None, confidence=None,
-                                  reason_codes=("PREDICTION_FAILED",), model_version=None,
+                                  reason_codes=("PREDICTION_FAILED",), model_version=metadata.get("model_version"),
+                                  model_sha256=digest, model_name=metadata.get("model_name"),
                                   error=type(exc).__name__)

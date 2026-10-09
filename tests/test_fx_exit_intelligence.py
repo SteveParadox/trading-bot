@@ -44,7 +44,7 @@ def _inputs(signed_units: float = 1000):
 def test_long_exit_uses_bid_and_only_causal_fields():
     now, trade, quote, instrument = _inputs()
     snapshot = build_exit_snapshot(trade, quote, instrument, now,
-                                   recorded_payload={"sniper_excursions": {"mfe": .0008, "mae": .0005}},
+                                   recorded_payload={"sniper_excursions": {"mfe": .0008, "mae": .0005, "last_sample": now.isoformat()}},
                                    strategy_version="strategy-123")
     assert snapshot["liquidation_price"] == quote.bid
     assert snapshot["pnl_pips"] == pytest.approx(10.0)

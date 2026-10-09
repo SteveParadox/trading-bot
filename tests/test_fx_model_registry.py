@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+from fxbot.ai.feature_builder import FEATURE_BUILDER_VERSION
+from fxbot.training_dataset import FEATURE_COLUMNS
 from fxbot.ai.model_registry import ModelRegistry, RegistryError, exclusive_file_lock
 
 
@@ -16,7 +18,7 @@ def _candidate(directory: Path, version: str):
     metadata.write_text(json.dumps({
         "model_version": version, "model_name": "XGB",
         "model_sha256": hashlib.sha256(model.read_bytes()).hexdigest(),
-        "feature_columns": ["a", "b"], "feature_builder_version": "v1",
+        "feature_columns": list(FEATURE_COLUMNS), "feature_builder_version": FEATURE_BUILDER_VERSION,
         "target": "TP_BEFORE_SL",
     }), encoding="utf-8")
     return model, metadata

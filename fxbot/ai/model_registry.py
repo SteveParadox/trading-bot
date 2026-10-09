@@ -29,6 +29,29 @@ def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _validate_metadata(data: dict[str, Any], model_type: str) -> None:
+    from fxbot.ai.exit_intelligence import EXIT_ACTIONS, EXIT_FEATURE_COLUMNS, EXIT_FEATURE_VERSION
+    from fxbot.ai.feature_builder import FEATURE_BUILDER_VERSION
+    from fxbot.training_dataset import FEATURE_COLUMNS
+    from fxbot.baseline_model import SUPPORTED_BINARY_TARGETS
+    if model_type == "exit_management":
+        target, columns, builder = "EXIT_ACTION", list(EXIT_FEATURE_COLUMNS), EXIT_FEATURE_VERSION
+        if data.get("class_labels") != list(EXIT_ACTIONS):
+            raise RegistryError("exit class manifest mismatch")
+    elif model_type == "entry_timing":
+        from fxbot.training_dataset import ENTRY_ACTIONS
+        target, columns, builder = "ENTRY_ACTION_LABEL", list(FEATURE_COLUMNS), FEATURE_BUILDER_VERSION
+        if data.get("class_labels") != list(ENTRY_ACTIONS):
+            raise RegistryError("entry timing class manifest mismatch")
+    else:
+        target, columns, builder = data.get("target"), list(FEATURE_COLUMNS), FEATURE_BUILDER_VERSION
+        if target not in SUPPORTED_BINARY_TARGETS:
+            raise RegistryError("entry target mismatch")
+    if (data.get("target") != target or data.get("feature_columns") != columns
+            or data.get("feature_builder_version") != builder):
+        raise RegistryError("model target/feature manifest mismatch")
+
+
 @contextmanager
 def exclusive_file_lock(path: Path):
     """Fail fast rather than overlap unsafe registry/training modifications.
@@ -66,6 +89,24 @@ class ModelRegistry:
                 or not isinstance(value.get("active"), dict)
                 or not isinstance(value.get("history"), list)):
             raise RegistryError("invalid model registry schema")
+        for model_id, row in value["models"].items():
+            if (not isinstance(row, dict) or row.get("model_id") != model_id
+                    or row.get("model_type") not in {"entry_quality", "entry_timing", "exit_management"}
+                    or row.get("status") not in {"candidate", "approved", "active", "retired"}
+                    or any(not isinstance(row.get(key), str) or not row[key] for key in
+                           ("model_version", "model_path", "metadata_path", "model_sha256", "metadata_sha256", "feature_manifest_sha256"))):
+                raise RegistryError("invalid registry model record")
+        for family, model_id in value["active"].items():
+            row = value["models"].get(model_id)
+            if row is None or row["model_type"] != family or row["status"] != "active":
+                raise RegistryError("invalid active model pointer")
+        if any(not isinstance(event, dict) or not isinstance(event.get("event"), str)
+               or event.get("model_id") not in value["models"] for event in value["history"]):
+            raise RegistryError("invalid registry history")
+        approved = {event["model_id"] for event in value["history"] if event["event"] == "approved"}
+        if any(row["status"] in {"approved", "active", "retired"} and model_id not in approved
+               for model_id, row in value["models"].items()):
+            raise RegistryError("model approval history missing")
         return value
 
     def _write(self, data: dict[str, Any]) -> None:
@@ -93,6 +134,7 @@ class ModelRegistry:
         data = json.loads(meta.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             raise RegistryError("model metadata must be an object")
+        _validate_metadata(data, model_type)
         digest = _digest(model)
         if not data.get("model_sha256") or data["model_sha256"] != digest:
             raise RegistryError("candidate model SHA-256 mismatch")
@@ -180,6 +222,8 @@ class ModelRegistry:
                 raise RegistryError("model has not passed manual approval")
             family = record["model_type"]
             prior = store["active"].get(family)
+            if prior and store["models"][prior]["target"] != record["target"]:
+                raise RegistryError("active model target mismatch")
             if prior and prior != model_id:
                 store["models"][prior]["status"] = "retired"
             store["active"][family] = model_id
@@ -199,6 +243,8 @@ class ModelRegistry:
             if previous_model_id not in approved_ids:
                 raise RegistryError("rollback target was never approved")
             current = store["active"].get(model_type)
+            if current and store["models"][current]["target"] != record["target"]:
+                raise RegistryError("rollback target mismatch")
             if current and current != previous_model_id:
                 store["models"][current]["status"] = "retired"
             store["models"][previous_model_id]["status"] = "active"
@@ -208,18 +254,20 @@ class ModelRegistry:
             self._write(store)
             return store["models"][previous_model_id]
 
-    def status(self) -> dict[str, Any]:
+    def status(self, limit: int = 100) -> dict[str, Any]:
         store = self._read()
         return {
             "schema_version": store["schema_version"],
             "active": dict(store["active"]),
-            "models": [{key: value for key, value in row.items()
-                        if key not in {"model_path", "metadata_path"}}
-                       for row in store["models"].values()],
+            "models": [{key: row.get(key) for key in (
+                "model_id", "model_type", "model_name", "model_version", "target",
+                "model_sha256", "metadata_sha256", "feature_version", "feature_manifest_sha256",
+                "registered_at", "status")}
+                       for row in list(store["models"].values())[-limit:]],
             # Approval evidence may contain private review URLs/notes;
             # never expose it through the read-only monitoring API.
             "history": [
                 {key: event.get(key) for key in ("at", "event", "model_id", "previous") if key in event}
-                for event in store["history"]
+                for event in store["history"][-limit:]
             ],
         }
