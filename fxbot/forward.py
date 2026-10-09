@@ -50,6 +50,7 @@ from fxbot.ai_deliberation import (
 from fxbot.ai_contract import AiTradeDecision
 from fxbot.ai.predictor import PredictionService, TradePredictor
 from fxbot.ai.schemas import NumericalPrediction, PredictionRequest
+from fxbot.ai.exit_intelligence import ExitPredictionService, build_exit_snapshot
 from fxbot.market_snapshot import build_market_snapshot, build_news_context
 from fxbot.outcome_tracker import CandidateOutcomeTracker
 from fxbot.operations import clock_health
@@ -101,6 +102,12 @@ class ForwardTestWorker:
         )
         self.deliberator = deliberator or AiDeliberationService(self.settings.ai)
         self.predictor = predictor or PredictionService(self.settings.ml_prediction)
+        self.exit_predictor = ExitPredictionService(
+            model_path=self.settings.exit_ai.model_path,
+            metadata_path=self.settings.exit_ai.metadata_path,
+            verify_hash=self.settings.exit_ai.verify_hash,
+        )
+        self._exit_last_observed: dict[str, datetime] = {}
         # Feed SQLite lock retries into the operational monitor.
         monitor_ref = self.monitor
         set_lock_retry_callback(monitor_ref.record_db_lock_retry)
@@ -1335,6 +1342,9 @@ class ForwardTestWorker:
                 if not closing:
                     self._maybe_move_stop_to_breakeven(trade, instrument, price)
                     self._maybe_update_trailing_stop(trade, instrument, price)
+                # Exit AI observes after deterministic protective management.
+                # It has no reference to the MT5 client and cannot place orders.
+                self._observe_exit_shadow(now, trade, instrument, price)
             self.journal.upsert_trade(
                 broker_trade_id=trade_id,
                 instrument=instrument_name,
@@ -1356,6 +1366,58 @@ class ForwardTestWorker:
                 units=abs(units),
                 payload={**trade, "source": "mt5_reconciliation"},
             )
+
+    def _observe_exit_shadow(
+        self,
+        now: datetime,
+        trade: dict[str, Any],
+        instrument: FxInstrument,
+        price: PriceSnapshot,
+    ) -> None:
+        if self.settings.exit_ai.mode == "off":
+            return
+        ticket = str(trade.get("id") or "")
+        if not ticket:
+            return
+        last = self._exit_last_observed.get(ticket)
+        if last is not None and (now - last).total_seconds() < self.settings.exit_ai.evaluation_interval_seconds:
+            return
+        try:
+            recorded = self.journal.find_trade(ticket)
+            snapshot = build_exit_snapshot(
+                trade, price, instrument, now,
+                recorded_payload=(recorded.payload if recorded is not None else {}),
+                strategy_version=self.strategy_hash,
+            )
+            prediction = self.exit_predictor.predict(snapshot)
+            # Journal first; never mark an observation successful before it is durable.
+            self.journal.log_event(
+                "exit_ai_observation",
+                f"Shadow exit evaluation of {ticket}",
+                payload={
+                    "mode": "shadow",
+                    "applied_action": None,
+                    "execution_attempted": False,
+                    "snapshot": snapshot,
+                    "prediction": prediction.to_dict(),
+                    "strategy_version": self.strategy_hash,
+                    "code_version": self.code_version,
+                },
+            )
+            self._exit_last_observed[ticket] = now
+        except Exception as exc:
+            # Failure to observe an optional ML suggestion must not interrupt
+            # reconciliation or established stop/exit management.
+            log.warning("exit shadow observation failed for %s: %s", ticket, type(exc).__name__)
+            try:
+                self.journal.log_event(
+                    "exit_ai_observation_failed",
+                    "Exit observation unavailable; existing position protection continues",
+                    level="warning",
+                    payload={"ticket": ticket, "error": type(exc).__name__},
+                )
+            except Exception:
+                log.exception("exit observation journal unavailable")
 
     def _sync_trade_history(self, now: datetime) -> None:
         state = self.journal.get_state()
