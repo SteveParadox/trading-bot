@@ -144,3 +144,19 @@ def test_invalid_prediction_and_unreleased_execution_mode_rejected():
         ExitAiSettings(mode="advisory")
     with pytest.raises(ValueError, match="integrity"):
         ExitAiSettings(model_path="x", metadata_path="y", verify_hash=False)
+
+
+def test_exit_model_paths_are_private_in_config_api():
+    from fxbot.api import _config_payload
+    from fxbot.config import FxBotSettings
+    settings = FxBotSettings(exit_ai=ExitAiSettings(
+        model_path="/private/exit.joblib",
+        metadata_path="/private/exit.metadata.json",
+        registry_path="/private/model-registry",
+    ))
+    result = _config_payload(settings)
+    assert result["exit_ai"]["model_configured"] is True
+    assert result["exit_ai"]["execution_enabled"] is False
+    serialised = json.dumps(result)
+    assert "/private/" not in serialised
+    assert "exit.metadata.json" not in serialised
