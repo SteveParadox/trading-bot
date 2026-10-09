@@ -673,8 +673,6 @@ class FxBotSettings:
     sniper: SniperSettings = field(default_factory=SniperSettings)
 
     def __post_init__(self) -> None:
-        if self.exit_ai.mode != "off" and not self.broker.demo_only:
-            raise ValueError("exit AI is demo/forward-test only")
         if self.ml_prediction.mode != "off" and not self.broker.demo_only:
             raise ValueError("ML candidate artifacts are demo/research-only; live promotion is not implemented")
         # Provider precedence must match build_news_gateway. An opt-in FF flag
