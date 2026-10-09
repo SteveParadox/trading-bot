@@ -918,7 +918,15 @@ class StructuredJournal:
             session.add(row)
         self.write_jsonl("event", row)
 
-    def recent_events(self, limit: int = 100) -> list[EventLogRow]:
+    def recent_events(self, limit: int = 100, *, event_types: tuple[str, ...] | None = None) -> list[EventLogRow]:
+        if event_types:
+            with self.sessions() as session:
+                rows = list(session.scalars(select(EventLogRow)
+                    .where(EventLogRow.event_type.in_(event_types))
+                    .order_by(desc(EventLogRow.timestamp), desc(EventLogRow.id)).limit(limit)))
+                for row in rows:
+                    session.expunge(row)
+                return rows
         return _recent(self.sessions, EventLogRow, limit)
 
     def recovery_orders(self, limit: int = 100) -> list[OrderJournalRow]:
