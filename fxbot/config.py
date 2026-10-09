@@ -668,9 +668,9 @@ class FxBotSettings:
     runtime: RuntimeSettings = field(default_factory=RuntimeSettings)
     ai: AiDeliberationSettings = field(default_factory=AiDeliberationSettings)
     ml_prediction: MlPredictionSettings = field(default_factory=MlPredictionSettings)
-    exit_ai: ExitAiSettings = field(default_factory=ExitAiSettings)
     news_events: list[NewsEvent] = field(default_factory=list)
     sniper: SniperSettings = field(default_factory=SniperSettings)
+    exit_ai: ExitAiSettings = field(default_factory=ExitAiSettings)
 
     def __post_init__(self) -> None:
         if self.ml_prediction.mode != "off" and not self.broker.demo_only:
