@@ -757,6 +757,15 @@ def _config_payload(settings: FxBotSettings) -> dict[str, Any]:
     ai_payload["api_key_configured"] = bool(settings.ai.api_key)
     ai_payload["endpoint_configured"] = bool(settings.ai.endpoint)
     payload["ai"] = ai_payload
+    # Newly added artifact and registry paths are private deployment details.
+    payload["exit_ai"] = {
+        "mode": settings.exit_ai.mode,
+        "evaluation_interval_seconds": settings.exit_ai.evaluation_interval_seconds,
+        "verify_hash": settings.exit_ai.verify_hash,
+        "model_configured": bool(settings.exit_ai.model_path and settings.exit_ai.metadata_path),
+        "registry_configured": bool(settings.exit_ai.registry_path),
+        "execution_enabled": False,
+    }
     payload["ml_prediction"] = {
         "mode": settings.ml_prediction.mode,
         "target": settings.ml_prediction.target,
