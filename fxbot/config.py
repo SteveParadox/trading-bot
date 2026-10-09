@@ -548,6 +548,33 @@ class MlPredictionSettings:
 
 
 @dataclass(frozen=True)
+class ExitAiSettings:
+    """Isolated observation-only exit intelligence.
+
+    Advisory execution is deliberately not released until broker-safe
+    validation and independent forward evidence have been completed.
+    """
+
+    mode: str = "shadow"
+    model_path: str = ""
+    metadata_path: str = ""
+    verify_hash: bool = True
+    evaluation_interval_seconds: int = 60
+
+    def __post_init__(self) -> None:
+        mode = self.mode.lower().strip()
+        if mode not in {"off", "shadow"}:
+            raise ValueError("exit AI currently supports only off/shadow; advisory broker actions are not approved")
+        if self.evaluation_interval_seconds < 1:
+            raise ValueError("exit AI evaluation interval must be positive")
+        if bool(self.model_path) != bool(self.metadata_path):
+            raise ValueError("exit model path and metadata path must both be configured")
+        if self.model_path and not self.verify_hash:
+            raise ValueError("exit model integrity verification cannot be disabled")
+        object.__setattr__(self, "mode", mode)
+
+
+@dataclass(frozen=True)
 class AiDeliberationSettings:
     """Configuration for the isolated, optional signal-audit service.
 
@@ -640,10 +667,13 @@ class FxBotSettings:
     runtime: RuntimeSettings = field(default_factory=RuntimeSettings)
     ai: AiDeliberationSettings = field(default_factory=AiDeliberationSettings)
     ml_prediction: MlPredictionSettings = field(default_factory=MlPredictionSettings)
+    exit_ai: ExitAiSettings = field(default_factory=ExitAiSettings)
     news_events: list[NewsEvent] = field(default_factory=list)
     sniper: SniperSettings = field(default_factory=SniperSettings)
 
     def __post_init__(self) -> None:
+        if self.exit_ai.mode != "off" and not self.broker.demo_only:
+            raise ValueError("exit AI is demo/forward-test only")
         if self.ml_prediction.mode != "off" and not self.broker.demo_only:
             raise ValueError("ML candidate artifacts are demo/research-only; live promotion is not implemented")
         # Provider precedence must match build_news_gateway. An opt-in FF flag
@@ -778,6 +808,13 @@ def settings_from_env() -> FxBotSettings:
             live_trading_enabled=_get_bool("FX_LIVE_TRADING_ENABLED", False),
             live_release_ack=_get_str("FX_LIVE_RELEASE_ACK", ""),
             max_price_age_seconds=_get_int("FX_MAX_PRICE_AGE_SECONDS", 120),
+        ),
+        exit_ai=ExitAiSettings(
+            mode=_get_str("FX_EXIT_AI_MODE", "shadow"),
+            model_path=_get_str("FX_EXIT_MODEL_PATH", ""),
+            metadata_path=_get_str("FX_EXIT_MODEL_METADATA_PATH", ""),
+            verify_hash=_get_bool("FX_EXIT_VERIFY_MODEL_HASH", True),
+            evaluation_interval_seconds=_get_int("FX_EXIT_EVALUATION_INTERVAL_SECONDS", 60),
         ),
         ml_prediction=MlPredictionSettings(
             mode=_get_str("FX_ML_PREDICTION_MODE", "off"),
