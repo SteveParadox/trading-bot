@@ -102,6 +102,29 @@ For existing behavior, set `FX_EXIT_AI_MODE=off`. MT5 demo protection,
 existing stop-loss behavior, risk limits, news safeguards, and entry LLM
 configuration are unchanged.
 
+## Observed exit-horizon dataset (no action labels)
+
+To export the initial exit observation history from the existing SQL journal:
+
+```powershell
+python -m fxbot.ai.exit_observation_dataset --database-url sqlite:///./data/fx_forward_test.db --output data/training/exit_observed.csv --limit 50000 --max-lag-seconds 20
+```
+
+The CSV has separate audit identifiers, strictly decision-time exit features,
+and nullable future targets `observed_mark_return_60s_pips`,
+`observed_mark_return_180s_pips`, and
+`observed_mark_return_300s_pips`. It also writes a dataset manifest with
+SHA-256 and horizon coverage. Labels are derived only when the broker quote
+timestamp is at or after the requested horizon and within the allowed lag.
+Missing observations, reopened tickets, stale quotes, or insufficient coverage
+produce unknown targets instead of fabricated prices.
+
+This is a **quote-sampled research dataset**, not an executable exit
+counterfactual dataset. It does not account for alternative MT5 fills, partial
+closes, trailing stop reachability, realized commissions/financing, or future
+portfolio exposure. Do not train the five-class `EXIT_ACTION` model on its
+mark returns as if they were optimal actions.
+
 ## Periodic training (entry-quality only)
 
 Prerequisites: install `requirements-fx-research.txt` plus
@@ -158,7 +181,7 @@ comparison `not_evaluated` and promotion `manual_review_required`.
 
 ```powershell
 python -m compileall -q fxbot
-python -m pytest -q tests/test_fx_exit_intelligence.py tests/test_fx_exit_policy.py tests/test_fx_model_registry.py
+python -m pytest -q tests/test_fx_exit_intelligence.py tests/test_fx_exit_policy.py tests/test_fx_exit_observation_dataset.py tests/test_fx_model_registry.py
 python -m pytest -q tests/test_fx*.py
 ```
 
