@@ -100,6 +100,11 @@ class ModelRegistry:
             row = value["models"].get(model_id)
             if row is None or row["model_type"] != family or row["status"] != "active":
                 raise RegistryError("invalid active model pointer")
+        # Every active record must correspond to the one active pointer for its family.
+        # A dangling 'active' status is a corrupted registry, not a second champion.
+        for model_id, row in value["models"].items():
+            if row["status"] == "active" and value["active"].get(row["model_type"]) != model_id:
+                raise RegistryError("orphaned active model status")
         if any(not isinstance(event, dict) or not isinstance(event.get("event"), str)
                or event.get("model_id") not in value["models"] for event in value["history"]):
             raise RegistryError("invalid registry history")
@@ -131,7 +136,10 @@ class ModelRegistry:
         model, meta = Path(model_path).resolve(), Path(metadata_path).resolve()
         if not model.is_file() or not meta.is_file():
             raise RegistryError("model and metadata files are required")
-        data = json.loads(meta.read_text(encoding="utf-8"))
+        # Hash the *exact* metadata bytes validated below. Re-reading the file
+        # after validation could otherwise register an unvalidated replacement.
+        raw_metadata = meta.read_bytes()
+        data = json.loads(raw_metadata.decode("utf-8"))
         if not isinstance(data, dict):
             raise RegistryError("model metadata must be an object")
         _validate_metadata(data, model_type)
@@ -153,7 +161,7 @@ class ModelRegistry:
             "model_path": str(model),
             "metadata_path": str(meta),
             "model_sha256": digest,
-            "metadata_sha256": _digest(meta),
+            "metadata_sha256": hashlib.sha256(raw_metadata).hexdigest(),
             "feature_version": data["feature_builder_version"],
             "feature_manifest_sha256": hashlib.sha256(
                 json.dumps(data["feature_columns"], sort_keys=True).encode("utf-8")
@@ -164,6 +172,10 @@ class ModelRegistry:
             "status": "candidate",
         }
         with exclusive_file_lock(self.lock):
+            # Fail closed if a training process or operator changed either
+            # artifact after the initial validation but before registration.
+            if _digest(model) != digest or _digest(meta) != record["metadata_sha256"]:
+                raise RegistryError("candidate artifact changed during registration")
             store = self._read()
             existing = store["models"].get(model_id)
             if existing is not None:
@@ -191,6 +203,14 @@ class ModelRegistry:
                 or _digest(meta) != record["metadata_sha256"]):
             raise RegistryError("registered artifact missing or corrupted")
         data = json.loads(meta.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise RegistryError("registered metadata must be an object")
+        _validate_metadata(data, record["model_type"])
+        if (data.get("model_version") != record["model_version"]
+                or data.get("model_sha256") != record["model_sha256"]
+                or data.get("target") != record["target"]
+                or data.get("feature_builder_version") != record["feature_version"]):
+            raise RegistryError("registered metadata attribution mismatch")
         manifest = hashlib.sha256(
             json.dumps(data["feature_columns"], sort_keys=True).encode("utf-8")
         ).hexdigest()
