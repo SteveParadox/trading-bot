@@ -53,3 +53,11 @@ def test_registry_verify_checks_metadata_contract_again(tmp_path):
     registry.manifest.write_text(json.dumps(payload), encoding="utf-8")
     with pytest.raises(RegistryError, match="entry target mismatch"):
         registry.verify(row["model_id"])
+
+
+def test_register_rejects_noncanonical_version(tmp_path):
+    registry = ModelRegistry(tmp_path / "registry")
+    model, metadata = _candidate(tmp_path / "run", " first ")
+    with pytest.raises(RegistryError, match="canonical"):
+        registry.register(model_path=model, metadata_path=metadata, model_type="entry_quality")
+    assert not registry.manifest.exists()
