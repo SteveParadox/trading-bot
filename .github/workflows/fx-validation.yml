@@ -2,7 +2,7 @@ name: FX Python validation
 on:
   pull_request:
   push:
-    branches: [main, codex/ai-market-snapshot]
+    branches: [main, 'codex/**']
 permissions:
   contents: read
 jobs:

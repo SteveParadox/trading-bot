@@ -1,0 +1,272 @@
+# Exit intelligence and challenger retraining: first safe implementation slice
+
+**Status (2026-10-09): Research-only, review required. NOT a production AI exit release.**
+
+This implementation deliberately makes the smallest broker-safe change possible.
+It **does not** claim completion of the broader AI-assisted exit / adaptive MLOps
+initiative. In particular, it cannot issue AI-initiated MT5 closing or stop
+modifications. That requires independently validated counterfactual exit labels,
+an approved challenger, a locked execution coordinator, fresh broker-position
+revalidation, and forward demo evidence.
+
+## Audited trading path
+
+The existing forward worker still follows:
+
+MT5 prices / closed candles -> strategy candidate -> candidate journal ->
+ML entry scores -> bounded LLM TAKE/WAIT/SKIP -> deterministic risk recheck ->
+MT5 entry -> `_sync_open_trades` -> sniper failure/time exits -> breakeven and
+ATR trailing stop -> broker close/history reconciliation -> trade journal and
+candidate outcome tracker.
+
+The worker collects historical captures after deterministic stop management,
+finishes news protection, then submits optional observations to a single daemon
+worker with a bounded queue (64 waiting captures, one in progress). Queue
+submission does not wait for inference or SQL. Positions inside a protective
+news blackout are skipped because their pre-news broker state may have changed.
+The observer has no broker execution path. Unavailable models and
+storage errors cannot authorize an exit or suppress the existing position
+manager. `FX_EXIT_AI_MODE=off` returns to original behavior. Existing entry
+AI / ML and live trading modes are untouched.
+
+## Delivered components
+
+- `fxbot/ai/exit_intelligence.py`: strict five-action taxonomy, causal
+  position snapshots, stable feature manifest, SHA-256 and feature-manifest
+  validated shadow predictor, structured version-tagged predictions. A missing
+  model is `unavailable`, never a fabricated HOLD.
+- `fxbot/ai/exit_policy.py`: **pure**, non-executing eligibility checks for
+  TAKE_PROFIT_NOW, HOLD, TRAIL_STOP, REDUCE_POSITION and EXIT. It blocks
+  unverified net profit, stop widening, missing broker lot sizes, and unapproved
+  defensive exits. An actual advisory execution coordinator is **not wired**.
+- `fxbot/forward.py`: journal `exit_ai_observation` (or a failure event)
+  through the existing SQL + JSONL event infrastructure, throttled per
+  configured evaluation interval per position lifetime per worker process,
+  including failed attempts. Throttle state is capped at 512 lifetimes.
+- `fxbot/ai/model_registry.py`: append-only audit history in an atomically
+  replaced JSON manifest, immutable model identifiers, SHA-256 checks, explicit
+  reviewer approval, candidate versus active metadata pointers and rollback.
+  Registry active pointers do **not** silently reconfigure running model
+  instances. Regulated live execution stays separately blocked.
+- `fxbot/retrain.py`: separate-process entry-quality challenger training
+  from a previously exported v2 CSV. Uses existing chronological splitter,
+  XGBoost baseline, per-job unique artifact directories, an exclusive
+  training lock, a minimum-new-record gate, candidate registration and
+  validation/test reports. **Never auto-promotes**.
+- `GET /api/exit-ai`: API-key-authenticated read-only model/registry state and
+  recent exit observations. It reports execution as disabled.
+- Focused test suites: `test_fx_exit_intelligence.py`,
+  `test_fx_exit_policy.py`, and `test_fx_model_registry.py`.
+
+No new database table was necessary for this slice: existing `event_log` JSON
+payloads preserve every observed position decision. A dedicated indexed exit
+decision/outcome table remains future work for high-volume studies.
+
+## Snapshot semantics and limitations
+
+At observation time the worker uses a fresh executable quote (bid to
+liquidate a BUY, ask to liquidate a SELL), the broker position ticket,
+opening time/price, direction, signed broker units (separate from MT5 lots), current SL/TP, holding time,
+unrealized broker P&L, and past sampled MFE/MAE where available. These
+excursions are **sampling lower bounds**, not full intratrade tick paths.
+Missing or noncausal historical telemetry leaves MFE/MAE/drawdown nullable with
+`excursion_quality=historical_excursions_unavailable`. Manual and recovered
+positions are not assigned invented excursions or strategy identities. Initial
+stops are reported separately only when preserved entry context supplies them.
+Unsupported news/ATR/RSI/momentum/partial-close fields remain null and cannot
+be silently filled from future market observations.
+
+The snapshot deliberately does **not** equate broker unrealized gross P&L
+with realized net P&L. Unknown exit commission, slippage, financing, conversion,
+and account-currency accounting mean `estimated_net_pl=null`. The pure
+TAKE_PROFIT_NOW policy therefore rejects that action rather than inventing
+profitable fills.
+
+A trained exit artifact would need: `target=EXIT_ACTION`,
+`feature_builder_version=exit-v2`, the precise
+`EXIT_FEATURE_COLUMNS` in source order, the complete five-class
+`EXIT_ACTIONS` order, `model_version`, and `model_sha256`. No trustworthy
+exit training artifact is bundled and no strategy backtest performance claims
+are made. Never deserialize untrusted external model files.
+
+## Configuration
+
+```dotenv
+# Demo accounts: shadow by default. Non-demo accounts: off by default.
+FX_EXIT_AI_MODE=shadow
+FX_EXIT_EVALUATION_INTERVAL_SECONDS=60
+FX_EXIT_MODEL_PATH=
+FX_EXIT_MODEL_METADATA_PATH=
+FX_EXIT_VERIFY_MODEL_HASH=true
+FX_MODEL_REGISTRY_PATH=data/models/registry
+```
+
+Only `off` and `shadow` are accepted. `advisory` fails configuration
+validation because safe MT5 modifications and demonstrated model value are not
+yet implemented. The pure policy's `advisory_released` argument defaults
+to false, and the worker never calls it to execute.
+
+For existing behavior, set `FX_EXIT_AI_MODE=off`. MT5 demo protection,
+existing stop-loss behavior, risk limits, news safeguards, and entry LLM
+configuration are unchanged.
+
+## Observed exit-horizon dataset (no action labels)
+
+To export the initial exit observation history from the existing SQL journal:
+
+```powershell
+python -m fxbot.ai.exit_observation_dataset --database-url sqlite:///./data/fx_forward_test.db --output data/training/exit_observed.csv --limit 50000 --max-lag-seconds 20
+```
+
+The CSV has separate audit identifiers, strictly decision-time exit features,
+and nullable future targets `observed_mark_return_60s_pips`,
+`observed_mark_return_180s_pips`, and
+`observed_mark_return_300s_pips`. It also writes a dataset manifest with
+SHA-256 and horizon coverage (`exit-observed-v2`). Base quote age must also
+fit within the exporter lag budget. Changed entry prices and recycled tickets
+are separated by position lifetime; duplicate conflicts resolve deterministically. Labels are derived only when the broker quote
+timestamp is at or after the requested horizon and within the allowed lag.
+Missing observations, reopened tickets, stale quotes, or insufficient coverage
+produce unknown targets instead of fabricated prices.
+
+This is a **quote-sampled research dataset**, not an executable exit
+counterfactual dataset. It does not account for alternative MT5 fills, partial
+closes, trailing stop reachability, realized commissions/financing, or future
+portfolio exposure. Do not train the five-class `EXIT_ACTION` model on its
+mark returns as if they were optimal actions.
+
+## Periodic training (entry-quality only)
+
+Prerequisites: install `requirements-fx-research.txt` plus
+`requirements-fx-ml.txt`, then export a fresh v2 causal training CSV using
+the repository's `fxbot.training_dataset` / historical reconstruction path.
+Keep research CSV files and model artifacts out of version control.
+
+Example from the repository root:
+
+```powershell
+python -m fxbot.retrain --dataset data/training/fx_4pair_test_v2.csv --artifacts-root data/models/challengers --registry-root data/models/registry --target TP_BEFORE_SL --min-new-samples 100
+```
+
+Default split boundaries are train 2023-2024, validation 2025, test January
+through June 2026, forward July 2026 onward, subject to the actual dataset
+having usable examples in every required training/evaluation partition. The
+existing split logic purges overlapping label horizons. The task is repeatable
+but **does not** manufacture sufficient samples or interpolate missing future
+labels. Dataset timestamps and candidate IDs are validated; new rows are
+counted by fingerprints of eligible TRAIN rows from the last registered job,
+including old timestamps whose labels completed later. Incomplete rows, purged
+rows, validation/test rows and forward rows cannot trigger a job.
+`label_end_timestamp` is required; missing validation/test periods fail closed.
+The fixed chronological dates intentionally do not assimilate current forward
+rows into training. Adaptive rolling retraining remains unreleased.
+
+Use Windows Task Scheduler or cron to call the command in a separate low-priority
+process, after your export pipeline has completed. For example a monthly cron
+entry (adapt to your server environment):
+
+```cron
+10 3 1 * * cd /srv/trading-bot && /srv/trading-bot/.venv/bin/python -m fxbot.retrain --dataset data/training/exported_v2.csv >> /var/log/fx-retrain.log 2>&1
+```
+
+There is no embedded training scheduler inside the MT5 worker. A lock prevents
+concurrent retraining; after an interrupted process leaves a lock, inspect
+running jobs before manually removing `retraining.lock`.
+
+## Registry approval and rollback
+
+Registry register creates a **candidate**. An operator can inspect the
+candidate through `ModelRegistry.status()`, review the reports and approve it
+with `ModelRegistry.approve(model_id, approver=..., evidence=...)`.
+`activate(model_id)` switches a local registry metadata pointer after hash
+verification. `rollback(model_type, previous_model_id)` restores a
+previously approved artifact pointer.
+
+**Do not confuse a metadata pointer with runtime activation.** The current
+entry-serving `VersionedModelLoader` still reads its configured local paths
+and caches the artifact. Repointing it requires a separately controlled
+deployment/restart following normal verification. Exit observation similarly
+uses configured paths and is shadow-only.
+
+Training results include validation and test metrics but no independent
+champion-vs-challenger trading backtest. The report explicitly marks that
+comparison `not_evaluated` and promotion `manual_review_required`.
+
+## Tests
+
+```powershell
+python -m compileall -q fxbot
+python -m pytest -q tests/test_fx_exit_intelligence.py tests/test_fx_exit_policy.py tests/test_fx_exit_observation_dataset.py tests/test_fx_model_registry.py
+python -m pytest -q tests/test_fx*.py
+```
+
+MT5 broker calls require a separate mocked or demo environment. This PR
+does not authorize execution testing against a real-money account.
+
+## Required future work before production advisory exits
+
+1. Construct a dedicated exit-decision dataset with linked original positions,
+   repeated time-stamped observations, future-only TP/SL outcomes and
+   realistic, feasible alternative-action replay. Model unknown counterfactuals
+   as unknown; address incomplete quote paths and entry-selection bias.
+2. Train and calibrate an exit model only when class support and genuine
+   out-of-sample performance justify it. Compare identical-entry baseline,
+   quick-profit rules, trailing, reduction, ML and (if useful) bounded LLM
+   deliberation under realistic broker costs.
+3. Build independently locked, idempotent MT5 position action coordinator:
+   re-fetch ticket, account, signed units, broker min volume/step, freeze
+   levels, SL/TP, quotes, and broker ack; distinguish hedging/netting; preserve
+   all deterministic emergency exits.
+4. Add a dedicated persisted action lifecycle, pending/unknown ack recovery,
+   coherent realized/partial P&L attribution, exit outcome tracker, historical
+   reconstruction and independent shadow-vs-baseline reporting.
+5. Produce a true reusable rolling/expanding data policy, minimum sample
+   coverage per action/regime, walk-forward purging, champion comparisons,
+   tested model hot-switch and full API/UI approval workflow.
+6. Demonstrate measurable net expectancy and controlled drawdown improvements
+   in forward demo runs before **explicitly** implementing and enabling
+   `FX_EXIT_AI_MODE=advisory`.
+
+**Acceptance boundary:** candidate prediction infrastructure exists; approved
+broker-executable exit intelligence does not. This PR should remain in review
+until CI and regression checks pass, and must not be represented as delivering
+all 29 phases of the requested feature.
+
+
+## Audit corrections and operational boundaries (2026-10-09)
+
+See [FX_EXIT_AI_AUDIT_20261009.md](FX_EXIT_AI_AUDIT_20261009.md) for actual checks,
+regressions, CI evidence and release limits. `exit-v1` records remain readable in
+the journal/API but the revised v2 exporter/loader intentionally excludes them;
+there is no automatic conversion that would invent missing historical quality.
+
+Both environment configuration and direct non-demo `FxBotSettings` construction
+resolve exit mode to OFF. Observation intervals must be integers from 1 to 86400.
+Only trusted operator-configured local joblib artifacts may be evaluated; SHA
+checks establish consistency, not pickle safety or approval. Configured models
+are explicitly shadow artifacts. A running predictor pins the bytes it loaded;
+replacing files or changing registry pointers does not switch it. Deploy/restart
+separately after controlled verification. Registry supports candidate, approved,
+active and retired metadata states; separate VALIDATED/SHADOW_TESTED gates are
+not implemented. It prevents cross-target replacement within a model family.
+
+The policy's profit evidence must include executable-price gross P&L, signed
+swap, nonnegative paid/closing commissions and slippage costs, account currency,
+conversion confirmation and matching quote timestamp/price. No runtime cost
+adapter currently supplies this evidence. Partial-close evidence must include
+verified action state, hedging/netting mode, broker minimum and volume step; no
+runtime coordinator supplies it. Trailing validation requires a causal ATR
+timestamp and rejects modification inside the existing stop's freeze zone.
+These are pure proposal checks, not permission to send an order.
+
+A stuck estimator occupies only the optional daemon worker; queue overflow drops
+research captures and `/api/exit-ai` exposes backlog/drop counts. Captures are
+historical, not current-position assertions; pending work is discarded on close.
+There is no hard cancellation of a running estimator, durable queue, exact-once
+restart collection, or automatic observation/artifact retention service. SQL
+shares the existing database and brief write contention remains possible.
+For strict runtime timing use OFF until a process-isolated service is validated.
+The exporter deterministically deduplicates repeated quotes; no missing sample
+is reconstructed after a restart. Interrupted training locks require an operator
+to confirm the old job is gone before deleting the lock. Failed registration may
+leave an inactive run directory for diagnosis, never an active champion change.

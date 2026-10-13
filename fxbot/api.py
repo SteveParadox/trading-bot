@@ -18,6 +18,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from fxbot.ai_evaluation import AiEvaluationConfig, ai_value_report
+from fxbot.ai.model_registry import ModelRegistry
+from fxbot.ai.exit_intelligence import ExitPrediction, EXIT_FEATURE_COLUMNS, EXIT_FEATURE_VERSION
 from fxbot.analytics import live_snapshot, performance_summary
 from fxbot.config import FxBotSettings, ensure_runtime_dirs, settings_from_env
 from fxbot.forward import ForwardTestWorker
@@ -225,6 +227,50 @@ def create_app(settings: FxBotSettings | None = None) -> FastAPI:
             "worker_task_running": bool(controller.task and not controller.task.done()),
             "demo_only": resolved_settings.broker.demo_only,
             "live_release_approved": resolved_settings.runtime.live_release_approved,
+        }
+
+    @app.get("/api/exit-ai", dependencies=[Depends(require_api_key)])
+    def exit_ai_status(
+        limit: int = Query(default=25, ge=1, le=100),
+    ) -> dict[str, Any]:
+        """Read-only, authenticated shadow observations and registry metadata."""
+        events = []
+        for row in journal.recent_events(limit=limit, event_types=("exit_ai_observation", "exit_ai_observation_failed")):
+            event = row_to_dict(row)
+            payload = event.get("payload") or {}
+            snapshot = payload.get("snapshot") or {}
+            prediction = payload.get("prediction") or {}
+            # Allowlisted schemas exclude arbitrary nested deployment details.
+            event["message"] = "Exit AI observation"
+            event["payload"] = {
+                key: payload.get(key) for key in ("mode", "execution_attempted", "applied_action",
+                    "policy_result", "execution_result", "code_version", "error", "ticket") if key in payload}
+            event["payload"]["snapshot"] = {key: snapshot.get(key) for key in (
+                *EXIT_FEATURE_COLUMNS, "schema_version", "position_id", "position_lifetime_id", "candidate_id",
+                "timestamp", "quote_timestamp", "symbol", "entry_timestamp", "entry_price", "units",
+                "pip_size", "liquidation_price", "bid", "ask", "stop_loss", "take_profit", "excursion_quality") if key in snapshot}
+            event["payload"]["prediction"] = {key: prediction.get(key)
+                for key in ExitPrediction.__dataclass_fields__ if key in prediction}
+            events.append(redact(event))
+        try:
+            registry = ModelRegistry(resolved_settings.exit_ai.registry_path).status(limit=limit)
+        except (OSError, ValueError, RuntimeError) as exc:
+            registry = {"status": "unavailable", "error": type(exc).__name__}
+        loaded = controller.worker.exit_predictor._artifact
+        return {
+            "mode": resolved_settings.exit_ai.mode,
+            "execution_enabled": False,
+            "model_configured": bool(resolved_settings.exit_ai.model_path and resolved_settings.exit_ai.metadata_path),
+            "model_status": "loaded_shadow_only" if loaded is not None else
+                ("configured_not_yet_verified" if resolved_settings.exit_ai.model_path else "unavailable"),
+            "loaded_model_version": loaded[1].get("model_version") if loaded is not None else None,
+            "loaded_model_sha256": loaded[2] if loaded is not None else None,
+            "observer": controller.worker._exit_observer.status(),
+            "model_integrity_check": resolved_settings.exit_ai.verify_hash,
+            "feature_version": EXIT_FEATURE_VERSION,
+            "evaluation_interval_seconds": resolved_settings.exit_ai.evaluation_interval_seconds,
+            "registry": registry,
+            "recent_observations": events,
         }
 
     @app.get("/api/positions", dependencies=[Depends(require_api_key)])
@@ -731,6 +777,15 @@ def _config_payload(settings: FxBotSettings) -> dict[str, Any]:
     ai_payload["api_key_configured"] = bool(settings.ai.api_key)
     ai_payload["endpoint_configured"] = bool(settings.ai.endpoint)
     payload["ai"] = ai_payload
+    # Newly added artifact and registry paths are private deployment details.
+    payload["exit_ai"] = {
+        "mode": settings.exit_ai.mode,
+        "evaluation_interval_seconds": settings.exit_ai.evaluation_interval_seconds,
+        "verify_hash": settings.exit_ai.verify_hash,
+        "model_configured": bool(settings.exit_ai.model_path and settings.exit_ai.metadata_path),
+        "registry_configured": bool(settings.exit_ai.registry_path),
+        "execution_enabled": False,
+    }
     payload["ml_prediction"] = {
         "mode": settings.ml_prediction.mode,
         "target": settings.ml_prediction.target,
