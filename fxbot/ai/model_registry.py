@@ -149,8 +149,8 @@ class ModelRegistry:
         if not data.get("feature_columns") or not data.get("feature_builder_version"):
             raise RegistryError("candidate feature manifest is missing")
         version = str(data.get("model_version") or "").strip()
-        if not version:
-            raise RegistryError("model version is required")
+        if not version or data.get("model_version") != version:
+            raise RegistryError("model version must be a canonical non-empty string")
         model_id = f"{model_type}:{version}:{digest[:16]}"
         record = {
             "model_id": model_id,
