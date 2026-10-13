@@ -214,3 +214,31 @@ now includes this feature branch. Local results are verified; hosted CI cannot b
 declared successful while the account lock remains. No merge readiness until CI
 executes successfully and a reviewer accepts the limited SHADOW research scope.
 Advisory exit release separately requires the unimplemented safety/value gates.
+
+## K. Follow-up release audit (2026-10-13)
+
+A further review found an integrity gap in registry registration: the original
+implementation validated metadata at one point in time but calculated its stored
+checksum by reading the file again. A concurrent replacement between those reads
+could have been registered as if it had passed validation. Registration now hashes
+the exact validated bytes and verifies both artifacts again while holding the
+registry lock before writing. Verification also repeats target/feature/attribution
+contract validation, and registry reads reject orphaned active-model statuses.
+Model versions must be canonical non-empty strings.
+
+Added `tests/test_fx_model_registry_release_audit.py` with regression cases for
+a concurrent metadata replacement, an orphaned active pointer, incompatible
+metadata even if the registry checksum is rewritten, and ambiguous versions.
+
+**Validation boundary:** the previously reported 770 passing FX tests belong
+to the October 9 commit, *not* to these follow-up patches. No local full-suite
+run on the October 13 head has been executed in this review. GitHub Actions
+for head `66b97f6c7c330763ae254bd4db2ddf5b5ab932ad` failed before executing
+steps (zero runner/job steps), consistent with the previously documented GitHub
+billing lock. Do not interpret these runs as test failures or test passes.
+
+The branch remains SHADOW-only with no broker action authority. Keep this PR in
+draft and unmerged until the new tests, full FX suite, and frontend build pass
+on the exact reviewed commit; resolve hosted CI access and obtain an independent
+release gate before merging into main. Merging research infrastructure does not
+approve AI-controlled exits, model promotion, or funded trading.
