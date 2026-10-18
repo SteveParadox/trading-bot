@@ -1,0 +1,60 @@
+name: Frontend validation
+
+on:
+  pull_request:
+    paths:
+      - "frontend/**"
+      - ".github/workflows/frontend-validation.yml"
+  push:
+    branches: [main]
+    paths:
+      - "frontend/**"
+      - ".github/workflows/frontend-validation.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  frontend:
+    name: Build and theme browser smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Install locked frontend dependencies
+        run: npm ci
+      - name: Theme initialization regression tests
+        run: npm run test:theme
+      - name: Build production dashboard
+        run: npm run build
+      - name: Check deployable output
+        run: |
+          test -f dist/index.html
+          test -f dist/theme-init.js
+          grep -q 'theme-init.js' dist/index.html
+          test -n "$(find dist/assets -maxdepth 1 -name '*.js' -print -quit)"
+          test -n "$(find dist/assets -maxdepth 1 -name '*.css' -print -quit)"
+      - name: Install isolated Chromium browser test dependency
+        run: |
+          npm install --no-save --package-lock=false playwright@1.56.1
+          npx playwright install --with-deps chromium
+      - name: Browser smoke on desktop and mobile layouts
+        run: |
+          npm run dev > /tmp/fx-theme-vite.log 2>&1 &
+          SERVER_PID=$!
+          trap 'kill "$SERVER_PID" || true' EXIT
+          curl --retry 30 --retry-delay 1 --retry-connrefused --fail --silent http://127.0.0.1:5173/ > /dev/null
+          node tests/theme.browser.mjs
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fx-dashboard-dist
+          path: frontend/dist/
+          retention-days: 7
