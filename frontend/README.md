@@ -40,12 +40,12 @@ allows `script-src 'self'` without requiring `unsafe-inline`.
 Run this from the repository root before deploying a FastAPI-hosted dashboard:
 
 ```powershell
-cd frontend
-npm ci
-npm run test:theme
-npm run build
-cd ..
+python scripts/build_frontend.py
 ```
+
+The build script uses locked npm dependencies, executes theme regression tests,
+generates production assets, and verifies the compiled JS, CSS and theme script.
+With existing `node_modules`, pass `--skip-install`.
 
 The FastAPI service serves the prebuilt `frontend/dist` directory directly.
 **Deploying source-only changes does not update that directory.** Rebuild it
