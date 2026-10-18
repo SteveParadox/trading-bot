@@ -24,6 +24,41 @@ Open `http://127.0.0.1:5173`, enter the `FX_API_KEY` configured for the
 backend, then select **Connect**. The dashboard saves the key only in the
 current browser's local storage and sends it as `X-API-Key` for API calls.
 
+Use the **White / Black** button in the header to switch the dashboard and
+Analyst workspace between light and dark themes, including charts and dialogs.
+The selected theme is saved in this browser and restored before the page
+renders. Black is the default if no theme has been saved or browser storage
+is unavailable. The toggle also works on the API-key connection screen.
+
+The theme is initialized by `frontend/public/theme-init.js`, which Vite copies
+into `frontend/dist/theme-init.js` as part of the production build. This is a
+same-origin external script, so it works with a Content Security Policy that
+allows `script-src 'self'` without requiring `unsafe-inline`.
+
+## Frontend verification and deployment
+
+Run this from the repository root before deploying a FastAPI-hosted dashboard:
+
+```powershell
+python scripts/build_frontend.py
+```
+
+The build script uses locked npm dependencies, executes theme regression tests,
+generates production assets, and verifies the compiled JS, CSS and theme script.
+With existing `node_modules`, pass `--skip-install`.
+
+The FastAPI service serves the prebuilt `frontend/dist` directory directly.
+**Deploying source-only changes does not update that directory.** Rebuild it
+on the machine/image where FastAPI will run, or use the `fx-dashboard-dist`
+artifact produced by the **Frontend validation** GitHub Actions workflow.
+Ensure `dist/index.html`, `dist/assets/` and `dist/theme-init.js` are
+present together. For a Vercel-hosted frontend, configure Vercel to build
+from `frontend/`, run `npm run build`, and serve `dist/`.
+
+CI runs the Node theme initialization regression tests, a production build,
+and Chromium smoke tests for theme switching, persistence, responsiveness and
+light-mode primary-button contrast. These checks do not issue trading orders.
+
 ## Deployment and API URL
 
 `npm run build` produces `frontend/dist`. When FastAPI serves that directory,

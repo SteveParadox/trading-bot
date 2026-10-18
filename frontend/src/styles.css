@@ -85,3 +85,148 @@ button svg { flex: 0 0 auto; }
 @media (max-width: 1120px) { .metricGrid { grid-template-columns: repeat(3, 1fr); }.lowerOverviewGrid { grid-template-columns: 1fr 1fr; }.outcomePanel { grid-column: 1 / -1; }.commandBar { grid-template-columns: 1fr auto; }.commandMeta { display: none; }.controlActions { grid-column: 1 / -1; justify-content: flex-end; }.connectionSetup { gap: 42px; }.appHeader { padding: 0 24px; } }
 @media (max-width: 800px) { .appHeader { grid-template-columns: 1fr auto; min-height: 64px; }.primaryNav { order: 3; grid-column: 1 / -1; width: 100%; margin-bottom: 9px; }.primaryNav button { flex: 1; justify-content: center; }.headerActions { gap: 7px; }.connectionBadge { font-size: 0; }.connectionBadge i { width: 8px; height: 8px; }.workspace { width: min(100% - 28px, 680px); padding-top: 23px; }.connectionSetup { grid-template-columns: 1fr; min-height: auto; padding: 35px 0 10px; }.setupCopy h1 { font-size: 38px; }.connectCard { padding: 24px; }.commandBar { grid-template-columns: 1fr; gap: 14px; }.controlActions { grid-column: auto; justify-content: stretch; }.controlButton { flex: 1; }.securityStrip { flex-wrap: wrap; margin-bottom: 24px; }.securityKey { flex: 1 0 100%; }.securityHint { margin-right: auto; }.pageHeading { align-items: flex-start; flex-direction: column; }.equityChip { align-self: stretch; }.metricGrid { grid-template-columns: repeat(2, 1fr); }.overviewGrid, .lowerOverviewGrid, .activityGrid { grid-template-columns: 1fr; }.outcomePanel { grid-column: auto; }.tableTitlebar { align-items: flex-start; flex-direction: column; }.tableFilters { width: 100%; }.searchField { flex: 1; }.filterButton { min-width: 66px; }.agentToolbar { align-items: stretch; flex-direction: column; }.agentInput, .agentInputWide { width: 100%; }.agentRunBtn { justify-content: center; }.agentDl { grid-template-columns: 1fr; }.agentDl dd { padding-top: 0; text-align: left; }.chartFooter { flex-wrap: wrap; } }
 @media (max-width: 460px) { .appHeader { padding: 0 14px; }.brand small { display: none; }.brandMark { width: 33px; height: 33px; }.workspace { width: calc(100% - 20px); }.setupCopy h1 { font-size: 33px; }.setupFeatures { font-size: 11px; }.connectCard { padding: 20px; }.metricGrid { grid-template-columns: 1fr; }.metricCard { min-height: 113px; }.securityHint { flex-basis: 100%; }.textButton { padding-left: 0; }.panelHeader, .tableTitlebar { padding-left: 15px; padding-right: 15px; }.chartFooter { padding-left: 15px; padding-right: 15px; }.chartWrap { margin: 0 5px; }.positionList, .eventList { padding-left: 15px; padding-right: 15px; }.healthScore, .healthList, .systemFooter { padding-left: 15px; padding-right: 15px; }.blackoutNotice { margin-left: 15px; margin-right: 15px; }.outcomeContent { justify-content: center; }.outcomeLegend { max-width: 130px; }.commandTitle p { max-width: 270px; }.controlButton { padding: 0 7px; font-size: 10px; } }
+
+
+/* Black / white theme tokens. The default remains black for existing users. */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  color: #f2f3f4;
+  background: #0b0b0c;
+  --page: #0b0b0c;
+  --surface: #161719;
+  --surface-raised: #222428;
+  --surface-input: #101113;
+  --border: rgba(216, 223, 231, .16);
+  --border-strong: rgba(216, 223, 231, .28);
+  --text: #f2f3f4;
+  --muted: #b0b6c0;
+  --muted-dim: #919ba8;
+  --header-bg: rgba(11, 11, 12, .93);
+  --ui-subtle: rgba(255, 255, 255, .045);
+  --ui-hover: rgba(255, 255, 255, .095);
+  --table-head-bg: #202226;
+  --chart-grid: rgba(210, 218, 226, .14);
+  --chart-tick: #a7b3c0;
+  --on-accent: #071710;
+  --shadow: 0 20px 60px rgba(0, 0, 0, .27);
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+  color: #15171a;
+  background: #ffffff;
+  --page: #ffffff;
+  --surface: #ffffff;
+  --surface-raised: #f3f4f6;
+  --surface-input: #f7f8f9;
+  --border: #e0e3e7;
+  --border-strong: #c6ccd3;
+  --text: #15171a;
+  --muted: #525d69;
+  --muted-dim: #64717f;
+  --header-bg: rgba(255, 255, 255, .94);
+  --ui-subtle: rgba(14, 23, 34, .035);
+  --ui-hover: rgba(14, 23, 34, .08);
+  --table-head-bg: #f6f7f8;
+  --chart-grid: rgba(35, 45, 55, .15);
+  --chart-tick: #5d6b78;
+  --on-accent: #ffffff;
+  --teal: #076e53;
+  --teal-dark: #055f47;
+  --teal-bg: rgba(7, 110, 83, .09);
+  --blue: #2656a3;
+  --red: #b62d43;
+  --red-bg: rgba(182, 45, 67, .09);
+  --amber: #885500;
+  --amber-bg: rgba(136, 85, 0, .09);
+  --shadow: 0 15px 45px rgba(17, 24, 39, .075);
+}
+
+/* Shared theme-aware surfaces and controls */
+body { background: var(--page); color: var(--text); }
+.appHeader { background: var(--header-bg); border-bottom-color: var(--border); }
+.primaryNav, .agentTabs, .segmentedControl { background: var(--surface-raised); }
+.connectCard, .commandBar, .metricCard, .panel, .securityStrip,
+.loadingPanel, .agentScoreRow, .agentSection, .agentExperiment {
+  background: var(--surface);
+}
+.panel, .connectCard, .commandBar, .metricCard { box-shadow: var(--shadow); }
+.chartTooltip, .confirmDialog, .agentSection pre { background: var(--surface-raised); }
+.agentBigScore, .agentMetaText, .agentFactorLevel, .headingBadge,
+.stateGlyph, .iconButton, .inlineIcon, .controlButton, .filterButton,
+.pagination button, .dialogActions button {
+  background: var(--ui-subtle);
+}
+.primaryNav button:hover, .agentTab:hover, .iconButton:hover, .inlineIcon:hover,
+.controlButton:hover:not(:disabled), .filterButton:hover,
+.pagination button:hover:not(:disabled), .dialogActions button:hover:not(:disabled),
+.textButton.muted:hover, .noticeClose:hover { background: var(--ui-hover); }
+tbody tr:hover { background: var(--ui-subtle); }
+th { color: var(--muted); background: var(--table-head-bg); border-color: var(--border); }
+td { color: var(--muted); border-bottom-color: var(--border); }
+td strong, .agentSection h3, .agentExperiment h3, .agentFactorTitle,
+.agentDl dd, .agentBigScore { color: var(--text); }
+.sectionKicker, .setupFeatures, .connectCard label, .commandMeta svg,
+.metricCard > span, .metricIcon, .equityChip small, .securityKey input,
+.controlButton:not(.primary):not(.destructive), .filterButton,
+.agentMetaText, .agentFactorLevel, .agentSection p, .agentSection li,
+.agentSection pre, .mono { color: var(--muted); }
+.passwordField input::placeholder, .securityKey input::placeholder,
+.searchField input::placeholder, .agentInput::placeholder { color: var(--muted-dim); }
+.exposureTrack { background: var(--ui-hover); }
+.primaryNav button.active, .agentTab.active, .segmentedControl button.active,
+.connectButton, .agentRunBtn, .controlButton.primary, .dialogActions .primary {
+  color: var(--on-accent);
+  background: var(--teal);
+}
+
+/* Keep semantic status colors legible on both backgrounds. */
+.connectionBadge.live, .statusBadge.positive, .sideBadge.long, .riskBadge {
+  color: var(--teal);
+}
+.statusBadge.negative, .sideBadge.short,
+.controlButton.destructive, .dialogActions .destructive { color: var(--red); }
+.notice, .blackoutNotice { color: var(--amber); }
+:root[data-theme="light"] .notice { background: var(--amber-bg); }
+:root[data-theme="light"] .statusBadge.positive,
+:root[data-theme="light"] .sideBadge.long,
+:root[data-theme="light"] .riskBadge { border-color: rgba(7, 110, 83, .2); }
+:root[data-theme="light"] .statusBadge.negative,
+:root[data-theme="light"] .sideBadge.short { border-color: rgba(182, 45, 67, .22); }
+:root[data-theme="light"] .tableScroll,
+:root[data-theme="light"] .tableWrap { scrollbar-color: #b7c0ca transparent; }
+
+/* Header theme toggle, available even before the API key is connected. */
+.themeToggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  height: 34px;
+  padding: 0 11px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  background: var(--surface-raised);
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 750;
+  white-space: nowrap;
+  transition: background 160ms ease, border-color 160ms ease;
+}
+/* A hover state must retain sufficient contrast in both themes. */
+.connectButton:hover:not(:disabled),
+.controlButton.primary:hover:not(:disabled),
+.dialogActions .primary:hover,
+.agentRunBtn:hover:not(:disabled) {
+  background: var(--teal-dark);
+  color: var(--on-accent);
+}
+.themeToggle:hover { border-color: var(--border-strong); background: var(--ui-hover); }
+.themeToggle:focus-visible { outline: 2px solid var(--teal); outline-offset: 3px; }
+@media (max-width: 460px) {
+  .themeToggle { width: 34px; padding: 0; }
+  .themeToggleText { display: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .themeToggle { transition: none; }
+}
