@@ -213,6 +213,14 @@ td strong, .agentSection h3, .agentExperiment h3, .agentFactorTitle,
   white-space: nowrap;
   transition: background 160ms ease, border-color 160ms ease;
 }
+/* A hover state must retain sufficient contrast in both themes. */
+.connectButton:hover:not(:disabled),
+.controlButton.primary:hover:not(:disabled),
+.dialogActions .primary:hover,
+.agentRunBtn:hover:not(:disabled) {
+  background: var(--teal-dark);
+  color: var(--on-accent);
+}
 .themeToggle:hover { border-color: var(--border-strong); background: var(--ui-hover); }
 .themeToggle:focus-visible { outline: 2px solid var(--teal); outline-offset: 3px; }
 @media (max-width: 460px) {
