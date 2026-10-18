@@ -24,6 +24,12 @@ Open `http://127.0.0.1:5173`, enter the `FX_API_KEY` configured for the
 backend, then select **Connect**. The dashboard saves the key only in the
 current browser's local storage and sends it as `X-API-Key` for API calls.
 
+Use the **White / Black** button in the header to switch the dashboard and
+Analyst workspace between light and dark themes, including charts and dialogs.
+The selected theme is saved in this browser and restored before the page
+renders. Black is the default if no theme has been saved or browser storage
+is unavailable. The toggle also works on the API-key connection screen.
+
 ## Deployment and API URL
 
 `npm run build` produces `frontend/dist`. When FastAPI serves that directory,
