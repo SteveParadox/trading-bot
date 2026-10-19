@@ -90,6 +90,10 @@ def evaluate_signal_frame(
     timestamp: datetime | None = None,
     structure_frame: pd.DataFrame | None = None,
 ) -> FxSignalDecision:
+    if settings.structure_timeframe is not None and timestamp is None:
+        # Without a decision time the caller cannot prove that the
+        # intermediate or higher-timeframe bars are actually closed/current.
+        return FxSignalDecision(None, "decision_timestamp_required", {})
     try:
         entry = _ensure_indicators(entry_frame)
         htf = _ensure_indicators(htf_frame)
