@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite --host 127.0.0.1 --port 5173",
+    "test:polling": "node --test tests/polling.test.mjs",
     "test:theme": "node --test tests/theme.test.mjs",
     "build": "tsc && vite build",
     "preview": "vite preview --host 127.0.0.1 --port 5173"

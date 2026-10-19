@@ -141,36 +141,23 @@ def _wilders_smooth(series: pd.Series, period: int) -> pd.Series:
     1..period because index 0 normally represents the unavailable
     first-difference/previous-close observation.
     """
-    result = pd.Series(
-        np.nan,
-        index=series.index,
-        dtype="float64",
-    )
-
+    # Keep the recurrence and seed identical; avoid pandas scalar dispatch in
+    # this hot loop. Input arrays are read-only and the result owns its storage.
+    values = series.to_numpy(dtype="float64", copy=False)
+    output = np.full(len(series), np.nan, dtype="float64")
     if period <= 0 or len(series) <= period:
-        return result
-
+        return pd.Series(output, index=series.index)
     seed = series.iloc[1 : period + 1]
-
     if seed.isna().any():
-        return result
-
-    result.iloc[period] = seed.sum()
-
-    for index in range(period + 1, len(series)):
-        current = series.iloc[index]
-
-        if pd.isna(current) or pd.isna(result.iloc[index - 1]):
+        return pd.Series(output, index=series.index)
+    output[period] = seed.sum()
+    for position in range(period + 1, len(values)):
+        current = values[position]
+        previous = output[position - 1]
+        if pd.isna(current) or pd.isna(previous):
             continue
-
-        previous = result.iloc[index - 1]
-        result.iloc[index] = (
-            previous
-            - (previous / period)
-            + current
-        )
-
-    return result
+        output[position] = previous - (previous / period) + current
+    return pd.Series(output, index=series.index)
 
 
 def _calculate_wilder_adx(
@@ -231,23 +218,17 @@ def _calculate_wilder_adx(
         # This should not normally happen with sufficient clean history.
         return di_plus, di_minus, adx
 
-    adx.iloc[first_adx_index] = seed_window.mean()
-
-    for current_index in range(first_adx_index + 1, len(dx)):
-        current_dx = dx.iloc[current_index]
-        previous_adx = adx.iloc[current_index - 1]
-
+    adx_values = adx.to_numpy(copy=True)
+    dx_values = dx.to_numpy(copy=False)
+    adx_values[first_adx_index] = seed_window.mean()
+    for current_index in range(first_adx_index + 1, len(dx_values)):
+        current_dx = dx_values[current_index]
+        previous_adx = adx_values[current_index - 1]
         if pd.isna(current_dx) or pd.isna(previous_adx):
             continue
+        adx_values[current_index] = (previous_adx * (period - 1) + current_dx) / period
 
-        adx.iloc[current_index] = (
-            (
-                previous_adx * (period - 1)
-            )
-            + current_dx
-        ) / period
-
-    return di_plus, di_minus, adx
+    return di_plus, di_minus, pd.Series(adx_values, index=index)
 
 
 # ---------------------------------------------------------------------------

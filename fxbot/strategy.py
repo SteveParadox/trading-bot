@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from fxbot.performance import measured
+
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import math
@@ -63,6 +65,7 @@ class CandleFrameError(ValueError):
         self.details = details or {}
 
 
+@measured("indicators")
 def prepare_indicators(frame: pd.DataFrame) -> pd.DataFrame:
     """Return FX-specific indicator data using explicit runtime parameters.
 
@@ -81,6 +84,7 @@ def prepare_indicators(frame: pd.DataFrame) -> pd.DataFrame:
     ).sort_index()
 
 
+@measured("strategy")
 def evaluate_signal_frame(
     entry_frame: pd.DataFrame,
     htf_frame: pd.DataFrame,
@@ -413,7 +417,7 @@ def _direction_from_row(
     volume_ratio_min: float,
 ) -> FxSignalDecision:
     required = ["ma7", "ma14", "ma28", "adx", "di_plus", "di_minus", "close"]
-    if any(column not in row or pd.isna(row[column]) for column in required):
+    if any(column not in row or not math.isfinite(_safe_float(row[column], float("nan"))) for column in required):
         return FxSignalDecision(None, "indicator_unavailable", {"required": required})
 
     volume_ma_ratio = _safe_float(row.get("volume_ma_ratio"), _safe_float(row.get("volume_ratio")))
@@ -612,8 +616,16 @@ def _normalize_market_frame(frame: pd.DataFrame, *, require_ohlcv: bool) -> pd.D
         missing = [column for column in ("open", "high", "low", "close", "volume") if column not in result.columns]
         if missing:
             raise CandleFrameError("missing_ohlcv", {"missing": missing})
-        if result[["open", "high", "low", "close", "volume"]].isna().any().any():
+        values = result[["open", "high", "low", "close", "volume"]]
+        if values.isna().any().any():
             raise CandleFrameError("nan_ohlcv", {})
+        try:
+            import numpy as np
+            finite = np.isfinite(values.to_numpy(dtype=float)).all()
+        except (ValueError, TypeError):
+            finite = False
+        if not finite:
+            raise CandleFrameError("nonfinite_ohlcv", {})
     return result
 
 

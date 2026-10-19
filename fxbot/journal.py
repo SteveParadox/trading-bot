@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from fxbot.performance import measured
+
 import json
 import math
 import os
@@ -96,6 +98,7 @@ class StructuredJournal:
         self.write_jsonl("bot_state", {"state": value, "reason": reason})
         return row
 
+    @measured("db_signal_write")
     def record_signal(
         self,
         *,
@@ -163,6 +166,7 @@ class StructuredJournal:
         self.write_jsonl("signal_updated", row)
         return row
 
+    @measured("db_candidate_write")
     def record_candidate(
         self,
         *,
@@ -473,6 +477,7 @@ class StructuredJournal:
     def recent_ai_deliberations(self, limit: int = 200) -> list[AiDeliberationRow]:
         return _recent(self.sessions, AiDeliberationRow, limit)
 
+    @measured("db_order_reserve")
     def reserve_order(
         self,
         *,
@@ -514,6 +519,7 @@ class StructuredJournal:
         self.write_jsonl("order_reserved", row)
         return row, True
 
+    @measured("db_order_update")
     def update_order(
         self,
         client_order_id: str,
@@ -794,6 +800,7 @@ class StructuredJournal:
             return session.scalar(select(OrderJournalRow.id).where(
                 OrderJournalRow.status.in_(("pending", "unknown", "submitted", "operator_review"))).limit(1)) is not None
 
+    @measured("db_trade_write")
     def upsert_trade(
         self,
         *,
@@ -1001,12 +1008,14 @@ class StructuredJournal:
     def recent_orders(self, limit: int = 200) -> list[OrderJournalRow]:
         return _recent(self.sessions, OrderJournalRow, limit)
 
+    @measured("db_signal_read")
     def recent_signals(self, limit: int = 200) -> list[SignalJournalRow]:
         return _recent(self.sessions, SignalJournalRow, limit)
 
     def recent_trades(self, limit: int = 200) -> list[TradeJournalRow]:
         return _recent(self.sessions, TradeJournalRow, limit)
 
+    @measured("db_trade_read")
     def filtered_trades(
         self,
         *,

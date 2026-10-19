@@ -56,7 +56,7 @@ class MultiTimeframeTests(unittest.TestCase):
         self.assertEqual(decision.signal, Side.LONG, decision.reason)
         self.assertEqual(decision.details["htf_timeframe"], "4h")
         self.assertEqual(decision.details["structure_timeframe"], "1h")
-        self.assertEqual(decision.details["entry_timeframe"], "5m")
+        self.assertEqual(decision.details["entry_timeframe"], self.settings.entry_timeframe)
         self.assertEqual(decision.details["structure_signal_time"], self.structure.index[-1].isoformat())
         intent = build_signal_intent(
             self.entry, self.htf, instrument=FxInstrument("EUR_USD"),
@@ -120,7 +120,9 @@ class MultiTimeframeTests(unittest.TestCase):
         self.assertEqual(stale_h4.details["timeframe"], "4h")
 
     def test_short_direction_requires_h1_slope_confirmation(self):
-        self.entry = trend("5min", "2026-01-08T11:55:00Z", -0.00008, start=1.2)
+        self.entry = trend("5min" if self.settings.entry_timeframe == "5m" else "15min",
+                           "2026-01-08T11:55:00Z" if self.settings.entry_timeframe == "5m" else "2026-01-08T11:45:00Z",
+                           -0.00008, start=1.2)
         self.structure = trend("1h", "2026-01-08T11:00:00Z", -0.0003, start=1.2)
         self.htf = trend("4h", "2026-01-08T08:00:00Z", -0.0007, start=1.25)
         result = self.decide()
@@ -138,7 +140,7 @@ class MultiTimeframeTests(unittest.TestCase):
             structure_frame=self.structure,
         )
         self.assertIsNotNone(intent)
-        frames = {"5m": self.entry, "1h": self.structure, "4h": self.htf}
+        frames = {self.settings.entry_timeframe: self.entry, "1h": self.structure, "4h": self.htf}
         worker = object.__new__(ForwardTestWorker)
         worker.settings = SimpleNamespace(
             strategy=self.settings, runtime=SimpleNamespace(max_price_age_seconds=30)

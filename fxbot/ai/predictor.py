@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from fxbot.performance import measured
+
 import hashlib
 import json
 import logging
@@ -86,6 +88,7 @@ class PredictionService:
                     verify_hash=settings.verify_hash,
                 )
 
+    @measured("ml_inference")
     def predict(self, request: PredictionRequest) -> NumericalPrediction:
         started = time.perf_counter()
         if self.settings.mode == "off":
@@ -106,6 +109,19 @@ class PredictionService:
                 json.dumps(features, sort_keys=True, default=str, separators=(",", ":")).encode("utf-8")
             ).hexdigest()
             artifact = self.loader.load()
+            # Every model contributing to an execution recommendation needs
+            # explicit validation for the active strategy distribution.
+            if request.strategy_context is not None:
+                artifacts = [artifact]
+                if self.entry_loader is not None:
+                    artifacts.append(self.entry_loader.load())
+                artifacts.extend(loader.load() for loader in self.auxiliary_loaders.values())
+                if any(item.metadata.get("validated_strategy_context") != request.strategy_context
+                       for item in artifacts):
+                    return NumericalPrediction(
+                        status="unavailable", error="model_strategy_incompatible",
+                        latency_ms=_elapsed_ms(started),
+                    )
             frame = pd.DataFrame([features])
             probability = _binary_probability(artifact, frame)
             outputs = _classification_outputs(artifact.target, probability)

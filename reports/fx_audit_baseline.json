@@ -1,0 +1,46 @@
+{
+  "git_revision": "c3a00653ba19a36a823b7fd4089f12234eab915b",
+  "source_sha256": "a75f9069c82b380cb2c38dec6a80f1c1887618f7831ec6dcd37dc699089e92d4",
+  "kind": "synthetic_engineering_benchmark_not_trading_results",
+  "python": "3.12.14",
+  "platform": "Linux-6.18.55-x86_64-with-glibc2.39",
+  "pandas": "2.2.3",
+  "numpy": "2.3.5",
+  "workloads": {
+    "indicators_180_bars": {
+      "iterations": 60,
+      "median_ms": 27.03508550001743,
+      "p95_ms": 28.269791000070654,
+      "cpu_seconds": 1.627878819,
+      "peak_traced_bytes_3_calls": 192388
+    },
+    "three_frame_raw_decision": {
+      "iterations": 60,
+      "median_ms": 87.08098399995379,
+      "p95_ms": 95.12070300002051,
+      "cpu_seconds": 5.245802606000001,
+      "peak_traced_bytes_3_calls": 375843
+    },
+    "journal_read_100_of_10000": {
+      "iterations": 60,
+      "median_ms": 1.1889614999631704,
+      "p95_ms": 1.4239829999951326,
+      "cpu_seconds": 0.0735331230000007,
+      "peak_traced_bytes_3_calls": 183585
+    },
+    "journal_signal_write": {
+      "iterations": 60,
+      "median_ms": 0.21055550001847223,
+      "p95_ms": 0.29200799997397553,
+      "cpu_seconds": 0.0152731029999984,
+      "peak_traced_bytes_3_calls": 18882
+    },
+    "authenticated_config_api": {
+      "iterations": 60,
+      "median_ms": 2.2808869999835224,
+      "p95_ms": 3.911649000087891,
+      "cpu_seconds": 0.13858648799999962,
+      "peak_traced_bytes_3_calls": 84961
+    }
+  }
+}

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { chromium } from "playwright";
+const { chromium } = await import(process.env.PLAYWRIGHT_MODULE ?? "playwright");
 
 const url = process.env.FRONTEND_TEST_URL ?? "http://127.0.0.1:5173";
 
@@ -38,7 +38,7 @@ try {
       assert.equal(await page.locator('meta[name="theme-color"]').getAttribute("content"), "#ffffff");
 
       const connect = page.getByRole("button", { name: "Connect securely" });
-      await page.getByLabel("API key").fill("only-for-appearance-testing");
+      await page.getByLabel("API key", { exact: true }).fill("only-for-appearance-testing");
       await connect.hover();
       const colors = await connect.evaluate((element) => ({
         foreground: getComputedStyle(element).color,

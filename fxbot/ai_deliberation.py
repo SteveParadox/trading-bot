@@ -7,6 +7,8 @@ package and returns validated, untrusted research data.
 
 from __future__ import annotations
 
+from fxbot.performance import measured
+
 import hashlib
 import json
 import logging
@@ -384,6 +386,7 @@ class AiDeliberationService:
         self.settings = settings
         self.provider = provider or _http_provider(settings)
 
+    @measured("llm_deliberation")
     def deliberate(self, evidence: FxSignalEvidence) -> AiDeliberationResult:
         started = time.perf_counter()
         try:

@@ -384,6 +384,8 @@ class StrategySettings:
         if self.htf_timeframe not in {"1h", "4h", "1d"}:
             raise ValueError("unsupported FX HTF timeframe")
         durations = {"5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440}
+        if durations[self.entry_timeframe] >= durations[self.htf_timeframe]:
+            raise ValueError("FX entry timeframe must be shorter than HTF")
         if self.structure_timeframe is not None:
             if self.structure_timeframe not in durations:
                 raise ValueError("unsupported FX structure timeframe")
@@ -394,7 +396,7 @@ class StrategySettings:
         if self.structure_ma28_slope_lookback < 1:
             raise ValueError("strategy.structure_ma28_slope_lookback must be at least 1")
         if self.structure_timeframe is not None and self.candle_limit < 60:
-            raise ValueError("strategy.candle_limit must be at least 60 for H4/H1/M5 confirmation")
+            raise ValueError("strategy.candle_limit must be at least 60 for multi-timeframe confirmation")
         if self.structure_timeframe is not None and self.structure_ma28_slope_lookback >= self.candle_limit:
             raise ValueError("strategy.structure_ma28_slope_lookback must be smaller than candle_limit")
         if self.tp_timeframe is not None and self.tp_timeframe not in {"5m", "15m", "30m", "1h"}:
@@ -734,7 +736,7 @@ def settings_from_env() -> FxBotSettings:
             symbol_map=_get_symbol_map("MT5_SYMBOL_MAP"),
         ),
         strategy=StrategySettings(
-            entry_timeframe=_get_str("FX_ENTRY_TIMEFRAME", "5m"),
+            entry_timeframe=_get_str("FX_ENTRY_TIMEFRAME", "15m"),
             htf_timeframe=_get_str("FX_HTF_TIMEFRAME", "4h"),
             structure_timeframe=_get_str(
                 "FX_STRUCTURE_TIMEFRAME",

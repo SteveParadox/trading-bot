@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from fxbot.performance import measured, operation_timings
+
 import asyncio
 import hashlib
 import logging
@@ -191,6 +193,7 @@ class ForwardTestWorker:
         self.deliberator.close()
         self.journal.close()
 
+    @measured("scan")
     def scan_once(self) -> None:
         now = datetime.now(timezone.utc)
         if self.journal.get_state().state == BotRunState.STOPPED.value:
@@ -378,6 +381,7 @@ class ForwardTestWorker:
             self.monitor.clear_unknown_order(row.client_order_id)
             self.journal.log_event("order_reconciled", f"order {row.client_order_id} reconciled", payload={"state": result.after.value})
 
+    @measured("instrument_scan")
     def _scan_instrument(
         self,
         now: datetime,
@@ -827,6 +831,12 @@ class ForwardTestWorker:
                         strategy_score=float(intent.score),
                         execution_cost_pips_round_trip=float(candidate_row.payload["execution_cost_pips_round_trip"]),
                         pip_size=instrument.pip_size,
+                        strategy_context={
+                            "entry_timeframe": self.settings.strategy.entry_timeframe,
+                            "htf_timeframe": self.settings.strategy.htf_timeframe,
+                            "structure_timeframe": self.settings.strategy.structure_timeframe,
+                            "tp_timeframe": self.settings.strategy.tp_timeframe,
+                        },
                     )
                 )
         except Exception as exc:
@@ -1075,6 +1085,7 @@ class ForwardTestWorker:
             log.warning("execution revalidation failed: %s", type(exc).__name__)
             return False
 
+    @measured("execution_confirmation")
     def _timeframe_evidence_still_current(
         self, intent: FxSignalIntent, instrument: FxInstrument, now: datetime
     ) -> bool:
@@ -1121,6 +1132,7 @@ class ForwardTestWorker:
             for key in ("signal_time", "htf_signal_time", "structure_signal_time")
         )
 
+    @measured("execution_revalidation")
     def _revalidate_execution(self, intent: FxSignalIntent, instrument: FxInstrument, risk: FxRiskDecision) -> bool:
         if not risk.allowed or risk.exit_plan is None:
             return False
@@ -1188,7 +1200,7 @@ class ForwardTestWorker:
                 if not still_aligned:
                     self.journal.log_event(
                         "multi_timeframe_confirmation_expired",
-                        "H4/H1/M5 confirmation expired before order leg",
+                        "Multi-timeframe confirmation expired before order leg",
                         level="warning",
                         payload={"instrument": instrument.name, "leg": leg_name},
                     )
@@ -1250,6 +1262,8 @@ class ForwardTestWorker:
                 submitted = True
                 continue
             try:
+                operation_timings.observe("signal_to_order", max(0.0,
+                    (datetime.now(timezone.utc) - intent.timestamp).total_seconds() * 1000))
                 response = self.client.create_market_order(
                     instrument=instrument,
                     signed_units=units * intent.side.broker_units_sign,

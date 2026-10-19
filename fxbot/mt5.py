@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from fxbot.performance import measured
+
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -113,6 +115,7 @@ class Mt5Client:
         conversions = self._conversion_rates(prices)
         return PricingResponse(prices=prices, conversion_rates=conversions, raw={"prices": raw_prices, "conversion_rates": conversions})
 
+    @measured("market_data")
     def candles(self, instrument: str, timeframe: str, count: int) -> pd.DataFrame:
         self._ensure_connected()
         mt5 = self._module()
@@ -597,8 +600,9 @@ class Mt5Client:
             if getter is None:
                 continue
             rows = getter()
-            if not rows:
-                continue
+            if rows is None:
+                self._mark_disconnected()
+                raise Mt5Error(f"MT5 {getter_name} failed during duplicate-order lookup: {mt5.last_error()}")
             for row in rows:
                 payload = _as_dict(row)
                 if str(payload.get("comment") or "").startswith(marker):
@@ -608,6 +612,7 @@ class Mt5Client:
                             "trade_id": identifier if getter_name == "positions_get" else None}
         return None
 
+    @measured("order_submit")
     def create_market_order(
         self,
         *,
@@ -707,6 +712,7 @@ class Mt5Client:
                 return str(position_id)
         return ""
 
+    @measured("trade_modify")
     def set_trade_dependent_orders(
         self,
         *,

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from fxbot.performance import measured
+
 import math
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -69,6 +71,7 @@ class FxRiskManager:
         self._daily_start_equity: dict[str, float] = {}
         self._halted_days: set[str] = set()
 
+    @measured("risk")
     def evaluate_intent(
         self,
         intent: FxSignalIntent,

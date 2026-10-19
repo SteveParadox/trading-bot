@@ -228,5 +228,8 @@ td strong, .agentSection h3, .agentExperiment h3, .agentFactorTitle,
   .themeToggleText { display: none; }
 }
 @media (prefers-reduced-motion: reduce) {
-  .themeToggle { transition: none; }
+  button { transition: none !important; }
 }
+
+.timeframeStrip { display: flex; flex-wrap: wrap; gap: 12px 24px; padding: 12px 18px; color: var(--muted); font-size: 12px; border: 1px solid var(--border); border-radius: 12px; }
+.timeframeStrip strong { color: var(--text); margin-left: 6px; }
