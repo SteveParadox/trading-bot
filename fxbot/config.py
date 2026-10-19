@@ -296,6 +296,10 @@ class BrokerSettings:
 class StrategySettings:
     entry_timeframe: str = "15m"
     htf_timeframe: str = "1h"
+    # Optional intermediate H1 confirmation. None preserves old two-frame logic.
+    structure_timeframe: str | None = None
+    structure_adx_min: float = 18.0
+    structure_ma28_slope_lookback: int = 3
     candle_limit: int = 180
     adx_min: float = 18.0
     htf_adx_min: float = 20.0
@@ -375,6 +379,16 @@ class StrategySettings:
             raise ValueError("unsupported FX entry timeframe")
         if self.htf_timeframe not in {"1h", "4h", "1d"}:
             raise ValueError("unsupported FX HTF timeframe")
+        durations = {"5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440}
+        if self.structure_timeframe is not None:
+            if self.structure_timeframe not in durations:
+                raise ValueError("unsupported FX structure timeframe")
+            if not durations[self.entry_timeframe] < durations[self.structure_timeframe] < durations[self.htf_timeframe]:
+                raise ValueError("FX timeframes must satisfy entry < structure < HTF")
+        if not math.isfinite(self.structure_adx_min) or self.structure_adx_min < 0:
+            raise ValueError("strategy.structure_adx_min must be finite and nonnegative")
+        if self.structure_ma28_slope_lookback < 1:
+            raise ValueError("strategy.structure_ma28_slope_lookback must be at least 1")
         if self.tp_timeframe is not None and self.tp_timeframe not in {"5m", "15m", "30m", "1h"}:
             raise ValueError("unsupported FX TP timeframe")
         if not math.isfinite(self.tp_atr_multiplier) or self.tp_atr_multiplier <= 0:
@@ -712,8 +726,14 @@ def settings_from_env() -> FxBotSettings:
             symbol_map=_get_symbol_map("MT5_SYMBOL_MAP"),
         ),
         strategy=StrategySettings(
-            entry_timeframe=_get_str("FX_ENTRY_TIMEFRAME", "15m"),
-            htf_timeframe=_get_str("FX_HTF_TIMEFRAME", "1h"),
+            entry_timeframe=_get_str("FX_ENTRY_TIMEFRAME", "5m"),
+            htf_timeframe=_get_str("FX_HTF_TIMEFRAME", "4h"),
+            structure_timeframe=_get_str(
+                "FX_STRUCTURE_TIMEFRAME",
+                "1h" if _get_str("FX_HTF_TIMEFRAME", "4h") == "4h" else "",
+            ).lower() or None,
+            structure_adx_min=_get_float("FX_STRUCTURE_ADX_MIN", 18.0),
+            structure_ma28_slope_lookback=_get_int("FX_STRUCTURE_MA28_SLOPE_LOOKBACK", 3),
             candle_limit=_get_int("FX_CANDLE_LIMIT", 180),
             adx_min=_get_float("FX_ADX_MIN", 18.0),
             htf_adx_min=_get_float("FX_HTF_ADX_MIN", 20.0),
