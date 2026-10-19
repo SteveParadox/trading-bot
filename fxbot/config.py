@@ -762,7 +762,10 @@ def settings_from_env() -> FxBotSettings:
             max_stop_atr_multiple=_get_float("FX_MAX_STOP_ATR_MULTIPLE", 4.0),
             require_volume_confirmation=_get_bool("FX_REQUIRE_VOLUME_CONFIRMATION", False),
             volume_ratio_min=_get_float("FX_VOLUME_RATIO_MIN", 0.80),
-            htf_require_momentum_candle=_get_bool("FX_HTF_REQUIRE_MOMENTUM_CANDLE", True),
+            htf_require_momentum_candle=_get_bool(
+                "FX_HTF_REQUIRE_MOMENTUM_CANDLE",
+                _get_str("FX_HTF_TIMEFRAME", "4h") != "4h",
+            ),
             min_signal_score=_get_float("FX_MIN_SIGNAL_SCORE", 60.0),
             min_di_edge=_get_float("FX_MIN_DI_EDGE", 5.0),
             require_adx_non_decreasing=_get_bool("FX_REQUIRE_ADX_NON_DECREASING", True),
