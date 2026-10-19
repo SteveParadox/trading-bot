@@ -145,6 +145,58 @@ class MultiTimeframeTests(unittest.TestCase):
         frames["1h"] = trend("1h", "2026-01-08T11:00:00Z", -0.0003, start=1.15)
         self.assertFalse(worker._timeframe_evidence_still_current(intent, instrument, DECISION_TIME))
 
+    def test_order_leg_is_blocked_when_confirmation_expires(self):
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        from fxbot.forward import ForwardTestWorker
+
+        instrument = FxInstrument("EUR_USD")
+        intent = build_signal_intent(
+            self.entry, self.htf, instrument=instrument,
+            settings=self.settings, entry_price=1.1, timestamp=DECISION_TIME,
+            structure_frame=self.structure,
+        )
+        self.assertIsNotNone(intent)
+        worker = object.__new__(ForwardTestWorker)
+        worker.settings = SimpleNamespace(strategy=self.settings)
+        worker.journal = SimpleNamespace(log_event=Mock())
+        worker.client = SimpleNamespace(create_market_order=Mock())
+        worker._order_legs = Mock(return_value=[("leg1", 1000.0, 1.11)])
+        worker._timeframe_evidence_still_current = Mock(return_value=False)
+        worker._tp_candle_still_current = Mock(return_value=True)
+        risk = SimpleNamespace(allowed=True, exit_plan=SimpleNamespace(stop_loss=1.07))
+        self.assertFalse(worker._submit_idempotent(intent, instrument, risk))
+        worker.client.create_market_order.assert_not_called()
+        worker.journal.log_event.assert_called_once()
+        worker._tp_candle_still_current.assert_not_called()
+
+    def test_environment_defaults_and_explicit_legacy_overrides(self):
+        from unittest.mock import patch
+        from fxbot.config import settings_from_env
+
+        with patch.dict("os.environ", {
+            "FX_ENTRY_TIMEFRAME": "5m",
+            "FX_HTF_TIMEFRAME": "4h",
+            "FX_STRUCTURE_TIMEFRAME": "1h",
+            "MT5_DEMO_ONLY": "true",
+            "FX_LIVE_TRADING_ENABLED": "false",
+            "FX_USE_FOREX_FACTORY": "false",
+        }):
+            loaded = settings_from_env().strategy
+        self.assertEqual((loaded.entry_timeframe, loaded.structure_timeframe, loaded.htf_timeframe),
+                         ("5m", "1h", "4h"))
+        with patch.dict("os.environ", {
+            "FX_ENTRY_TIMEFRAME": "15m",
+            "FX_HTF_TIMEFRAME": "1h",
+            "FX_STRUCTURE_TIMEFRAME": "",
+            "MT5_DEMO_ONLY": "true",
+            "FX_LIVE_TRADING_ENABLED": "false",
+            "FX_USE_FOREX_FACTORY": "false",
+        }):
+            legacy = settings_from_env().strategy
+        self.assertEqual((legacy.entry_timeframe, legacy.structure_timeframe, legacy.htf_timeframe),
+                         ("15m", None, "1h"))
+
     def test_h4_default_disables_only_momentum_candle_gate(self):
         self.assertFalse(StrategySettings(htf_timeframe="4h").htf_require_momentum_candle)
         self.assertTrue(StrategySettings(htf_timeframe="1h").htf_require_momentum_candle)
