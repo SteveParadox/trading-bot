@@ -393,6 +393,8 @@ class StrategySettings:
             raise ValueError("strategy.structure_adx_min must be finite and nonnegative")
         if self.structure_ma28_slope_lookback < 1:
             raise ValueError("strategy.structure_ma28_slope_lookback must be at least 1")
+        if self.structure_timeframe is not None and self.candle_limit < 60:
+            raise ValueError("strategy.candle_limit must be at least 60 for H4/H1/M5 confirmation")
         if self.structure_timeframe is not None and self.structure_ma28_slope_lookback >= self.candle_limit:
             raise ValueError("strategy.structure_ma28_slope_lookback must be smaller than candle_limit")
         if self.tp_timeframe is not None and self.tp_timeframe not in {"5m", "15m", "30m", "1h"}:
