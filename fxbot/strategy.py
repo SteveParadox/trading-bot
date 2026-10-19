@@ -88,6 +88,7 @@ def evaluate_signal_frame(
     instrument: FxInstrument,
     settings: StrategySettings,
     timestamp: datetime | None = None,
+    structure_frame: pd.DataFrame | None = None,
 ) -> FxSignalDecision:
     try:
         entry = _ensure_indicators(entry_frame)
@@ -102,10 +103,20 @@ def evaluate_signal_frame(
             settings.htf_timeframe,
             timestamp=timestamp,
         )
+        structure_window = None
+        if settings.structure_timeframe is not None:
+            if structure_frame is None:
+                return FxSignalDecision(None, "structure_frame_unavailable", {"timeframe": settings.structure_timeframe})
+            structure_window = last_closed_window(
+                _ensure_indicators(structure_frame),
+                settings.structure_timeframe,
+                timestamp=timestamp,
+            )
     except CandleFrameError as exc:
         return FxSignalDecision(None, exc.reason, exc.details)
 
-    if len(entry_window) < FX_MIN_SIGNAL_CANDLES or len(htf_window) < FX_MIN_HTF_CANDLES:
+    if (len(entry_window) < FX_MIN_SIGNAL_CANDLES or len(htf_window) < FX_MIN_HTF_CANDLES
+            or (structure_window is not None and len(structure_window) < FX_MIN_HTF_CANDLES)):
         return FxSignalDecision(
             None,
             "insufficient_closed_candles",
@@ -114,6 +125,8 @@ def evaluate_signal_frame(
                 "htf": len(htf_window),
                 "min_entry": FX_MIN_SIGNAL_CANDLES,
                 "min_htf": FX_MIN_HTF_CANDLES,
+                "structure": len(structure_window) if structure_window is not None else None,
+                "min_structure": FX_MIN_HTF_CANDLES if structure_window is not None else None,
             },
         )
 
@@ -132,6 +145,43 @@ def evaluate_signal_frame(
             "htf_conflict",
             {"signal": signal.signal.value, "htf": htf_signal.signal.value, **htf_signal.details},
         )
+
+    structure_details: dict[str, Any] | None = None
+    if structure_window is not None:
+        structure_row = structure_window.iloc[-1]
+        structure_signal = _direction_from_row(structure_row, settings.structure_adx_min, False, 0.0)
+        if structure_signal.signal is None:
+            return FxSignalDecision(
+                None, f"structure_{structure_signal.reason}",
+                {"timeframe": settings.structure_timeframe, **structure_signal.details},
+            )
+        if structure_signal.signal is not htf_signal.signal:
+            return FxSignalDecision(
+                None, "structure_conflict",
+                {"timeframe": settings.structure_timeframe, "htf": htf_signal.signal.value,
+                 "structure": structure_signal.signal.value, "entry": signal.signal.value,
+                 "structure_signal_time": _index_value(structure_row)},
+            )
+        lookback = settings.structure_ma28_slope_lookback
+        if len(structure_window) <= lookback:
+            return FxSignalDecision(None, "structure_slope_history_unavailable", {})
+        structure_atr = _safe_float(structure_row.get("atr"))
+        structure_ma28 = _safe_float(structure_row.get("ma28"))
+        past_structure_ma28 = _safe_float(structure_window.iloc[-1 - lookback].get("ma28"))
+        if not all(math.isfinite(value) for value in (structure_atr, structure_ma28, past_structure_ma28)) or structure_atr <= 0:
+            return FxSignalDecision(None, "structure_slope_unavailable", {})
+        structure_slope = (structure_ma28 - past_structure_ma28) * signal.signal.sign / structure_atr
+        if structure_slope <= 0:
+            return FxSignalDecision(
+                None, "structure_slope_filter",
+                {"timeframe": settings.structure_timeframe, "directional_ma28_slope_atr": structure_slope},
+            )
+        structure_details = {
+            **structure_signal.details, "timeframe": settings.structure_timeframe,
+            "signal_time": _index_value(structure_row),
+            "directional_ma28_slope_atr": structure_slope,
+            "ma28_slope_lookback": lookback,
+        }
 
     # A stacked MA arrangement alone can survive well after a move loses
     # momentum. Require meaningful directional movement and a non-flattening
@@ -235,7 +285,12 @@ def evaluate_signal_frame(
     details = {
         **signal.details,
         "htf": htf_signal.details,
+        "htf_timeframe": settings.htf_timeframe,
         "htf_signal_time": _index_value(htf_row),
+        "structure": structure_details,
+        "structure_timeframe": settings.structure_timeframe,
+        "structure_signal_time": structure_details.get("signal_time") if structure_details else None,
+        "entry_timeframe": settings.entry_timeframe,
         "signal_time": _index_value(entry_row),
         "signal_close": close,
         "atr_price": atr,
@@ -277,6 +332,7 @@ def build_signal_intent(
     entry_price: float,
     timestamp: datetime | None = None,
     entry_price_source: str = "provided",
+    structure_frame: pd.DataFrame | None = None,
 ) -> FxSignalIntent | None:
     decision = evaluate_signal_frame(
         entry_frame,
@@ -284,6 +340,7 @@ def build_signal_intent(
         instrument=instrument,
         settings=settings,
         timestamp=timestamp,
+        structure_frame=structure_frame,
     )
     if decision.signal is None:
         return None
