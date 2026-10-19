@@ -91,6 +91,67 @@ class MultiTimeframeTests(unittest.TestCase):
         self.assertEqual(baseline.details["htf_signal_time"], confirmed.details["htf_signal_time"])
         self.assertEqual(baseline.details["structure_signal_time"], confirmed.details["structure_signal_time"])
 
+    def test_stale_h1_and_h4_bars_block_replay(self):
+        previous_h1 = self.structure
+        self.structure = trend("1h", "2026-01-08T09:00:00Z", 0.0003)
+        stale_h1 = self.decide()
+        self.assertIsNone(stale_h1.signal)
+        self.assertEqual(stale_h1.reason, "stale_closed_candles")
+        self.assertEqual(stale_h1.details["timeframe"], "1h")
+        self.structure = previous_h1
+        self.htf = trend("4h", "2026-01-08T00:00:00Z", 0.0007)
+        stale_h4 = self.decide()
+        self.assertIsNone(stale_h4.signal)
+        self.assertEqual(stale_h4.reason, "stale_closed_candles")
+        self.assertEqual(stale_h4.details["timeframe"], "4h")
+
+    def test_short_direction_requires_h1_slope_confirmation(self):
+        self.entry = trend("5min", "2026-01-08T11:55:00Z", -0.00008, start=1.2)
+        self.structure = trend("1h", "2026-01-08T11:00:00Z", -0.0003, start=1.2)
+        self.htf = trend("4h", "2026-01-08T08:00:00Z", -0.0007, start=1.25)
+        result = self.decide()
+        self.assertEqual(result.signal, Side.SHORT, result.reason)
+        self.assertGreater(result.details["structure"]["directional_ma28_slope_atr"], 0)
+
+    def test_revalidation_requires_matching_candle_ids_and_signal(self):
+        from types import SimpleNamespace
+        from fxbot.forward import ForwardTestWorker
+
+        instrument = FxInstrument("EUR_USD")
+        intent = build_signal_intent(
+            self.entry, self.htf, instrument=instrument,
+            settings=self.settings, entry_price=1.1, timestamp=DECISION_TIME,
+            structure_frame=self.structure,
+        )
+        self.assertIsNotNone(intent)
+        frames = {"5m": self.entry, "1h": self.structure, "4h": self.htf}
+        worker = object.__new__(ForwardTestWorker)
+        worker.settings = SimpleNamespace(
+            strategy=self.settings, runtime=SimpleNamespace(max_price_age_seconds=30)
+        )
+        worker.client = SimpleNamespace(candles=lambda _instrument, timeframe, _count: frames[timeframe])
+        self.assertTrue(worker._timeframe_evidence_still_current(intent, instrument, DECISION_TIME))
+        metadata = dict(intent.metadata)
+        metadata["details"] = dict(metadata["details"])
+        metadata["details"]["htf_signal_time"] = "2026-01-01T00:00:00+00:00"
+        self.assertFalse(worker._timeframe_evidence_still_current(
+            replace(intent, metadata=metadata), instrument, DECISION_TIME
+        ))
+        metadata["details"]["htf_signal_time"] = intent.metadata["details"]["htf_signal_time"]
+        metadata["details"]["structure_signal_time"] = "2026-01-01T00:00:00+00:00"
+        self.assertFalse(worker._timeframe_evidence_still_current(
+            replace(intent, metadata=metadata), instrument, DECISION_TIME
+        ))
+        frames["1h"] = trend("1h", "2026-01-08T11:00:00Z", -0.0003, start=1.15)
+        self.assertFalse(worker._timeframe_evidence_still_current(intent, instrument, DECISION_TIME))
+
+    def test_h4_default_disables_only_momentum_candle_gate(self):
+        self.assertFalse(StrategySettings(htf_timeframe="4h").htf_require_momentum_candle)
+        self.assertTrue(StrategySettings(htf_timeframe="1h").htf_require_momentum_candle)
+        self.assertTrue(StrategySettings(
+            htf_timeframe="4h", htf_require_momentum_candle=True
+        ).htf_require_momentum_candle)
+
     def test_timeframe_order_validation_and_legacy_mode(self):
         with self.assertRaisesRegex(ValueError, "entry < structure < HTF"):
             replace(self.settings, structure_timeframe="4h")
