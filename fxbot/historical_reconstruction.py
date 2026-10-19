@@ -179,6 +179,7 @@ def _reconstruct_symbol(
     end = _utc(config.end)
     entry_delta = TIMEFRAME_DELTAS[settings.strategy.entry_timeframe]
     htf_delta = TIMEFRAME_DELTAS[settings.strategy.htf_timeframe]
+    structure_timeframe = settings.strategy.structure_timeframe
     warmup_start = start - max(entry_delta, htf_delta) * config.warmup_bars
 
     entry_raw = source.historical_candles(
@@ -193,7 +194,11 @@ def _reconstruct_symbol(
         warmup_start,
         end,
     )
-    if entry_raw.empty or htf_raw.empty:
+    structure_raw = (
+        source.historical_candles(instrument.name, structure_timeframe, warmup_start, end)
+        if structure_timeframe is not None else None
+    )
+    if entry_raw.empty or htf_raw.empty or (structure_raw is not None and structure_raw.empty):
         return {
             "decision_points": 0,
             "permission_blocks": 0,
@@ -206,12 +211,15 @@ def _reconstruct_symbol(
 
     entry = prepare_indicators(_ohlcv(entry_raw))
     htf = prepare_indicators(_ohlcv(htf_raw))
+    structure = prepare_indicators(_ohlcv(structure_raw)) if structure_raw is not None else None
     tp_frame: pd.DataFrame | None = None
     if settings.strategy.tp_timeframe is not None:
         if settings.strategy.tp_timeframe == settings.strategy.entry_timeframe:
             tp_frame = entry
         elif settings.strategy.tp_timeframe == settings.strategy.htf_timeframe:
             tp_frame = htf
+        elif settings.strategy.tp_timeframe == structure_timeframe:
+            tp_frame = structure
         else:
             tp_raw = source.historical_candles(
                 instrument.name,
@@ -251,12 +259,14 @@ def _reconstruct_symbol(
 
         entry_slice = entry.loc[entry.index <= pd.Timestamp(decision_time)]
         htf_slice = htf.loc[htf.index <= pd.Timestamp(decision_time)]
+        structure_slice = structure.loc[structure.index <= pd.Timestamp(decision_time)] if structure is not None else None
         decision = evaluate_signal_frame(
             entry_slice,
             htf_slice,
             instrument=instrument,
             settings=settings.strategy,
             timestamp=decision_time,
+            structure_frame=structure_slice,
         )
         if decision.signal is None:
             continue
@@ -299,6 +309,7 @@ def _reconstruct_symbol(
             entry_price=entry_price,
             timestamp=decision_time,
             entry_price_source="historical_mt5_executable_tick",
+            structure_frame=structure_slice,
         )
         if intent is None:
             continue
