@@ -1075,6 +1075,52 @@ class ForwardTestWorker:
             log.warning("execution revalidation failed: %s", type(exc).__name__)
             return False
 
+    def _timeframe_evidence_still_current(
+        self, intent: FxSignalIntent, instrument: FxInstrument, now: datetime
+    ) -> bool:
+        """Require fresh, matching completed HTF/structure/entry bars.
+
+        Also supports legacy two-frame modes without changing their signal
+        revalidation semantics.
+        """
+        strategy = self.settings.strategy
+        timeframes = [strategy.entry_timeframe, strategy.htf_timeframe]
+        if strategy.structure_timeframe is not None:
+            timeframes.append(strategy.structure_timeframe)
+        frames: dict[str, pd.DataFrame] = {}
+        for timeframe in timeframes:
+            frame = self.client.candles(instrument.name, timeframe, strategy.candle_limit)
+            if not candles_are_current(
+                frame, timeframe, now, self.settings.runtime.max_price_age_seconds
+            ):
+                return False
+            frames[timeframe] = frame
+
+        if strategy.structure_timeframe is None:
+            return True
+
+        previous = intent.metadata.get("details")
+        if not isinstance(previous, dict):
+            return False
+        decision = evaluate_signal_frame(
+            frames[strategy.entry_timeframe],
+            frames[strategy.htf_timeframe],
+            instrument=instrument,
+            settings=strategy,
+            timestamp=now,
+            structure_frame=frames[strategy.structure_timeframe],
+        )
+        if decision.signal is not intent.side:
+            return False
+        # At the H1/H4 boundary the previous signal context has expired,
+        # even if all three directions still agree. Reprice a fresh candidate
+        # in the next scan rather than execute against superseded evidence.
+        return all(
+            isinstance(previous.get(key), str)
+            and previous[key] == decision.details.get(key)
+            for key in ("signal_time", "htf_signal_time", "structure_signal_time")
+        )
+
     def _revalidate_execution(self, intent: FxSignalIntent, instrument: FxInstrument, risk: FxRiskDecision) -> bool:
         if not risk.allowed or risk.exit_plan is None:
             return False
@@ -1094,31 +1140,11 @@ class ForwardTestWorker:
             return False
         if price.time > now or (executable_entry_price(price, intent.side) - intent.entry_price) * intent.side.sign > 0:
             return False  # Do not increase approved stop risk after price movement.
-        if (now - intent.timestamp).total_seconds() > TIMEFRAME_DELTAS[self.settings.strategy.entry_timeframe].total_seconds():
+        age_seconds = (now - intent.timestamp).total_seconds()
+        if not 0 <= age_seconds <= TIMEFRAME_DELTAS[self.settings.strategy.entry_timeframe].total_seconds():
             return False
-        timeframes = [self.settings.strategy.entry_timeframe, self.settings.strategy.htf_timeframe]
-        if self.settings.strategy.structure_timeframe is not None:
-            timeframes.append(self.settings.strategy.structure_timeframe)
-        refreshed_frames = {}
-        for timeframe in timeframes:
-            frame = self.client.candles(instrument.name, timeframe, self.settings.strategy.candle_limit)
-            if not candles_are_current(frame, timeframe, now, self.settings.runtime.max_price_age_seconds):
-                return False
-            refreshed_frames[timeframe] = frame
-        # Before order submission, recheck all three fully closed candles.
-        # A late structural reversal must not slip through the earlier scan.
-        if self.settings.strategy.structure_timeframe is not None:
-            fresh_decision = evaluate_signal_frame(
-                refreshed_frames[self.settings.strategy.entry_timeframe],
-                refreshed_frames[self.settings.strategy.htf_timeframe],
-                instrument=instrument,
-                settings=self.settings.strategy,
-                timestamp=now,
-                structure_frame=refreshed_frames[self.settings.strategy.structure_timeframe],
-            )
-            if (fresh_decision.signal is not intent.side
-                    or fresh_decision.details.get("signal_time") != intent.metadata.get("details", {}).get("signal_time")):
-                return False
+        if not self._timeframe_evidence_still_current(intent, instrument, now):
+            return False
         portfolio = self._portfolio_from_broker(now, self._load_instruments(), prices.prices, prices.conversion_rates,
                                                account=self.client.account_summary(), positions=self.client.open_positions())
         if portfolio.pair_exposures.get(instrument.name, 0) > 0:
@@ -1151,6 +1177,22 @@ class ForwardTestWorker:
         submitted = False
         legs = self._order_legs(intent, risk, instrument)
         for leg_name, units, take_profit in legs:
+            if self.settings.strategy.structure_timeframe is not None:
+                try:
+                    still_aligned = self._timeframe_evidence_still_current(
+                        intent, instrument, datetime.now(timezone.utc)
+                    )
+                except Exception as exc:
+                    log.warning("multi-timeframe order-leg revalidation failed: %s", type(exc).__name__)
+                    still_aligned = False
+                if not still_aligned:
+                    self.journal.log_event(
+                        "multi_timeframe_confirmation_expired",
+                        "H4/H1/M5 confirmation expired before order leg",
+                        level="warning",
+                        payload={"instrument": instrument.name, "leg": leg_name},
+                    )
+                    return submitted
             if not self._tp_candle_still_current(intent, instrument):
                 self.journal.log_event(
                     "tp_candle_expired",
