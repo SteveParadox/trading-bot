@@ -91,6 +91,20 @@ class MultiTimeframeTests(unittest.TestCase):
         self.assertEqual(baseline.details["htf_signal_time"], confirmed.details["htf_signal_time"])
         self.assertEqual(baseline.details["structure_signal_time"], confirmed.details["structure_signal_time"])
 
+    def test_decision_timestamp_is_required_for_three_frame_mode(self):
+        result = evaluate_signal_frame(
+            self.entry, self.htf, instrument=FxInstrument("EUR_USD"),
+            settings=self.settings, structure_frame=self.structure,
+        )
+        self.assertIsNone(result.signal)
+        self.assertEqual(result.reason, "decision_timestamp_required")
+
+    def test_candle_history_configuration_validated(self):
+        with self.assertRaisesRegex(ValueError, "at least 60"):
+            replace(self.settings, candle_limit=45)
+        with self.assertRaisesRegex(ValueError, "smaller than candle_limit"):
+            replace(self.settings, structure_ma28_slope_lookback=200)
+
     def test_stale_h1_and_h4_bars_block_replay(self):
         previous_h1 = self.structure
         self.structure = trend("1h", "2026-01-08T09:00:00Z", 0.0003)
