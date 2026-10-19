@@ -594,7 +594,7 @@ Trading perpetual futures can lose money quickly, especially with leverage.
 Start in dry-run and testnet, keep risk small, and review exchange orders
 manually until you trust the automation.
 
- 
+
 ## Multi-timeframe FX confirmation (H4 / H1 / M5)
 
 The environment-loaded FX worker now defaults to M5 entry execution, H1
@@ -610,8 +610,11 @@ the previous configuration before relying on it.
   take-profit and execution gates still apply. H4 is not used to inflate
   stop-loss or take-profit distances.
 - **Safety:** Missing, stale or unfinished bars cannot authorize trades.
-  The final order gate reconfirms the three-frame signal and entry candle
-  identity immediately before sending an MT5 order.
+  Live scanning and historical reconstruction reject overly old closed bars.
+  The final order gate checks the same H4, H1 and M5 candle identities
+  immediately before authorization, and checks again before each order leg.
+  A partial first leg is not automatically unwound if the confirmation changes
+  before the next leg; the event is logged for normal position management.
 
 Revert to the earlier two-timeframe behavior explicitly using:
 
@@ -620,6 +623,12 @@ FX_ENTRY_TIMEFRAME=15m
 FX_HTF_TIMEFRAME=1h
 FX_STRUCTURE_TIMEFRAME=
 ```
+
+For H4, `FX_HTF_REQUIRE_MOMENTUM_CANDLE` defaults to `false`: a
+counter-color H4 candle does not by itself reverse a valid broader MA/ADX/DI
+bias. Set this option to `true` if the original momentum-candle gate is
+desired. H1 is indicator-based trend/MA alignment, **not** a full swing-high/
+swing-low market-structure classifier.
 
 An empty `FX_STRUCTURE_TIMEFRAME` disables the intermediate filter.
 If set, its duration must be strictly between entry and HTF. The optional
