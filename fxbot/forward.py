@@ -389,13 +389,23 @@ class ForwardTestWorker:
     ) -> bool | None:
         entry_frame = self.client.candles(instrument.name, self.settings.strategy.entry_timeframe, self.settings.strategy.candle_limit)
         htf_frame = self.client.candles(instrument.name, self.settings.strategy.htf_timeframe, self.settings.strategy.candle_limit)
-        for frame, timeframe in ((entry_frame, self.settings.strategy.entry_timeframe),
-                                 (htf_frame, self.settings.strategy.htf_timeframe)):
+        structure_timeframe = self.settings.strategy.structure_timeframe
+        structure_frame = (
+            self.client.candles(instrument.name, structure_timeframe, self.settings.strategy.candle_limit)
+            if structure_timeframe is not None else None
+        )
+        frames_to_check = [(entry_frame, self.settings.strategy.entry_timeframe),
+                           (htf_frame, self.settings.strategy.htf_timeframe)]
+        if structure_frame is not None:
+            frames_to_check.append((structure_frame, structure_timeframe))
+        for frame, timeframe in frames_to_check:
             if not candles_are_current(frame, timeframe, now, self.settings.runtime.max_price_age_seconds):
                 self._skip(now, instrument.name, "stale_or_invalid_candles", {"timeframe": timeframe})
                 return
         entry_frame = prepare_indicators(entry_frame)
         htf_frame = prepare_indicators(htf_frame)
+        if structure_frame is not None:
+            structure_frame = prepare_indicators(structure_frame)
         decision_time = now
         decision = evaluate_signal_frame(
             entry_frame,
@@ -403,6 +413,7 @@ class ForwardTestWorker:
             instrument=instrument,
             settings=self.settings.strategy,
             timestamp=decision_time,
+            structure_frame=structure_frame,
         )
         if decision.signal is None:
             self._skip(now, instrument.name, decision.reason, decision.details)
@@ -432,6 +443,7 @@ class ForwardTestWorker:
             entry_price=executable_entry,
             timestamp=decision_time,
             entry_price_source="broker_executable_bid_ask",
+            structure_frame=structure_frame,
         )
         if intent is None:
             self._skip(now, instrument.name, "intent_unavailable")
@@ -627,8 +639,7 @@ class ForwardTestWorker:
                         "quote_time": price.time.isoformat(), "observed_at": now.isoformat()}
             # Check freshness against real decision time, not candle-derived time.
             stale_frames = []
-            for frame, timeframe in ((entry_frame, self.settings.strategy.entry_timeframe),
-                                     (htf_frame, self.settings.strategy.htf_timeframe)):
+            for frame, timeframe in frames_to_check:
                 closed_at = frame.index[-1] + TIMEFRAME_DELTAS[timeframe]
                 age = (pd.Timestamp(now) - closed_at).total_seconds()
                 if age < 0 or age > TIMEFRAME_DELTAS[timeframe].total_seconds() + self.settings.runtime.max_price_age_seconds:
@@ -1085,9 +1096,28 @@ class ForwardTestWorker:
             return False  # Do not increase approved stop risk after price movement.
         if (now - intent.timestamp).total_seconds() > TIMEFRAME_DELTAS[self.settings.strategy.entry_timeframe].total_seconds():
             return False
-        for timeframe in (self.settings.strategy.entry_timeframe, self.settings.strategy.htf_timeframe):
+        timeframes = [self.settings.strategy.entry_timeframe, self.settings.strategy.htf_timeframe]
+        if self.settings.strategy.structure_timeframe is not None:
+            timeframes.append(self.settings.strategy.structure_timeframe)
+        refreshed_frames = {}
+        for timeframe in timeframes:
             frame = self.client.candles(instrument.name, timeframe, self.settings.strategy.candle_limit)
             if not candles_are_current(frame, timeframe, now, self.settings.runtime.max_price_age_seconds):
+                return False
+            refreshed_frames[timeframe] = frame
+        # Before order submission, recheck all three fully closed candles.
+        # A late structural reversal must not slip through the earlier scan.
+        if self.settings.strategy.structure_timeframe is not None:
+            fresh_decision = evaluate_signal_frame(
+                refreshed_frames[self.settings.strategy.entry_timeframe],
+                refreshed_frames[self.settings.strategy.htf_timeframe],
+                instrument=instrument,
+                settings=self.settings.strategy,
+                timestamp=now,
+                structure_frame=refreshed_frames[self.settings.strategy.structure_timeframe],
+            )
+            if (fresh_decision.signal is not intent.side
+                    or fresh_decision.details.get("signal_time") != intent.metadata.get("details", {}).get("signal_time")):
                 return False
         portfolio = self._portfolio_from_broker(now, self._load_instruments(), prices.prices, prices.conversion_rates,
                                                account=self.client.account_summary(), positions=self.client.open_positions())
