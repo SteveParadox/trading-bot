@@ -130,6 +130,27 @@ def evaluate_signal_frame(
             },
         )
 
+    # Live and historical three-frame decisions share the same closed-bar
+    # freshness rule. Without this, replay may carry an old H1/H4 trend
+    # indefinitely through missing-candle periods.
+    if structure_window is not None and timestamp is not None:
+        decision_time = _coerce_utc_timestamp(timestamp)
+        for timeframe, window in (
+            (settings.entry_timeframe, entry_window),
+            (settings.htf_timeframe, htf_window),
+            (settings.structure_timeframe, structure_window),
+        ):
+            duration = _timeframe_delta(timeframe)
+            last_closed_at = window.index[-1] + duration
+            age = decision_time - last_closed_at
+            if age < pd.Timedelta(0) or age > duration:
+                return FxSignalDecision(
+                    None, "stale_closed_candles",
+                    {"timeframe": timeframe, "last_closed_at": last_closed_at.isoformat(),
+                     "decision_time": decision_time.isoformat(),
+                     "age_seconds": age.total_seconds()},
+                )
+
     entry_row = entry_window.iloc[-1]
     htf_row = htf_window.iloc[-1]
     signal = _direction_from_row(entry_row, settings.adx_min, settings.require_volume_confirmation, settings.volume_ratio_min)
