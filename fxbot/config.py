@@ -296,10 +296,6 @@ class BrokerSettings:
 class StrategySettings:
     entry_timeframe: str = "15m"
     htf_timeframe: str = "1h"
-    # Optional intermediate H1 confirmation. None preserves old two-frame logic.
-    structure_timeframe: str | None = None
-    structure_adx_min: float = 18.0
-    structure_ma28_slope_lookback: int = 3
     candle_limit: int = 180
     adx_min: float = 18.0
     htf_adx_min: float = 20.0
@@ -332,7 +328,7 @@ class StrategySettings:
     max_stop_atr_multiple: float = 4.0
     require_volume_confirmation: bool = False
     volume_ratio_min: float = 0.8
-    htf_require_momentum_candle: bool = True
+    htf_require_momentum_candle: bool | None = None
     min_signal_score: float = 60.0
     min_di_edge: float = 5.0
     require_adx_non_decreasing: bool = True
@@ -371,8 +367,16 @@ class StrategySettings:
     news_api_key: str = ""
     news_http_timeout_seconds: int = 30
     news_use_forex_factory: bool = False
+    # Append new fields so positional StrategySettings callers stay compatible.
+    structure_timeframe: str | None = None
+    structure_adx_min: float = 18.0
+    structure_ma28_slope_lookback: int = 3
 
     def __post_init__(self) -> None:
+        if self.htf_require_momentum_candle is None:
+            # H4 describes market bias, so a single counter-color H4 candle
+            # does not, by itself, reverse the longer direction.
+            object.__setattr__(self, "htf_require_momentum_candle", self.htf_timeframe != "4h")
         if self.stop_mode not in {"atr", "ma"}:
             raise ValueError("strategy.stop_mode must be 'atr' or 'ma'")
         if self.entry_timeframe not in {"5m", "15m", "30m", "1h"}:
@@ -389,6 +393,8 @@ class StrategySettings:
             raise ValueError("strategy.structure_adx_min must be finite and nonnegative")
         if self.structure_ma28_slope_lookback < 1:
             raise ValueError("strategy.structure_ma28_slope_lookback must be at least 1")
+        if self.structure_timeframe is not None and self.structure_ma28_slope_lookback >= self.candle_limit:
+            raise ValueError("strategy.structure_ma28_slope_lookback must be smaller than candle_limit")
         if self.tp_timeframe is not None and self.tp_timeframe not in {"5m", "15m", "30m", "1h"}:
             raise ValueError("unsupported FX TP timeframe")
         if not math.isfinite(self.tp_atr_multiplier) or self.tp_atr_multiplier <= 0:
