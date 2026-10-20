@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from fxbot.performance import measured
+
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import math
@@ -63,6 +65,7 @@ class CandleFrameError(ValueError):
         self.details = details or {}
 
 
+@measured("indicators")
 def prepare_indicators(frame: pd.DataFrame) -> pd.DataFrame:
     """Return FX-specific indicator data using explicit runtime parameters.
 
@@ -81,6 +84,7 @@ def prepare_indicators(frame: pd.DataFrame) -> pd.DataFrame:
     ).sort_index()
 
 
+@measured("strategy")
 def evaluate_signal_frame(
     entry_frame: pd.DataFrame,
     htf_frame: pd.DataFrame,
@@ -88,7 +92,12 @@ def evaluate_signal_frame(
     instrument: FxInstrument,
     settings: StrategySettings,
     timestamp: datetime | None = None,
+    structure_frame: pd.DataFrame | None = None,
 ) -> FxSignalDecision:
+    if settings.structure_timeframe is not None and timestamp is None:
+        # Without a decision time the caller cannot prove that the
+        # intermediate or higher-timeframe bars are actually closed/current.
+        return FxSignalDecision(None, "decision_timestamp_required", {})
     try:
         entry = _ensure_indicators(entry_frame)
         htf = _ensure_indicators(htf_frame)
@@ -102,10 +111,20 @@ def evaluate_signal_frame(
             settings.htf_timeframe,
             timestamp=timestamp,
         )
+        structure_window = None
+        if settings.structure_timeframe is not None:
+            if structure_frame is None:
+                return FxSignalDecision(None, "structure_frame_unavailable", {"timeframe": settings.structure_timeframe})
+            structure_window = last_closed_window(
+                _ensure_indicators(structure_frame),
+                settings.structure_timeframe,
+                timestamp=timestamp,
+            )
     except CandleFrameError as exc:
         return FxSignalDecision(None, exc.reason, exc.details)
 
-    if len(entry_window) < FX_MIN_SIGNAL_CANDLES or len(htf_window) < FX_MIN_HTF_CANDLES:
+    if (len(entry_window) < FX_MIN_SIGNAL_CANDLES or len(htf_window) < FX_MIN_HTF_CANDLES
+            or (structure_window is not None and len(structure_window) < FX_MIN_HTF_CANDLES)):
         return FxSignalDecision(
             None,
             "insufficient_closed_candles",
@@ -114,8 +133,31 @@ def evaluate_signal_frame(
                 "htf": len(htf_window),
                 "min_entry": FX_MIN_SIGNAL_CANDLES,
                 "min_htf": FX_MIN_HTF_CANDLES,
+                "structure": len(structure_window) if structure_window is not None else None,
+                "min_structure": FX_MIN_HTF_CANDLES if structure_window is not None else None,
             },
         )
+
+    # Live and historical three-frame decisions share the same closed-bar
+    # freshness rule. Without this, replay may carry an old H1/H4 trend
+    # indefinitely through missing-candle periods.
+    if structure_window is not None and timestamp is not None:
+        decision_time = _coerce_utc_timestamp(timestamp)
+        for timeframe, window in (
+            (settings.entry_timeframe, entry_window),
+            (settings.htf_timeframe, htf_window),
+            (settings.structure_timeframe, structure_window),
+        ):
+            duration = _timeframe_delta(timeframe)
+            last_closed_at = window.index[-1] + duration
+            age = decision_time - last_closed_at
+            if age < pd.Timedelta(0) or age > duration:
+                return FxSignalDecision(
+                    None, "stale_closed_candles",
+                    {"timeframe": timeframe, "last_closed_at": last_closed_at.isoformat(),
+                     "decision_time": decision_time.isoformat(),
+                     "age_seconds": age.total_seconds()},
+                )
 
     entry_row = entry_window.iloc[-1]
     htf_row = htf_window.iloc[-1]
@@ -132,6 +174,43 @@ def evaluate_signal_frame(
             "htf_conflict",
             {"signal": signal.signal.value, "htf": htf_signal.signal.value, **htf_signal.details},
         )
+
+    structure_details: dict[str, Any] | None = None
+    if structure_window is not None:
+        structure_row = structure_window.iloc[-1]
+        structure_signal = _direction_from_row(structure_row, settings.structure_adx_min, False, 0.0)
+        if structure_signal.signal is None:
+            return FxSignalDecision(
+                None, f"structure_{structure_signal.reason}",
+                {"timeframe": settings.structure_timeframe, **structure_signal.details},
+            )
+        if structure_signal.signal is not htf_signal.signal:
+            return FxSignalDecision(
+                None, "structure_conflict",
+                {"timeframe": settings.structure_timeframe, "htf": htf_signal.signal.value,
+                 "structure": structure_signal.signal.value, "entry": signal.signal.value,
+                 "structure_signal_time": _index_value(structure_row)},
+            )
+        lookback = settings.structure_ma28_slope_lookback
+        if len(structure_window) <= lookback:
+            return FxSignalDecision(None, "structure_slope_history_unavailable", {})
+        structure_atr = _safe_float(structure_row.get("atr"))
+        structure_ma28 = _safe_float(structure_row.get("ma28"))
+        past_structure_ma28 = _safe_float(structure_window.iloc[-1 - lookback].get("ma28"))
+        if not all(math.isfinite(value) for value in (structure_atr, structure_ma28, past_structure_ma28)) or structure_atr <= 0:
+            return FxSignalDecision(None, "structure_slope_unavailable", {})
+        structure_slope = (structure_ma28 - past_structure_ma28) * signal.signal.sign / structure_atr
+        if structure_slope <= 0:
+            return FxSignalDecision(
+                None, "structure_slope_filter",
+                {"timeframe": settings.structure_timeframe, "directional_ma28_slope_atr": structure_slope},
+            )
+        structure_details = {
+            **structure_signal.details, "timeframe": settings.structure_timeframe,
+            "signal_time": _index_value(structure_row),
+            "directional_ma28_slope_atr": structure_slope,
+            "ma28_slope_lookback": lookback,
+        }
 
     # A stacked MA arrangement alone can survive well after a move loses
     # momentum. Require meaningful directional movement and a non-flattening
@@ -235,7 +314,12 @@ def evaluate_signal_frame(
     details = {
         **signal.details,
         "htf": htf_signal.details,
+        "htf_timeframe": settings.htf_timeframe,
         "htf_signal_time": _index_value(htf_row),
+        "structure": structure_details,
+        "structure_timeframe": settings.structure_timeframe,
+        "structure_signal_time": structure_details.get("signal_time") if structure_details else None,
+        "entry_timeframe": settings.entry_timeframe,
         "signal_time": _index_value(entry_row),
         "signal_close": close,
         "atr_price": atr,
@@ -277,6 +361,7 @@ def build_signal_intent(
     entry_price: float,
     timestamp: datetime | None = None,
     entry_price_source: str = "provided",
+    structure_frame: pd.DataFrame | None = None,
 ) -> FxSignalIntent | None:
     decision = evaluate_signal_frame(
         entry_frame,
@@ -284,6 +369,7 @@ def build_signal_intent(
         instrument=instrument,
         settings=settings,
         timestamp=timestamp,
+        structure_frame=structure_frame,
     )
     if decision.signal is None:
         return None
@@ -331,7 +417,7 @@ def _direction_from_row(
     volume_ratio_min: float,
 ) -> FxSignalDecision:
     required = ["ma7", "ma14", "ma28", "adx", "di_plus", "di_minus", "close"]
-    if any(column not in row or pd.isna(row[column]) for column in required):
+    if any(column not in row or not math.isfinite(_safe_float(row[column], float("nan"))) for column in required):
         return FxSignalDecision(None, "indicator_unavailable", {"required": required})
 
     volume_ma_ratio = _safe_float(row.get("volume_ma_ratio"), _safe_float(row.get("volume_ratio")))
@@ -530,8 +616,16 @@ def _normalize_market_frame(frame: pd.DataFrame, *, require_ohlcv: bool) -> pd.D
         missing = [column for column in ("open", "high", "low", "close", "volume") if column not in result.columns]
         if missing:
             raise CandleFrameError("missing_ohlcv", {"missing": missing})
-        if result[["open", "high", "low", "close", "volume"]].isna().any().any():
+        values = result[["open", "high", "low", "close", "volume"]]
+        if values.isna().any().any():
             raise CandleFrameError("nan_ohlcv", {})
+        try:
+            import numpy as np
+            finite = np.isfinite(values.to_numpy(dtype=float)).all()
+        except (ValueError, TypeError):
+            finite = False
+        if not finite:
+            raise CandleFrameError("nonfinite_ohlcv", {})
     return result
 
 

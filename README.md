@@ -44,9 +44,13 @@ FX_MT5_TIME_OFFSET_SECONDS=0
 FX_API_KEY=change-this-demo-control-key
 FX_INSTRUMENTS=EUR_USD,GBP_USD,USD_JPY,AUD_USD
 MT5_SYMBOL_MAP=EUR_USD=EURUSD,GBP_USD=GBPUSD,USD_JPY=USDJPY,AUD_USD=AUDUSD
-# Optional: keep M15 entries and H1 trend confirmation, derive TP from M5 ATR.
+# New default: H4 directional bias + H1 structure alignment + M15 entries.
 FX_ENTRY_TIMEFRAME=15m
-FX_HTF_TIMEFRAME=1h
+FX_HTF_TIMEFRAME=4h
+FX_STRUCTURE_TIMEFRAME=1h
+FX_STRUCTURE_ADX_MIN=18
+FX_STRUCTURE_MA28_SLOPE_LOOKBACK=3
+# Optional: use completed M5 volatility for TP without changing stop/risk safety.
 FX_TP_TIMEFRAME=5m
 FX_TP_ATR_MULTIPLIER=1.5
 ```
@@ -589,3 +593,54 @@ python -m backtester.bybit_cli --config configs/bybit_backtest_config.json webso
 Trading perpetual futures can lose money quickly, especially with leverage.
 Start in dry-run and testnet, keep risk small, and review exchange orders
 manually until you trust the automation.
+
+
+## Multi-timeframe FX confirmation (H4 / H1 / M15)
+
+The environment-loaded FX worker now defaults to M15 entry execution, H1
+intermediate trend/structure alignment, and H4 primary bias. This does not
+establish profitability. Backtest and forward-test the revised setup against
+the previous configuration before relying on it.
+
+- **H4 bias:** MA7/14/28 stack, ADX/DI and optional momentum candle, using
+  completed candles only.
+- **H1 structure:** MA stack, ADX/DI and directionally positive MA28
+  slope. A contrary or neutral H1 blocks new entries until alignment.
+- **M15 execution:** Existing ATR, quality score, sniper, spread, risk,
+  take-profit and execution gates still apply. H4 is not used to inflate
+  stop-loss or take-profit distances.
+- **Safety:** Missing, stale or unfinished bars cannot authorize trades.
+  Live scanning and historical reconstruction reject overly old closed bars.
+  The final order gate checks the same H4, H1 and M15 candle identities
+  immediately before authorization, and checks again before each order leg.
+  A partial first leg is not automatically unwound if the confirmation changes
+  before the next leg; the event is logged for normal position management.
+
+Revert to the earlier two-timeframe behavior explicitly using:
+
+```env
+FX_ENTRY_TIMEFRAME=15m
+FX_HTF_TIMEFRAME=1h
+FX_STRUCTURE_TIMEFRAME=
+```
+
+For H4, `FX_HTF_REQUIRE_MOMENTUM_CANDLE` defaults to `false`: a
+counter-color H4 candle does not by itself reverse a valid broader MA/ADX/DI
+bias. Set this option to `true` if the original momentum-candle gate is
+desired. H1 is indicator-based trend/MA alignment, **not** a full swing-high/
+swing-low market-structure classifier.
+
+An empty `FX_STRUCTURE_TIMEFRAME` disables the intermediate filter.
+If set, its duration must be strictly between entry and HTF. The optional
+`FX_STRUCTURE_ADX_MIN` and `FX_STRUCTURE_MA28_SLOPE_LOOKBACK` tune the
+H1 structure filter. Restart the worker after changing these environment
+variables; existing deployment environment overrides still take precedence.
+
+**ML compatibility:** Models trained on the earlier M15/H1 data are not
+automatically validated for H4/H1/M15 features. Leave numerical prediction
+and LLM decision influence in OFF or SHADOW while evaluating the new setup.
+Use identical date ranges, bid/ask execution costs, sessions and news
+coverage to compare win rate, expectancy after costs, profit factor, drawdown,
+trade count and 5/15-minute outcome distributions.
+
+See [the measured FX audit and demo rollout guide](docs/FX_PERFORMANCE_AUDIT.md) for regression results, profiling, model compatibility, and research limitations.

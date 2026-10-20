@@ -1,3 +1,4 @@
+import { runSingleFlight } from "./polling.mjs";
 import {
   Activity,
   AlertTriangle,
@@ -143,31 +144,34 @@ export function App() {
     setLastSyncedAt(new Date());
   }, []);
 
+  const coreRequests = useRef(new Map<string, Promise<void>>());
   const loadCore = useCallback(async (showSpinner = false) => {
     if (!readStoredApiKey()) return;
-    if (showSpinner) setSyncing(true);
-    try {
-      const results = await Promise.allSettled([
-        fetchJson<BotStatus>("/api/status"), fetchJson<Position[]>("/api/positions"), fetchJson<EquityPoint[]>(`/api/equity?window=${chartWindow.toLowerCase()}&limit=1000`), fetchJson<Performance>("/api/performance"),
-        fetchJson<ConfigPayload>("/api/config"), fetchJson<Signal[]>("/api/signals?limit=100"), fetchJson<Order[]>("/api/orders?limit=100"), fetchJson<Monitoring>("/api/monitoring"),
-      ]);
-      const valueAt = <T,>(index: number): T | undefined => { const result = results[index]; return result.status === "fulfilled" ? result.value as T : undefined; };
-      const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
-      if (failures.length === results.length) throw failures[0].reason;
-      setData((current) => ({ ...current, status: valueAt<BotStatus>(0) ?? current.status, positions: valueAt<Position[]>(1) ?? current.positions, equity: valueAt<EquityPoint[]>(2) ?? current.equity, performance: valueAt<Performance>(3) ?? current.performance, config: valueAt<ConfigPayload>(4) ?? current.config, signals: valueAt<Signal[]>(5) ?? current.signals, orders: valueAt<Order[]>(6) ?? current.orders, monitoring: valueAt<Monitoring>(7) ?? current.monitoring }));
-      setLastSyncedAt(new Date());
-      setNotice(failures.length ? "Some operational data is temporarily unavailable. The remaining dashboard data is current." : "");
-    } finally { if (showSpinner) setSyncing(false); }
+    return runSingleFlight(coreRequests.current, chartWindow, async () => {
+      if (showSpinner) setSyncing(true);
+      try {
+        const results = await Promise.allSettled([
+          fetchJson<BotStatus>("/api/status"), fetchJson<Position[]>("/api/positions"), fetchJson<EquityPoint[]>(`/api/equity?window=${chartWindow.toLowerCase()}&limit=1000`), fetchJson<Performance>("/api/performance"),
+          fetchJson<ConfigPayload>("/api/config"), fetchJson<Signal[]>("/api/signals?limit=100"), fetchJson<Order[]>("/api/orders?limit=100"), fetchJson<Monitoring>("/api/monitoring"),
+        ]);
+        const valueAt = <T,>(index: number): T | undefined => { const result = results[index]; return result.status === "fulfilled" ? result.value as T : undefined; };
+        const failures = results.filter((result): result is PromiseRejectedResult => result.status === "rejected");
+        if (failures.length === results.length) throw failures[0].reason;
+        setData((current) => ({ ...current, status: valueAt<BotStatus>(0) ?? current.status, positions: valueAt<Position[]>(1) ?? current.positions, equity: valueAt<EquityPoint[]>(2) ?? current.equity, performance: valueAt<Performance>(3) ?? current.performance, config: valueAt<ConfigPayload>(4) ?? current.config, signals: valueAt<Signal[]>(5) ?? current.signals, orders: valueAt<Order[]>(6) ?? current.orders, monitoring: valueAt<Monitoring>(7) ?? current.monitoring }));
+        setLastSyncedAt(new Date());
+        setNotice(failures.length ? "Some operational data is temporarily unavailable. The remaining dashboard data is current." : "");
+      } finally { if (showSpinner) setSyncing(false); }
+    });
   }, [chartWindow]);
 
-  const loadTrades = useCallback(async () => {
+  const loadTrades = useCallback(async (resetPage = true) => {
     if (!readStoredApiKey()) return;
     const params = new URLSearchParams({ limit: "300" });
     if (instrumentFilter.trim()) params.set("instrument", instrumentFilter.trim().toUpperCase());
     if (outcomeFilter) params.set("outcome", outcomeFilter);
     const trades = await fetchJson<Trade[]>(`/api/trades?${params.toString()}`, { cache: "no-store" });
     setData((current) => ({ ...current, trades }));
-    setTradesPage(0);
+    if (resetPage) setTradesPage(0);
   }, [instrumentFilter, outcomeFilter]);
 
   const loadInitialTrades = useCallback(async () => {
@@ -224,9 +228,13 @@ export function App() {
   }, [authFailed, connection, connectionEnabled, handleIssue, loadCore]);
   useEffect(() => {
     if (!connectionEnabled || authFailed) return;
-    const interval = window.setInterval(() => loadCore().catch(handleIssue), 30_000);
+    const interval = window.setInterval(() => {
+      const tasks = [loadTrades(false), loadNews()];
+      if (connection === "live") tasks.push(loadCore());
+      Promise.all(tasks).catch(handleIssue);
+    }, 30_000);
     return () => window.clearInterval(interval);
-  }, [authFailed, connectionEnabled, handleIssue, loadCore]);
+  }, [authFailed, connectionEnabled, connection, handleIssue, loadCore, loadTrades, loadNews]);
 
   const connect = useCallback(() => {
     const key = apiKey.trim();
@@ -265,6 +273,12 @@ export function App() {
       {notice && <div className="notice" role="alert"><AlertTriangle size={17} /><span>{notice}</span><button className="noticeClose" onClick={() => setNotice("")} aria-label="Dismiss message"><X size={16} /></button></div>}
       {!connectionEnabled ? <ConnectionSetup apiKey={apiKey} showKey={showKey} onApiKeyChange={setApiKey} onShowKeyChange={() => setShowKey((visible) => !visible)} onConnect={connect} connecting={syncing} /> : <>
         <section className="commandBar" aria-label="Bot controls"><div className="commandTitle"><div className={`stateGlyph ${statusTone}`}><Activity size={18} /></div><div><span className="sectionKicker">Execution status</span><h1>{sentenceCase(data.status.state)}</h1><p>{data.status.reason || "No execution reason reported by the service."}</p></div></div><div className="commandMeta"><span><Clock3 size={14} /> {lastSyncedAt ? `Synced ${timeAgo(lastSyncedAt)}` : "Awaiting first sync"}</span><span><ShieldCheck size={14} /> {data.config.dashboard_badge ?? "Forward test"}</span></div><div className="controlActions"><button className="controlButton primary" onClick={() => setPendingAction("start")} disabled={!canControl || controlInFlight !== null || data.status.state.toLowerCase() === "running"}>{controlInFlight === "start" ? <Loader2 size={16} className="spin" /> : <Play size={16} />} Start</button><button className="controlButton" onClick={() => setPendingAction("pause")} disabled={!canControl || controlInFlight !== null || data.status.state.toLowerCase() !== "running"}>{controlInFlight === "pause" ? <Loader2 size={16} className="spin" /> : <CirclePause size={16} />} Pause</button><button className="controlButton destructive" onClick={() => setPendingAction("stop")} disabled={!canControl || controlInFlight !== null || data.status.state.toLowerCase() === "stopped"}>{controlInFlight === "stop" ? <Loader2 size={16} className="spin" /> : <CircleStop size={16} />} Stop</button></div></section>
+        <section className="timeframeStrip" aria-label="Active strategy timeframes">
+          <span>Entry <strong>{String(data.config.strategy?.entry_timeframe ?? "Unreported")}</strong></span>
+          <span>Confirmation <strong>{String(data.config.strategy?.structure_timeframe ?? "Disabled")}</strong></span>
+          <span>Primary bias <strong>{String(data.config.strategy?.htf_timeframe ?? "Unreported")}</strong></span>
+          <span>TP reference <strong>{String(data.config.strategy?.tp_timeframe ?? "Entry / risk target")}</strong></span>
+        </section>
         <section className="securityStrip"><div className="securityKey"><KeyRound size={16} /><input value={apiKey} onChange={(event) => { setApiKey(event.target.value); setAuthFailed(false); }} type={showKey ? "text" : "password"} placeholder="FX_API_KEY" aria-label="FX API key" onKeyDown={(event) => event.key === "Enter" && connect()} /><button className="inlineIcon" onClick={() => setShowKey((visible) => !visible)} title={showKey ? "Hide API key" : "Show API key"} aria-label={showKey ? "Hide API key" : "Show API key"}>{showKey ? <EyeOff size={16} /> : <Eye size={16} />}</button></div><span className="securityHint"><LockKeyhole size={14} /> Stored only in this browser</span><button className="textButton" onClick={connect} disabled={syncing}>{syncing ? "Connecting…" : "Reconnect"}</button><button className="textButton muted" onClick={forgetKey}>Forget key</button></section>
         {view === "agent" ? <section className="analystWorkspace"><div className="pageHeading"><div><span className="sectionKicker">Research workspace</span><h2>Trade analyst</h2><p>Interrogate outcomes, evidence, anomalies, and experiment proposals without exposing trading controls.</p></div><div className="headingBadge"><Bot size={16} /> Read-only analysis</div></div><Suspense fallback={<div className="loadingPanel"><Loader2 className="spin" size={22} /> Loading analyst tools…</div>}><AgentPanel /></Suspense></section> : <DashboardView data={data} latestEquity={latestEquity} chartData={chartData} chartWindow={chartWindow} onChartWindow={setChartWindow} wins={wins} losses={losses} totalMargin={totalMargin} activeBlackouts={activeBlackouts} instrumentFilter={instrumentFilter} outcomeFilter={outcomeFilter} onInstrumentFilter={setInstrumentFilter} onOutcomeFilter={setOutcomeFilter} onApplyTradeFilters={() => loadTrades().catch(handleIssue)} tradesPage={tradesPage} onTradesPage={setTradesPage} signalsPage={signalsPage} onSignalsPage={setSignalsPage} ordersPage={ordersPage} onOrdersPage={setOrdersPage} />}
       </>}

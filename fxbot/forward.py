@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from fxbot.performance import measured, operation_timings
+
 import asyncio
 import hashlib
 import logging
@@ -191,6 +193,7 @@ class ForwardTestWorker:
         self.deliberator.close()
         self.journal.close()
 
+    @measured("scan")
     def scan_once(self) -> None:
         now = datetime.now(timezone.utc)
         if self.journal.get_state().state == BotRunState.STOPPED.value:
@@ -378,6 +381,7 @@ class ForwardTestWorker:
             self.monitor.clear_unknown_order(row.client_order_id)
             self.journal.log_event("order_reconciled", f"order {row.client_order_id} reconciled", payload={"state": result.after.value})
 
+    @measured("instrument_scan")
     def _scan_instrument(
         self,
         now: datetime,
@@ -389,13 +393,23 @@ class ForwardTestWorker:
     ) -> bool | None:
         entry_frame = self.client.candles(instrument.name, self.settings.strategy.entry_timeframe, self.settings.strategy.candle_limit)
         htf_frame = self.client.candles(instrument.name, self.settings.strategy.htf_timeframe, self.settings.strategy.candle_limit)
-        for frame, timeframe in ((entry_frame, self.settings.strategy.entry_timeframe),
-                                 (htf_frame, self.settings.strategy.htf_timeframe)):
+        structure_timeframe = self.settings.strategy.structure_timeframe
+        structure_frame = (
+            self.client.candles(instrument.name, structure_timeframe, self.settings.strategy.candle_limit)
+            if structure_timeframe is not None else None
+        )
+        frames_to_check = [(entry_frame, self.settings.strategy.entry_timeframe),
+                           (htf_frame, self.settings.strategy.htf_timeframe)]
+        if structure_frame is not None:
+            frames_to_check.append((structure_frame, structure_timeframe))
+        for frame, timeframe in frames_to_check:
             if not candles_are_current(frame, timeframe, now, self.settings.runtime.max_price_age_seconds):
                 self._skip(now, instrument.name, "stale_or_invalid_candles", {"timeframe": timeframe})
                 return
         entry_frame = prepare_indicators(entry_frame)
         htf_frame = prepare_indicators(htf_frame)
+        if structure_frame is not None:
+            structure_frame = prepare_indicators(structure_frame)
         decision_time = now
         decision = evaluate_signal_frame(
             entry_frame,
@@ -403,6 +417,7 @@ class ForwardTestWorker:
             instrument=instrument,
             settings=self.settings.strategy,
             timestamp=decision_time,
+            structure_frame=structure_frame,
         )
         if decision.signal is None:
             self._skip(now, instrument.name, decision.reason, decision.details)
@@ -432,6 +447,7 @@ class ForwardTestWorker:
             entry_price=executable_entry,
             timestamp=decision_time,
             entry_price_source="broker_executable_bid_ask",
+            structure_frame=structure_frame,
         )
         if intent is None:
             self._skip(now, instrument.name, "intent_unavailable")
@@ -627,8 +643,7 @@ class ForwardTestWorker:
                         "quote_time": price.time.isoformat(), "observed_at": now.isoformat()}
             # Check freshness against real decision time, not candle-derived time.
             stale_frames = []
-            for frame, timeframe in ((entry_frame, self.settings.strategy.entry_timeframe),
-                                     (htf_frame, self.settings.strategy.htf_timeframe)):
+            for frame, timeframe in frames_to_check:
                 closed_at = frame.index[-1] + TIMEFRAME_DELTAS[timeframe]
                 age = (pd.Timestamp(now) - closed_at).total_seconds()
                 if age < 0 or age > TIMEFRAME_DELTAS[timeframe].total_seconds() + self.settings.runtime.max_price_age_seconds:
@@ -816,6 +831,12 @@ class ForwardTestWorker:
                         strategy_score=float(intent.score),
                         execution_cost_pips_round_trip=float(candidate_row.payload["execution_cost_pips_round_trip"]),
                         pip_size=instrument.pip_size,
+                        strategy_context={
+                            "entry_timeframe": self.settings.strategy.entry_timeframe,
+                            "htf_timeframe": self.settings.strategy.htf_timeframe,
+                            "structure_timeframe": self.settings.strategy.structure_timeframe,
+                            "tp_timeframe": self.settings.strategy.tp_timeframe,
+                        },
                     )
                 )
         except Exception as exc:
@@ -1064,6 +1085,54 @@ class ForwardTestWorker:
             log.warning("execution revalidation failed: %s", type(exc).__name__)
             return False
 
+    @measured("execution_confirmation")
+    def _timeframe_evidence_still_current(
+        self, intent: FxSignalIntent, instrument: FxInstrument, now: datetime
+    ) -> bool:
+        """Require fresh, matching completed HTF/structure/entry bars.
+
+        Also supports legacy two-frame modes without changing their signal
+        revalidation semantics.
+        """
+        strategy = self.settings.strategy
+        timeframes = [strategy.entry_timeframe, strategy.htf_timeframe]
+        if strategy.structure_timeframe is not None:
+            timeframes.append(strategy.structure_timeframe)
+        frames: dict[str, pd.DataFrame] = {}
+        for timeframe in timeframes:
+            frame = self.client.candles(instrument.name, timeframe, strategy.candle_limit)
+            if not candles_are_current(
+                frame, timeframe, now, self.settings.runtime.max_price_age_seconds
+            ):
+                return False
+            frames[timeframe] = frame
+
+        if strategy.structure_timeframe is None:
+            return True
+
+        previous = intent.metadata.get("details")
+        if not isinstance(previous, dict):
+            return False
+        decision = evaluate_signal_frame(
+            frames[strategy.entry_timeframe],
+            frames[strategy.htf_timeframe],
+            instrument=instrument,
+            settings=strategy,
+            timestamp=now,
+            structure_frame=frames[strategy.structure_timeframe],
+        )
+        if decision.signal is not intent.side:
+            return False
+        # At the H1/H4 boundary the previous signal context has expired,
+        # even if all three directions still agree. Reprice a fresh candidate
+        # in the next scan rather than execute against superseded evidence.
+        return all(
+            isinstance(previous.get(key), str)
+            and previous[key] == decision.details.get(key)
+            for key in ("signal_time", "htf_signal_time", "structure_signal_time")
+        )
+
+    @measured("execution_revalidation")
     def _revalidate_execution(self, intent: FxSignalIntent, instrument: FxInstrument, risk: FxRiskDecision) -> bool:
         if not risk.allowed or risk.exit_plan is None:
             return False
@@ -1083,12 +1152,11 @@ class ForwardTestWorker:
             return False
         if price.time > now or (executable_entry_price(price, intent.side) - intent.entry_price) * intent.side.sign > 0:
             return False  # Do not increase approved stop risk after price movement.
-        if (now - intent.timestamp).total_seconds() > TIMEFRAME_DELTAS[self.settings.strategy.entry_timeframe].total_seconds():
+        age_seconds = (now - intent.timestamp).total_seconds()
+        if not 0 <= age_seconds <= TIMEFRAME_DELTAS[self.settings.strategy.entry_timeframe].total_seconds():
             return False
-        for timeframe in (self.settings.strategy.entry_timeframe, self.settings.strategy.htf_timeframe):
-            frame = self.client.candles(instrument.name, timeframe, self.settings.strategy.candle_limit)
-            if not candles_are_current(frame, timeframe, now, self.settings.runtime.max_price_age_seconds):
-                return False
+        if not self._timeframe_evidence_still_current(intent, instrument, now):
+            return False
         portfolio = self._portfolio_from_broker(now, self._load_instruments(), prices.prices, prices.conversion_rates,
                                                account=self.client.account_summary(), positions=self.client.open_positions())
         if portfolio.pair_exposures.get(instrument.name, 0) > 0:
@@ -1121,6 +1189,22 @@ class ForwardTestWorker:
         submitted = False
         legs = self._order_legs(intent, risk, instrument)
         for leg_name, units, take_profit in legs:
+            if self.settings.strategy.structure_timeframe is not None:
+                try:
+                    still_aligned = self._timeframe_evidence_still_current(
+                        intent, instrument, datetime.now(timezone.utc)
+                    )
+                except Exception as exc:
+                    log.warning("multi-timeframe order-leg revalidation failed: %s", type(exc).__name__)
+                    still_aligned = False
+                if not still_aligned:
+                    self.journal.log_event(
+                        "multi_timeframe_confirmation_expired",
+                        "Multi-timeframe confirmation expired before order leg",
+                        level="warning",
+                        payload={"instrument": instrument.name, "leg": leg_name},
+                    )
+                    return submitted
             if not self._tp_candle_still_current(intent, instrument):
                 self.journal.log_event(
                     "tp_candle_expired",
@@ -1178,6 +1262,8 @@ class ForwardTestWorker:
                 submitted = True
                 continue
             try:
+                operation_timings.observe("signal_to_order", max(0.0,
+                    (datetime.now(timezone.utc) - intent.timestamp).total_seconds() * 1000))
                 response = self.client.create_market_order(
                     instrument=instrument,
                     signed_units=units * intent.side.broker_units_sign,

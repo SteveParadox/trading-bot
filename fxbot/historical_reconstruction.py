@@ -45,7 +45,7 @@ from fxbot.strategy import (
 from fxbot.training_dataset import export_training_dataset
 
 
-HISTORICAL_RECONSTRUCTION_VERSION = "v1"
+HISTORICAL_RECONSTRUCTION_VERSION = "v2"
 
 
 class HistoricalDataSource(Protocol):
@@ -157,9 +157,19 @@ def reconstruct_historical_candidates(
             "candidates_with_entry_quotes",
             "complete_outcomes",
             "incomplete_outcomes",
+            "tp_data_blocks",
         )
     }
     return report
+
+
+def replay_indicator_window(frame: pd.DataFrame, timeframe: str, decision_time: datetime, limit: int) -> pd.DataFrame:
+    """Use the same completed-bar count and indicator seeds as the live feed."""
+    # Do not pass future history to last_closed_window, which deliberately
+    # rejects future input in the live path. Exclude still-forming bars too.
+    cutoff = pd.Timestamp(decision_time) - pd.Timedelta(TIMEFRAME_DELTAS[timeframe])
+    closed = frame.loc[frame.index <= cutoff].tail(limit)
+    return prepare_indicators(closed) if not closed.empty else closed.copy()
 
 
 def _reconstruct_symbol(
@@ -179,6 +189,7 @@ def _reconstruct_symbol(
     end = _utc(config.end)
     entry_delta = TIMEFRAME_DELTAS[settings.strategy.entry_timeframe]
     htf_delta = TIMEFRAME_DELTAS[settings.strategy.htf_timeframe]
+    structure_timeframe = settings.strategy.structure_timeframe
     warmup_start = start - max(entry_delta, htf_delta) * config.warmup_bars
 
     entry_raw = source.historical_candles(
@@ -193,7 +204,11 @@ def _reconstruct_symbol(
         warmup_start,
         end,
     )
-    if entry_raw.empty or htf_raw.empty:
+    structure_raw = (
+        source.historical_candles(instrument.name, structure_timeframe, warmup_start, end)
+        if structure_timeframe is not None else None
+    )
+    if entry_raw.empty or htf_raw.empty or (structure_raw is not None and structure_raw.empty):
         return {
             "decision_points": 0,
             "permission_blocks": 0,
@@ -201,17 +216,24 @@ def _reconstruct_symbol(
             "candidates_with_entry_quotes": 0,
             "complete_outcomes": 0,
             "incomplete_outcomes": 0,
+            "tp_data_blocks": 0,
             "reason": "missing_historical_candles",
         }
 
-    entry = prepare_indicators(_ohlcv(entry_raw))
-    htf = prepare_indicators(_ohlcv(htf_raw))
+    # Live MT5 fetches a bounded window of completed candles. Recursive
+    # Wilder seeds depend on that window; full-history precomputation gives
+    # different ATR/ADX/RSI values even without explicit future leakage.
+    entry = _ohlcv(entry_raw)
+    htf = _ohlcv(htf_raw)
+    structure = _ohlcv(structure_raw) if structure_raw is not None else None
     tp_frame: pd.DataFrame | None = None
     if settings.strategy.tp_timeframe is not None:
         if settings.strategy.tp_timeframe == settings.strategy.entry_timeframe:
             tp_frame = entry
         elif settings.strategy.tp_timeframe == settings.strategy.htf_timeframe:
             tp_frame = htf
+        elif settings.strategy.tp_timeframe == structure_timeframe:
+            tp_frame = structure
         else:
             tp_raw = source.historical_candles(
                 instrument.name,
@@ -219,7 +241,7 @@ def _reconstruct_symbol(
                 warmup_start,
                 end,
             )
-            tp_frame = prepare_indicators(_ohlcv(tp_raw)) if not tp_raw.empty else None
+            tp_frame = _ohlcv(tp_raw) if not tp_raw.empty else None
 
     stats = {
         "decision_points": 0,
@@ -228,6 +250,7 @@ def _reconstruct_symbol(
         "candidates_with_entry_quotes": 0,
         "complete_outcomes": 0,
         "incomplete_outcomes": 0,
+        "tp_data_blocks": 0,
     }
 
     for candle_open in entry.index:
@@ -249,14 +272,17 @@ def _reconstruct_symbol(
             stats["permission_blocks"] += 1
             continue
 
-        entry_slice = entry.loc[entry.index <= pd.Timestamp(decision_time)]
-        htf_slice = htf.loc[htf.index <= pd.Timestamp(decision_time)]
+        entry_slice = replay_indicator_window(entry, settings.strategy.entry_timeframe, decision_time, settings.strategy.candle_limit)
+        htf_slice = replay_indicator_window(htf, settings.strategy.htf_timeframe, decision_time, settings.strategy.candle_limit)
+        structure_slice = (replay_indicator_window(structure, structure_timeframe, decision_time, settings.strategy.candle_limit)
+                           if structure is not None else None)
         decision = evaluate_signal_frame(
             entry_slice,
             htf_slice,
             instrument=instrument,
             settings=settings.strategy,
             timestamp=decision_time,
+            structure_frame=structure_slice,
         )
         if decision.signal is None:
             continue
@@ -299,6 +325,7 @@ def _reconstruct_symbol(
             entry_price=entry_price,
             timestamp=decision_time,
             entry_price_source="historical_mt5_executable_tick",
+            structure_frame=structure_slice,
         )
         if intent is None:
             continue
@@ -309,18 +336,25 @@ def _reconstruct_symbol(
             "historical_reconstruction": True,
             "historical_reconstruction_version": HISTORICAL_RECONSTRUCTION_VERSION,
         }
-        if settings.strategy.tp_timeframe is not None and tp_frame is not None:
-            tp_slice = tp_frame.loc[tp_frame.index <= pd.Timestamp(decision_time)]
-            tp_row = last_closed_row(
-                tp_slice,
-                settings.strategy.tp_timeframe,
-                timestamp=decision_time,
-            )
-            if tp_row is not None:
-                tp_atr = _finite_or_none(tp_row.get("atr"))
-                if tp_atr is not None and tp_atr > 0:
-                    metadata["tp_atr"] = tp_atr
-                    metadata["tp_timeframe"] = settings.strategy.tp_timeframe
+        if settings.strategy.tp_timeframe is not None:
+            timeframe = settings.strategy.tp_timeframe
+            tp_slice = (replay_indicator_window(tp_frame, timeframe, decision_time, settings.strategy.candle_limit)
+                        if tp_frame is not None else None)
+            # Match live behavior: unavailable/stale/invalid TP evidence cannot
+            # silently turn a configured M5 exit into the default target.
+            if tp_slice is None or tp_slice.empty:
+                stats["tp_data_blocks"] += 1
+                _record_tp_data_block(journal, intent, price, strategy_hash, timeframe)
+                continue
+            tp_row = tp_slice.iloc[-1]
+            tp_atr = _finite_or_none(tp_row.get("atr"))
+            age = pd.Timestamp(decision_time) - (tp_row.name + TIMEFRAME_DELTAS[timeframe])
+            if (tp_atr is None or tp_atr <= 0 or age < pd.Timedelta(0)
+                    or age.total_seconds() > TIMEFRAME_DELTAS[timeframe].total_seconds() + settings.runtime.max_price_age_seconds):
+                stats["tp_data_blocks"] += 1
+                _record_tp_data_block(journal, intent, price, strategy_hash, timeframe)
+                continue
+            metadata.update(tp_atr=tp_atr, tp_timeframe=timeframe, tp_candle_time=tp_row.name.isoformat())
         intent = replace(intent, metadata=metadata)
         exit_plan = risk.build_exit_plan(intent, instrument)
         candidate_id = _historical_candidate_id(intent, strategy_hash)
@@ -453,6 +487,21 @@ def _reconstruct_symbol(
     return stats
 
 
+def _record_tp_data_block(journal, intent, price, strategy_hash, timeframe):
+    """Retain rejected candidate evidence without manufacturing an exit label."""
+    journal.record_candidate(
+        candidate_id=_historical_candidate_id(intent, strategy_hash),
+        timestamp=intent.timestamp, symbol=intent.instrument, direction=intent.side.value,
+        entry=intent.entry_price, spread=price.ask - price.bid,
+        atr=_finite_or_none(intent.signal_row.get("atr")),
+        strategy_signal=str(intent.metadata.get("decision") or "signal_confirmed"),
+        executed=False, rejection_reason="historical_tp_data_unavailable", status="rejected",
+        payload={"historical_reconstruction": True, "market_snapshot": None,
+                 "tp_timeframe": timeframe, "historical_reconstruction_version": HISTORICAL_RECONSTRUCTION_VERSION},
+        strategy_hash=strategy_hash, code_version=f"historical-reconstruction-{HISTORICAL_RECONSTRUCTION_VERSION}",
+    )
+
+
 def _record_missing_quote_candidate(
     *,
     journal: StructuredJournal,
@@ -462,7 +511,7 @@ def _record_missing_quote_candidate(
     strategy_hash: str,
 ) -> None:
     key = (
-        f"{instrument.name}:{decision.signal.value if decision.signal else 'NONE'}:"
+        f"{HISTORICAL_RECONSTRUCTION_VERSION}:{instrument.name}:{decision.signal.value if decision.signal else 'NONE'}:"
         f"{decision_time.isoformat()}:{strategy_hash}:missing_quote"
     )
     candidate_id = "fxhist-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
@@ -550,7 +599,7 @@ def _ohlcv(frame: pd.DataFrame) -> pd.DataFrame:
 
 def _historical_candidate_id(intent: Any, strategy_hash: str) -> str:
     stamp = _utc(intent.timestamp).isoformat()
-    raw = f"{intent.instrument}:{intent.side.value}:{stamp}:{intent.entry_price:.8f}:{strategy_hash}"
+    raw = f"{HISTORICAL_RECONSTRUCTION_VERSION}:{intent.instrument}:{intent.side.value}:{stamp}:{intent.entry_price:.8f}:{strategy_hash}"
     return "fxhist-" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
 
 

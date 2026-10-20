@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from fxbot.performance import measured
+
 import math
 from datetime import datetime
 from statistics import mean, pstdev
@@ -10,6 +12,7 @@ from typing import Any
 from fxbot.journal import StructuredJournal, row_to_dict
 
 
+@measured("analytics")
 def performance_summary(
     journal: StructuredJournal,
     *,
@@ -61,6 +64,7 @@ def performance_summary(
     }
 
 
+@measured("dashboard_snapshot")
 def live_snapshot(journal: StructuredJournal, config_payload: dict[str, Any]) -> dict[str, Any]:
     equity = journal.latest_equity(limit=300)
     return {

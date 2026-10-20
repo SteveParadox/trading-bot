@@ -69,7 +69,11 @@ def code_version(root: str | Path | None = None) -> str:
         return explicit
     base = Path(root or Path(__file__).resolve().parents[1])
     digest = hashlib.sha256()
-    for path in sorted(base.glob("fxbot/**/*.py")):
+    sources = set(base.glob("fxbot/**/*.py"))
+    # FX imports the shared indicator implementation and its configuration.
+    # Include them so journal provenance changes when indicator math changes.
+    sources.update(path for path in (base / "indicators.py", base / "config.py") if path.is_file())
+    for path in sorted(sources):
         digest.update(str(path.relative_to(base)).encode("utf-8"))
         digest.update(path.read_bytes())
     return digest.hexdigest()[:16]

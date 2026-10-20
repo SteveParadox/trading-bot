@@ -20,6 +20,7 @@ from pydantic import BaseModel
 from fxbot.ai_evaluation import AiEvaluationConfig, ai_value_report
 from fxbot.ai.model_registry import ModelRegistry
 from fxbot.ai.exit_intelligence import ExitPrediction, EXIT_FEATURE_COLUMNS, EXIT_FEATURE_VERSION
+from fxbot.performance import performance_snapshot
 from fxbot.analytics import live_snapshot, performance_summary
 from fxbot.config import FxBotSettings, ensure_runtime_dirs, settings_from_env
 from fxbot.forward import ForwardTestWorker
@@ -369,6 +370,7 @@ def create_app(settings: FxBotSettings | None = None) -> FastAPI:
             "clock_health": snap.clock_health,
             "recent_alerts": snap.recent_alerts,
             "uptime_seconds": snap.uptime_seconds,
+            "performance": performance_snapshot(),
         }
 
     @app.get("/api/news", dependencies=[Depends(require_api_key)])
@@ -457,9 +459,11 @@ def create_app(settings: FxBotSettings | None = None) -> FastAPI:
         await broadcaster.connect(websocket)
         try:
             while True:
-                await websocket.send_json(live_snapshot(journal, config_payload))
+                await websocket.send_json(await asyncio.to_thread(live_snapshot, journal, config_payload))
                 await asyncio.sleep(2.0)
         except WebSocketDisconnect:
+            pass
+        finally:
             await broadcaster.disconnect(websocket)
 
     # ------------------------------------------------------------------

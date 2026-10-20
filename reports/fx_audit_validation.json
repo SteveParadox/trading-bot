@@ -1,0 +1,44 @@
+{
+  "base_commit": "c3a00653ba19a36a823b7fd4089f12234eab915b",
+  "python": {
+    "command": "python -m pytest -q --ignore=tests/test_bybit_data.py",
+    "passed": 953,
+    "subtests_passed": 2,
+    "warnings": 20,
+    "summary": "953 passed, 20 warnings, 2 subtests passed in 12.54s"
+  },
+  "compileall": {
+    "command": "python -m compileall -q fxbot indicators.py",
+    "passed": true
+  },
+  "unfiltered_suite": {
+    "status": "collection_error",
+    "missing_module": "backtester.bybit_data",
+    "reproduced_on_untouched_base": true
+  },
+  "frontend": {
+    "npm_ci": "passed",
+    "production_build": "passed",
+    "theme_tests": 4,
+    "polling_tests": 2,
+    "theme_browser_output": [
+      "Theme browser smoke passed at width 1280",
+      "Theme browser smoke passed at width 375"
+    ],
+    "strategy_browser_output": [
+      "Strategy roles and responsive dashboard passed at width 1440",
+      "Strategy roles and responsive dashboard passed at width 390"
+    ],
+    "broker_mode": "explicit mocked API and websocket; no terminal"
+  },
+  "ci": {
+    "pr_run_id": 39210461816,
+    "pr_job_id": 117922450762,
+    "main_run_id": 39112051421,
+    "main_job_id": 117630081628,
+    "runner_id": 0,
+    "steps": [],
+    "annotation": "The job was not started because your account is locked due to a billing issue."
+  },
+  "real_broker_performance": "not measured; MT5 broker history, fills and fee schedule unavailable"
+}

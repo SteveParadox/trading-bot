@@ -26,6 +26,7 @@ class PredictionRequest:
     strategy_score: float
     execution_cost_pips_round_trip: float
     pip_size: float
+    strategy_context: dict[str, str | None] | None = None
 
     def __post_init__(self) -> None:
         if not self.candidate_id.strip():

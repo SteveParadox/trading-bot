@@ -328,7 +328,7 @@ class StrategySettings:
     max_stop_atr_multiple: float = 4.0
     require_volume_confirmation: bool = False
     volume_ratio_min: float = 0.8
-    htf_require_momentum_candle: bool = True
+    htf_require_momentum_candle: bool | None = None
     min_signal_score: float = 60.0
     min_di_edge: float = 5.0
     require_adx_non_decreasing: bool = True
@@ -367,14 +367,38 @@ class StrategySettings:
     news_api_key: str = ""
     news_http_timeout_seconds: int = 30
     news_use_forex_factory: bool = False
+    # Append new fields so positional StrategySettings callers stay compatible.
+    structure_timeframe: str | None = None
+    structure_adx_min: float = 18.0
+    structure_ma28_slope_lookback: int = 3
 
     def __post_init__(self) -> None:
+        if self.htf_require_momentum_candle is None:
+            # H4 describes market bias, so a single counter-color H4 candle
+            # does not, by itself, reverse the longer direction.
+            object.__setattr__(self, "htf_require_momentum_candle", self.htf_timeframe != "4h")
         if self.stop_mode not in {"atr", "ma"}:
             raise ValueError("strategy.stop_mode must be 'atr' or 'ma'")
         if self.entry_timeframe not in {"5m", "15m", "30m", "1h"}:
             raise ValueError("unsupported FX entry timeframe")
         if self.htf_timeframe not in {"1h", "4h", "1d"}:
             raise ValueError("unsupported FX HTF timeframe")
+        durations = {"5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440}
+        if durations[self.entry_timeframe] >= durations[self.htf_timeframe]:
+            raise ValueError("FX entry timeframe must be shorter than HTF")
+        if self.structure_timeframe is not None:
+            if self.structure_timeframe not in durations:
+                raise ValueError("unsupported FX structure timeframe")
+            if not durations[self.entry_timeframe] < durations[self.structure_timeframe] < durations[self.htf_timeframe]:
+                raise ValueError("FX timeframes must satisfy entry < structure < HTF")
+        if not math.isfinite(self.structure_adx_min) or self.structure_adx_min < 0:
+            raise ValueError("strategy.structure_adx_min must be finite and nonnegative")
+        if self.structure_ma28_slope_lookback < 1:
+            raise ValueError("strategy.structure_ma28_slope_lookback must be at least 1")
+        if self.structure_timeframe is not None and self.candle_limit < 60:
+            raise ValueError("strategy.candle_limit must be at least 60 for multi-timeframe confirmation")
+        if self.structure_timeframe is not None and self.structure_ma28_slope_lookback >= self.candle_limit:
+            raise ValueError("strategy.structure_ma28_slope_lookback must be smaller than candle_limit")
         if self.tp_timeframe is not None and self.tp_timeframe not in {"5m", "15m", "30m", "1h"}:
             raise ValueError("unsupported FX TP timeframe")
         if not math.isfinite(self.tp_atr_multiplier) or self.tp_atr_multiplier <= 0:
@@ -713,7 +737,13 @@ def settings_from_env() -> FxBotSettings:
         ),
         strategy=StrategySettings(
             entry_timeframe=_get_str("FX_ENTRY_TIMEFRAME", "15m"),
-            htf_timeframe=_get_str("FX_HTF_TIMEFRAME", "1h"),
+            htf_timeframe=_get_str("FX_HTF_TIMEFRAME", "4h"),
+            structure_timeframe=_get_str(
+                "FX_STRUCTURE_TIMEFRAME",
+                "1h" if _get_str("FX_HTF_TIMEFRAME", "4h") == "4h" else "",
+            ).lower() or None,
+            structure_adx_min=_get_float("FX_STRUCTURE_ADX_MIN", 18.0),
+            structure_ma28_slope_lookback=_get_int("FX_STRUCTURE_MA28_SLOPE_LOOKBACK", 3),
             candle_limit=_get_int("FX_CANDLE_LIMIT", 180),
             adx_min=_get_float("FX_ADX_MIN", 18.0),
             htf_adx_min=_get_float("FX_HTF_ADX_MIN", 20.0),
@@ -742,7 +772,10 @@ def settings_from_env() -> FxBotSettings:
             max_stop_atr_multiple=_get_float("FX_MAX_STOP_ATR_MULTIPLE", 4.0),
             require_volume_confirmation=_get_bool("FX_REQUIRE_VOLUME_CONFIRMATION", False),
             volume_ratio_min=_get_float("FX_VOLUME_RATIO_MIN", 0.80),
-            htf_require_momentum_candle=_get_bool("FX_HTF_REQUIRE_MOMENTUM_CANDLE", True),
+            htf_require_momentum_candle=_get_bool(
+                "FX_HTF_REQUIRE_MOMENTUM_CANDLE",
+                _get_str("FX_HTF_TIMEFRAME", "4h") != "4h",
+            ),
             min_signal_score=_get_float("FX_MIN_SIGNAL_SCORE", 60.0),
             min_di_edge=_get_float("FX_MIN_DI_EDGE", 5.0),
             require_adx_non_decreasing=_get_bool("FX_REQUIRE_ADX_NON_DECREASING", True),
